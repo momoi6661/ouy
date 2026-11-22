@@ -23,6 +23,7 @@ interface Props {
   onUi: (commands: UiCommand[]) => void;
   /** 有几条 Agent 主动发来、还没看的消息 */
   onUnread?: (count: number) => void;
+  hidden?: boolean;
   /** 盯盘状态：用来知道这个币的 Worker 现在是不是正在思考 */
   agent?: AgentStatus;
 }
@@ -35,6 +36,12 @@ const PLAN_STATE: Record<string, string> = {
   failed: "没成功",
   declined: "已忽略",
   expired: "已过期",
+  armed: "等待触发",
+  active: "运行中",
+  done: "规则已结束",
+  cancelled: "已撤销",
+  disabled: "已关闭",
+  unavailable: "当前环境不可用",
 };
 
 /** 盯盘页里的 Agent 对话区：每个币种一段独立的对话，开仓 / 加仓以方案卡片的形式给出，点确认才下单。 */
@@ -62,7 +69,7 @@ function StepChips({ steps }: { steps: { label: string; args?: Record<string, an
   );
 }
 
-export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onActed, config, onUi, onUnread, agent }: Props) {
+export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onActed, config, onUi, onUnread, agent, hidden }: Props) {
   // 对话区跟着图表上的币种走；但如果是 Agent 自己把图表切到别的币，这段对话留在原地，回答不会“消失”
   const [inst, setThread] = useState(chartInst);
   const pinned = useRef(false);
@@ -78,6 +85,16 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const root = useRef<HTMLDivElement>(null);
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [text, setText] = useState("");
+  const [atOff, setAtOff] = useState(false);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const atMatch = /[@＠]([A-Za-z0-9]*)$/.exec(text);
+  const atList = atMatch && !atOff
+    ? ["Router", ...config.instruments.map(shortInst)].filter((name) => name.toUpperCase().startsWith(atMatch[1].toUpperCase()))
+    : [];
+  const insertAt = (name: string) => {
+    setText((value) => value.replace(/[@＠][A-Za-z0-9]*$/, `@${name} `));
+    input.current?.focus();
+  };
   // 同时可以有好几句在路上：对方在忙时，新的话进待发框，或者点「立即发送」直接送进它这一轮
   const [sending, setSending] = useState(0);
   const busy = sending > 0;
@@ -85,11 +102,14 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const end = useRef<HTMLDivElement>(null);
   const current = useRef(activeThread);
   current.current = activeThread;
+  const readId = useRef(0);
 
   const load = async (thread = current.current) => {
+    if (thread !== current.current) return;
+    const id = ++readId.current;
     try {
       const r = await api.chatLog(thread);
-      if (current.current === thread) setMsgs(r.messages);
+      if (current.current === thread && readId.current === id) setMsgs(r.messages);
     } catch {
       /* 读不到历史不影响继续聊 */
     }
@@ -99,7 +119,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     setMsgs([]);
     load(activeThread);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThread]);
+  }, [activeThread, config.env]);
 
   useEffect(() => {
     end.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -109,7 +129,10 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   useEffect(() => {
     const onChat = (ev: Event) => {
       const thread = (ev as CustomEvent<{ thread: string }>).detail?.thread;
-      if (!thread) return;
+      if (!thread) {
+        load();
+        return;
+      }
       const visible = !!root.current?.offsetParent && !document.hidden;
       if (thread === current.current) load(thread);
       if (thread !== current.current || !visible) setUnread((u) => ({ ...u, [thread]: (u[thread] ?? 0) + 1 }));
@@ -129,8 +152,8 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     return () => seen.disconnect();
   }, []);
   useEffect(() => {
-    if (root.current?.offsetParent) setUnread((u) => (u[inst] ? { ...u, [inst]: 0 } : u));
-  }, [inst, msgs.length]);
+    if (root.current?.offsetParent) setUnread((u) => (u[activeThread] ? { ...u, [activeThread]: 0 } : u));
+  }, [activeThread, hidden, msgs.length]);
   const unreadTotal = Object.values(unread).reduce((a, b) => a + b, 0);
   useEffect(() => {
     onUnread?.(unreadTotal);
@@ -140,15 +163,18 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const send = async (content = text, images: string[] = []) => {
     const message = content.trim();
     if (!message) return;
-    const thread = activeThread;
+    const mentions = [...message.matchAll(/[@＠]([A-Za-z0-9]+)/g)].map((m) => m[1].toUpperCase());
+    const otherTarget = mentions.includes("ROUTER") || config.instruments.some((i) => i !== inst && mentions.includes(shortInst(i).toUpperCase()));
+    const target = otherTarget ? "router" : to;
+    const thread = target === "router" ? "general" : inst;
+    if (target !== to) setTo(target);
     if (content === text) setText("");
-    const target = to;
     setMsgs((m) => [...m, { role: "user", text: message, to: target, images }]);
     setSending((n) => n + 1);
     try {
       const r = await api.chat(message, effort, thread, inst, target, false, images);
       if (r.steered) toast("它正在思考，这句话已直接送进它当前这一轮，回答随这一轮的结论发在这里", "ok");
-      else if (current.current === thread) setMsgs((m) => [...m, { role: "ai", text: r.reply, actions: r.actions, steps: r.steps, confirms: r.confirms, from: r.from }]);
+      else await load(thread);
       if (r.ui?.length) {
         if (r.ui.some((c) => c.type === "select_inst" && c.inst_id !== chartInst)) pinned.current = true;
         onUi(r.ui);
@@ -183,7 +209,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   /** Agent 想布置一条策略，等用户点同意 */
   const strategyCard = (a: ActionResult, key: string) => {
     const id = a.strategy_id!;
-    const state = a.pending_status || "waiting";
+    const state = a.pending_status || "unavailable";
     const decideStrategy = async (verb: "approve" | "cancel") => {
       setActing(-id);
       try {
@@ -203,10 +229,11 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
           <span className="tag">
             布置策略 · {a.detail?.label} · {shortInst(a.action?.inst_id ?? "")}
           </span>
-          <span className={`plan-state ${state}`}>{state === "executed" ? "已启用" : (PLAN_STATE[state] ?? state)}</span>
+          <span className={`plan-state ${state}`}>{PLAN_STATE[state] ?? state}</span>
         </div>
         <div className="small">{a.message}</div>
-        {a.detail?.note && <div className="muted small">{a.detail.note}</div>}
+        {(a.pending_result?.message || a.detail?.note) && <div className="muted small">{a.pending_result?.message || a.detail.note}</div>}
+        {a.pending_result?.detail?.ordId && <div className="small">委托号 {a.pending_result.detail.ordId}</div>}
         {state === "waiting" && (
           <div className="row">
             <button className="btn sm primary" disabled={acting === -id} onClick={() => decideStrategy("approve")}>
@@ -234,7 +261,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
           <span className={`plan-state ${state}`}>{PLAN_STATE[state] ?? state}</span>
         </div>
         {act.reason && <div className="muted small">{act.reason}</div>}
-        {state !== "waiting" && state !== "executed" && a.pending_result?.message && <div className="warn small">{a.pending_result.message}</div>}
+        {state !== "waiting" && a.pending_result?.message && <div className="muted small">{a.pending_result.message}</div>}
         {state === "waiting" && (
           <div className="row">
             <button className="btn sm primary" disabled={acting === id} onClick={() => decide(id, true)}>
@@ -262,7 +289,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
           <span className={`tag ${long ? "long" : "short"}`}>
             {act.kind === "add" ? "加仓" : long ? "做多" : "做空"} {shortInst(act.inst_id)} · {p.leverage}x · {p.margin_mode === "isolated" ? "逐仓" : "全仓"}
           </span>
-          <span className={`plan-state ${state}`}>{PLAN_STATE[state] ?? state}</span>
+          <span className={`plan-state ${state}`}>{state === "executed" ? "订单已提交" : (PLAN_STATE[state] ?? state)}</span>
         </div>
         <dl>
           <dt>入场</dt>
@@ -287,7 +314,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
         </dl>
         {act.reason && <div className="muted small">{act.reason}</div>}
         {p.notes?.length > 0 && <div className="muted small">{p.notes.join("；")}</div>}
-        {state !== "waiting" && state !== "executed" && a.pending_result?.message && <div className="warn small">{a.pending_result.message}</div>}
+        {state !== "waiting" && a.pending_result?.message && <div className="muted small">{a.pending_result.message}</div>}
         <div className="row">
           {state === "waiting" && (
             <button className="btn sm primary" disabled={acting === id} onClick={() => decide(id, true)}>
@@ -312,29 +339,33 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const samples = [`${name} 现在能做多还是做空？给我一个方案`, `帮我做多 ${name}，投 200 U`, "看一下我的持仓，要不要动", "把止损移到保本"];
 
   return (
-    <div className="chat-dock" ref={root}>
+    <div className="chat-dock" ref={root} hidden={hidden}>
       <div className="chat-thread">
-        <b>{name}</b> 的对话
+        <b>{to === "router" ? "Router" : `${name} Worker`}</b>
         {inst !== chartInst && (
           <button className="btn xs" onClick={() => setThread(chartInst)}>
             图表现在是 {shortInst(chartInst)}，切到它的对话
           </button>
         )}
         {Object.entries(unread)
-          .filter(([thread, n]) => n > 0 && thread !== activeThread && thread !== "general")
+          .filter(([thread, n]) => n > 0 && thread !== activeThread)
           .map(([thread, n]) => (
             <button
               key={thread}
               className="btn xs unread"
               title="这个币的 Worker 主动发来了方案或建议"
               onClick={() => {
+                if (thread === "general") {
+                  setTo("router");
+                  return;
+                }
                 pinned.current = false;
                 setTo("worker");
                 setThread(thread);
                 onUi([{ type: "select_inst", inst_id: thread }]);
               }}
             >
-              {shortInst(thread)} 有 {n} 条新消息
+              {thread === "general" ? "Router" : shortInst(thread)} 有 {n} 条新消息
             </button>
           ))}
         <div className="seg two slim chat-to" title="一般对 Router 说，它看全局、分派任务；也可以直接对这个币的 Worker 说，它用自己的上下文和交易工具回答">
@@ -345,11 +376,20 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
             对 {name} Worker 说
           </button>
         </div>
+        {to === "worker" && config.instruments.length > 1 && (
+          <select aria-label="选择对话 Worker" value={inst} onChange={(event) => {
+            const thread = event.target.value;
+            pinned.current = false;
+            setThread(thread);
+            onUi([{ type: "select_inst", inst_id: thread }]);
+          }}>
+            {config.instruments.map((i) => <option key={i} value={i}>{shortInst(i)}</option>)}
+          </select>
+        )}
       </div>
       <div className="chat-body">
         {msgs.length === 0 && !busy && (
           <div className="chat-empty">
-            <p className="muted small">这是 {name} 的对话区。让 Agent 分析、做多做空、调仓都可以；开仓和加仓它会先给方案，你点确认才下单。</p>
             <div className="chips">
               {samples.map((s) => (
                 <button key={s} className="chip" onClick={() => send(s)}>
@@ -388,9 +428,10 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
                 <div className="row">
                   <button
                     className="btn sm primary"
+                    disabled={!!m.env && m.env !== config.env}
                     onClick={async () => {
                       try {
-                        await api.saveConfig({ ...config, ...c.patch } as AgentConfig, config.env === "live");
+                        await api.saveConfig({ ...config, ...c.patch, risk: { ...config.risk, ...c.patch.risk } }, config.env === "live");
                         toast("设置已修改", "ok");
                         onActed();
                       } catch (e: any) {
@@ -423,9 +464,24 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
       </div>
       <Composer
         value={text}
-        onChange={setText}
+        onChange={(value) => {
+          setAtOff(false);
+          setText(value);
+        }}
+        inputRef={input}
+        onKey={(event) => {
+          if (!atList.length) return false;
+          if (event.key === "Escape") setAtOff(true);
+          if (event.key !== "Enter" && event.key !== "Tab") return false;
+          event.preventDefault();
+          insertAt(atList[0]);
+          return true;
+        }}
+        pop={atList.length > 0 && <div className="at-pop">
+          {atList.map((name) => <button key={name} type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => insertAt(name)}>＠{name}</button>)}
+        </div>}
         placeholder={to === "worker" ? `直接对 ${name} 的 Worker 说，比如「你现在怎么看」` : `对 Router 说点什么，比如「帮我做空 ${name}」`}
-        queueKey={`chat:${activeThread}`}
+        queueKey={`chat:${config.env}:${activeThread}`}
         busy={busy || (to === "worker" && workerBusy)}
         busyText={`${to === "worker" ? `${name} Worker` : "Router"} 正在忙`}
         onSend={(t, images) => send(t, images)}
@@ -448,8 +504,12 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
             disabled={busy || msgs.length === 0}
             onClick={async () => {
               if (!window.confirm("清空这段对话？")) return;
-              await api.chatClear(inst).catch(() => undefined);
-              setMsgs([]);
+              try {
+                await api.chatClear(activeThread);
+                await load(activeThread);
+              } catch (e: any) {
+                toast(e.message, "error");
+              }
             }}
           >
             清空对话

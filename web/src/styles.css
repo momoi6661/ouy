@@ -1,4 +1,6 @@
 .ws-chat-head { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.ws2-chat > .chat-dock { flex: 1; min-height: 0; }
+.chat-dock[hidden] { display: none; }
 :root {
   --bg: #0b0e11;
   --panel: #15191e;

@@ -37,6 +37,12 @@ async def test_observation_rules_at_same_price_have_separate_delivery_and_state(
     notes = [e["text"] for e in watcher.inbox("demo", BTC)]
     rules = [r for r in watcher.rules("demo", BTC) if r["type"] == "watch"]
     assert len(rules) == 2 and all(r["runs"] == 1 for r in rules)
+    assert all(r["mode"] == r["action"] == "wake" for r in rules)
+    wake_trigger = add(rt, when="price_above", level=60_300, do="wake")
+    rule = next(r for r in watcher.rules("demo", BTC) if r["strategy_id"] == wake_trigger["id"])
+    assert rule["type"] == "trigger" and rule["action"] == "wake"
+    with pytest.raises(Rejected, match="观察线"):
+        add(rt, when="price_touch", level=60_300, observation=True, do="open_market", side="long", stop_loss=59_900)
     assert any("first" in note for note in notes) and any("second" in note for note in notes)
     assert not fake.positions and not fake.orders
 
@@ -59,6 +65,65 @@ async def test_cancel_during_condition_evaluation_takes_precedence(rt, fake, mon
     await task
     assert rt.store.get_strategy(rule["id"])["status"] == "cancelled"
     assert not rt.watcher.inbox("demo", BTC)
+
+
+async def test_strategy_approval_requires_current_environment_and_unexpired_rule(rt, monkeypatch):
+    import httpx
+
+    from ouy.app import create_app
+
+    engine = rt.watcher.strategies
+    demo = engine.deploy(rt.config(), BTC, "trigger", "long", {
+        "when": "price_above", "level": 60_200, "do": "open_market", "stop_loss": 59_900,
+    }, require_approval=True)
+    live = rt.store.add_strategy("live", BTC, demo["kind"], demo["side"], demo["params"], "proposed", "")
+    app = create_app(rt)
+    async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        for operation in ("approve", "cancel", "edit"):
+            response = await client.post(f"/api/strategies/{live['id']}/{operation}", json={"level": 60_250})
+            assert 400 <= response.status_code < 500
+        assert rt.store.get_strategy(live["id"]) == live
+        monkeypatch.setattr("ouy.strategy.now_ms", lambda: demo["ts"] + 600_001)
+        response = await client.post(f"/api/strategies/{demo['id']}/approve")
+        assert 400 <= response.status_code < 500
+        assert rt.store.get_strategy(demo["id"])["status"] == "expired"
+        assert rt.watcher._with_pending_status([{"strategy_id": demo["id"]}])[0]["pending_status"] == "expired"
+
+
+def test_edit_that_needs_approval_leaves_the_old_rule_armed(rt):
+    engine = rt.watcher.strategies
+    old = add(rt, when="price_above", level=60_200, do="open_market", side="long", stop_loss=59_900)
+    proposed = engine.edit(old["id"], {"level": 60_500}, require_approval=True)
+    assert proposed["id"] != old["id"] and proposed["status"] == "proposed"
+    assert rt.store.get_strategy(old["id"])["params"]["level"] == 60_200
+    engine.cancel(proposed["id"])
+    assert rt.store.get_strategy(old["id"])["status"] == "armed"
+    proposed = engine.edit(old["id"], {"level": 60_500}, require_approval=True)
+    assert engine.approve(proposed["id"], env="demo")["status"] == "armed"
+    assert rt.store.get_strategy(old["id"])["status"] == "cancelled"
+
+
+async def test_cancel_close_rule_while_preparing_position_keeps_position(rt, fake, monkeypatch):
+    rule = add(rt, when="price_above", level=60_200, do="close")
+    result = await rt.trader.execute(TradeAction(kind="open", inst_id=BTC, side="long", stop_loss=59_800, risk_pct=0.1), "demo", source="agent")
+    assert result.ok
+    await tick(rt, fake, 60_000)
+    checking, resume = asyncio.Event(), asyncio.Event()
+    original = rt.trader._context
+
+    async def context(*args):
+        checking.set()
+        await resume.wait()
+        return await original(*args)
+
+    monkeypatch.setattr(rt.trader, "_context", context)
+    task = asyncio.create_task(tick(rt, fake, 60_250))
+    await asyncio.wait_for(checking.wait(), 2)
+    rt.watcher.strategies.cancel(rule["id"])
+    resume.set()
+    await task
+    assert fake.positions[BTC]["pos"] > 0
+    assert rt.store.get_strategy(rule["id"])["status"] == "cancelled"
 
 
 async def test_open_rule_does_not_become_add_after_a_position_appears(rt, fake):
@@ -97,6 +162,9 @@ async def test_worker_writes_a_trigger_and_code_places_the_limit_order_without_t
     assert [(o["side"], o["px"], o["ordType"]) for o in fake.orders] == [("buy", "59900", "limit")]
     assert calls["n"] == thought  # 没有叫模型思考
     assert rt.trader.order_guards("demo", BTC)[0]["cancel_px"] == 60_400 and rt.store.get_strategy(row["id"])["status"] == "done"
+    card = rt.watcher._with_pending_status([{"strategy_id": row["id"]}])[0]
+    assert card["pending_status"] == "done"
+    assert card["pending_result"]["detail"]["ordId"] == fake.orders[0]["ordId"]
     assert "订单已提交，成交以交易所为准" in rt.watcher.inbox("demo", BTC)[0]["text"] and "不是新的交易指令" in rt.watcher.inbox("demo", BTC)[0]["text"]
     await tick(rt, fake, 59_930)
     assert len(fake.orders) == 1  # 只执行一次
@@ -190,7 +258,7 @@ async def test_trigger_can_wait_on_anything_the_program_can_see_and_on_two_thing
     extra = ("recorder", "conds", "repeat", "cooldown_minutes", "off", "runs", "last_run")
     assert {k: v for k, v in rules[f"s{late}"].items() if k not in extra} | {"ts": 0, "updated_ts": 0, "note": ""} == {
         "id": f"s{late}", "type": "trigger", "label": "触发器", "when": "这个币有了持仓（挂单成交） 且 过了 30 分钟", "do": "市价平掉这个币的仓位", "mode": "auto",
-        "status": "waiting", "by": "Worker", "ts": 0, "updated_ts": 0, "note": "", "level": None, "strategy_id": late, "expires_ts": None}
+        "status": "waiting", "by": "Worker", "ts": 0, "updated_ts": 0, "note": "", "level": None, "strategy_id": late, "expires_ts": None, "action": "close"}
     assert rules[f"s{flat}"]["mode"] == "wake" and rules[f"s{flat}"]["status"] == "done"
 
 

@@ -381,12 +381,20 @@ class Trader:
             raise Rejected("这条指令已超过 10 分钟，行情已变，已作废。")
         if not self.store.claim_pending(pending_id):
             raise Rejected("这条指令正在执行或已处理。")
-        result = await self.execute(action, row["env"], source="agent")
+        def still_allowed() -> None:
+            cfg = self.get_config()
+            if cfg.env != row["env"] or cfg.permission_for(action.kind, action.inst_id) == "off":
+                raise Rejected("交易环境或权限已改变，这条指令不能执行。")
+
+        result = await self.execute(action, row["env"], source="agent", preflight=still_allowed)
         self.store.resolve_pending(pending_id, result.status, result.model_dump(mode="json"))
         self.bus.publish("pending", {"id": pending_id})
         return result
 
     def reject(self, pending_id: int) -> None:
+        row = self.store.get_pending(pending_id)
+        if not row or row["env"] != self.get_config().env:
+            raise Rejected("当前交易环境没有这条待确认指令。")
         if not self.store.claim_pending(pending_id):
             raise Rejected("这条指令正在执行或已处理。")
         self.store.resolve_pending(pending_id, "declined", {})
@@ -420,6 +428,8 @@ class Trader:
                     preflight()
                 if action.kind in ("open", "add"):
                     detail = await self._do_open(action, env, agent=source != "user", preflight=preflight, entry_only=entry_only)
+                elif preflight and action.kind in ("set_stops", "reduce", "close", "cancel_orders"):
+                    detail = await getattr(self, f"_do_{action.kind}")(action, env, preflight=preflight)
                 else:
                     detail = await getattr(self, f"_do_{action.kind}")(action, env)
             except Rejected as exc:
@@ -681,6 +691,8 @@ class Trader:
             sized.risk_usd = round(qty * abs(sized.entry - sized.stop_loss) * inst.ct_val, 4)
             sized.notes.append(f"数量受交易所当前杠杆档位上限（{max_cap:g} 张）限制")
             order["sz"] = fmt(room_sz)
+            if preflight:
+                preflight()
             rows = await self._call("swap_place_order", order, env)
         ord_id = str(rows[0].get("ordId") or "") if rows else ""
         if pos:
@@ -756,9 +768,11 @@ class Trader:
                 raise Rejected(f"保护单 {oid} 修改回执未核实，请先核对，不重挂。")
         return {"algo_id": oid, "stop_loss": sl or old.get("slTriggerPx"), "take_profit": tp or old.get("tpTriggerPx")}
 
-    async def _replace_stops(self, pos: Position, account: AccountState, sl: str | None, tp: str | None, env: Env) -> dict[str, Any]:
+    async def _replace_stops(self, pos: Position, account: AccountState, sl: str | None, tp: str | None, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         """已有整仓保护时原位修改；不能为换价先撤掉保护。"""
         old = await self._protections(pos, env)
+        if preflight:
+            preflight()
         whole = [r for r in old if _f(r.get("closeFraction")) == 1 or not _f(r.get("sz"))]
         if whole:
             if len(whole) != 1 or (len(old) > 1 and not (sl and tp and _f(whole[0].get("closeFraction")) == 1)):
@@ -797,7 +811,7 @@ class Trader:
                 self.bus.publish("journal", self.store.log(env, "alert", f"{pos.inst_id} 旧的止盈止损单没撤掉", {"message": str(exc)}, inst_id=pos.inst_id))
         return {"stop_loss": sl, "take_profit": tp}
 
-    async def _do_set_stops(self, action: TradeAction, env: Env) -> dict[str, Any]:
+    async def _do_set_stops(self, action: TradeAction, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         account, inst, last = await self._context(action, env)
         pos = account.position(action.inst_id)
         if not pos:
@@ -806,17 +820,17 @@ class Trader:
             raise Rejected("至少要给出止损或止盈其中一个价格。")
         lot = self._lot(action, env)
         if lot and len([l for l in self.store.lots(env, action.inst_id) if l["status"] == "open"]) > 1:
-            return await self._set_lot_stops(lot, pos, action, inst, last, env)
+            return await self._set_lot_stops(lot, pos, action, inst, last, env, preflight=preflight)
         risk.check_stop_update(pos, action.stop_loss, action.take_profit, account=account, inst=inst, limits=self.get_config().risk, last_px=last)
         sl = round_price(action.stop_loss, inst.tick_sz) if action.stop_loss else None
         tp = round_price(action.take_profit, inst.tick_sz) if action.take_profit else None
-        applied = await self._replace_stops(pos, account, sl, tp, env)
+        applied = await self._replace_stops(pos, account, sl, tp, env, preflight=preflight)
         for row in self.store.lots(env, action.inst_id):
             if row["status"] == "open":
                 self.store.update_lot(row["id"], stop_loss=_f(applied["stop_loss"]) or None, take_profit=_f(applied["take_profit"]) or None, algo_id="")
         return {"message": f"{action.inst_id} 整仓止损 {applied['stop_loss'] or '未设'}，止盈 {applied['take_profit'] or '未设'}", **applied}
 
-    async def _set_lot_stops(self, lot: dict[str, Any], pos: Position, action: TradeAction, inst: Any, last: float, env: Env) -> dict[str, Any]:
+    async def _set_lot_stops(self, lot: dict[str, Any], pos: Position, action: TradeAction, inst: Any, last: float, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         """只改这个币的某一笔的止盈止损，别的几笔不动。"""
         risk.check_stop_side(pos.side, last, action.stop_loss, action.take_profit, what="现价")
         if action.stop_loss is not None and lot["stop_loss"]:
@@ -827,6 +841,8 @@ class Trader:
         tp = round_price(action.take_profit, inst.tick_sz) if action.take_profit else (str(lot["take_profit"]) if lot["take_profit"] else None)
         old = await self._protections(pos, env)
         mine = await self._lot_algo(lot, pos, env)
+        if preflight:
+            preflight()
         whole = [r for r in old if _f(r.get("closeFraction")) == 1 or not _f(r.get("sz"))]
         if mine and not whole and mine.get("algoId") == lot["algo_id"] and abs(_f(mine.get("sz")) - lot["contracts"]) < 1e-9:
             applied = await self._amend_protection(pos.inst_id, mine, sl if action.stop_loss else None, tp if action.take_profit else None, env)
@@ -845,7 +861,7 @@ class Trader:
         self.store.update_lot(lot["id"], stop_loss=_f(sl) or None, take_profit=_f(tp) or None, algo_id=new_id)
         return {"message": f"{action.inst_id} 第 {lot['id']} 笔（{lot['contracts']:g} 张）止损 {sl or '未设'}，止盈 {tp or '未设'}", "stop_loss": sl, "take_profit": tp}
 
-    async def _do_reduce(self, action: TradeAction, env: Env) -> dict[str, Any]:
+    async def _do_reduce(self, action: TradeAction, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         account, inst, _ = await self._context(action, env)
         pos = account.position(action.inst_id)
         if not pos:
@@ -854,6 +870,8 @@ class Trader:
         fraction = action.fraction or (1.0 if lot else 0.5)
         qty = risk.floor_to_step((lot["contracts"] if lot else pos.contracts) * fraction, inst.lot_sz)
         remaining = pos.contracts - float(qty)
+        if preflight:
+            preflight()
         if (fraction >= 0.999 and not lot) or remaining < float(inst.min_sz) or qty < risk.Decimal(inst.min_sz):
             return await self._close(pos, account, env)
         rows = await self._call(
@@ -952,7 +970,7 @@ class Trader:
                 pass  # 仓位已平，这些单多半已被欧易自动撤掉
         return {"message": f"已市价全平 {pos.inst_id}（投入 {pos.margin:.2f} USDT，平仓前浮盈亏 {pos.upl:+.2f} USDT）", "upl": pos.upl}
 
-    async def _do_close(self, action: TradeAction, env: Env) -> dict[str, Any]:
+    async def _do_close(self, action: TradeAction, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         if action.profit_guard_id is not None:
             return await self._profit_exit(action, env)
         account, _, _ = await self._context(action, env)
@@ -965,7 +983,9 @@ class Trader:
             raise Rejected(f"{action.inst_id} 已经有一张平仓单在挂着（{secs} 秒前提交，还没成交），不用重复点。它成交后仓位就会消失。")
         lot = self._lot(action, env)
         if lot and len([l for l in self.store.lots(env, action.inst_id) if l["status"] == "open"]) > 1:
-            return await self._do_reduce(action.model_copy(update={"kind": "reduce", "fraction": 1.0}), env)
+            return await self._do_reduce(action.model_copy(update={"kind": "reduce", "fraction": 1.0}), env, preflight=preflight)
+        if preflight:
+            preflight()
         return await self._close(pos, account, env)
 
     async def _profit_exit(self, action: TradeAction, env: Env) -> dict[str, Any]:
@@ -1040,8 +1060,10 @@ class Trader:
                 await asyncio.sleep(self.settle_seconds)
         raise Rejected(f"委托 {oid} 尚未确认全成，先核对，不重复平仓、不撤保护单。")
 
-    async def _do_cancel_orders(self, action: TradeAction, env: Env) -> dict[str, Any]:
+    async def _do_cancel_orders(self, action: TradeAction, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         rows = await self.gw.call("swap_get_orders", {"status": "open", "instId": action.inst_id}, env=env)
+        if preflight:
+            preflight()
         cancelled: list[str] = []
         for row in rows or []:
             if action.ord_id and str(row["ordId"]) != action.ord_id:

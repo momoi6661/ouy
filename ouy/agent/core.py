@@ -55,7 +55,6 @@ class Deps:
     strategy: Any = None  # Worker 专用：策略执行器（布置 / 撤销按规则自动执行的策略）
     steered: bool = False  # 交给 Worker 的事没有另开一轮，而是直接送进了它正在跑的那一轮
     cards: list[dict[str, Any]] = field(default_factory=list)  # 这一轮挂起等用户同意的操作，做成界面上的卡片
-    interject: Any = None  # Router 专用：对某个币的 Worker 插话（它正在思考就插进去，空闲就放进信箱）
     goal: Any = None  # Router 专用：给某个币的 Worker 定目标（做什么、最多亏多少、做多久）
     general: Any = None  # Router 专用：把不针对某个币的问题交给通用 Worker 去想、去查
     lessons: Any = None  # 长期经验（模拟盘 / 实盘各一套，用户定的规矩共用）
@@ -641,7 +640,7 @@ async def add_trigger(
         "price_line": price_line, "price_offset_pct": price_offset_pct, "stop_line": stop_line, "stop_offset_pct": stop_offset_pct, "tp_line": tp_line, "tp_offset_pct": tp_offset_pct,
     }
     try:
-        row = engine.deploy(ctx.deps.config, _inst(inst_id), "trigger", side or "", params, note=reason[:300])
+        row = engine.deploy(ctx.deps.config, _inst(inst_id), "trigger", side or "", params, note=reason[:300], require_approval=ctx.deps.propose_only)
     except Exception as exc:  # noqa: BLE001 - 参数不对就告诉模型怎么改
         return f"[没写成] {exc}"
     if when.startswith("price") and not and_when and level:  # 写的时候条件还没满足：之后一满足就执行；写的时候已经满足的，要等价格先离开再回来
@@ -728,11 +727,10 @@ async def set_recorder(
                 return f"[没改成] 这个币上没有记录器 #{recorder_id}。"
             if permission == "off":
                 return "[没改成] 用户把这类操作设成了不允许 Agent 做，记录器不能设成直接执行它。"
-            row = engine.edit(recorder_id, params, reason[:300], side=side or "", replace=True)  # 条件和操作整套换成这次写的
-            if permission == "confirm":
-                engine.store.update_strategy(row["id"], status="proposed")
+            row = engine.edit(recorder_id, params, reason[:300], side=side or "", replace=True, env=ctx.deps.config.env,
+                              require_approval=permission == "confirm" or (ctx.deps.propose_only and do != "wake"))
         else:
-            row = engine.deploy(ctx.deps.config, inst, "trigger", side or "", params, note=reason[:300])
+            row = engine.deploy(ctx.deps.config, inst, "trigger", side or "", params, note=reason[:300], require_approval=ctx.deps.propose_only)
     except Exception as exc:  # noqa: BLE001 - 参数不对就告诉模型怎么改
         return f"[没设成] {exc}"
     row = engine.store.get_strategy(row["id"])
@@ -789,11 +787,21 @@ async def edit_trigger(
     engine = ctx.deps.strategy
     if engine is None:
         return "[不可用] 现在不能修改触发器。"
+    if ctx.tool_call_approved:
+        row = engine.store.get_strategy(strategy_id)
+        return f"[用户已同意，规则 #{strategy_id} 已更新] {engine.describe(row)}" if row else "[找不到规则]"
+    from ..strategy import TRIGGER_TALK
+
+    old = engine.store.get_strategy(strategy_id)
+    trades = old and not (old["kind"] == "trigger" and old["params"].get("do") in TRIGGER_TALK)
     try:
         row = engine.edit(strategy_id, {"level": level, "price": price, "stop_loss": stop_loss, "take_profit": take_profit, "cancel_px": cancel_px,
-                                        "order_expires_minutes": order_expires_minutes, "expires_minutes": expires_minutes}, reason)
+                                        "order_expires_minutes": order_expires_minutes, "expires_minutes": expires_minutes}, reason,
+                          env=ctx.deps.config.env, require_approval=bool(trades and ctx.deps.propose_only))
     except Exception as exc:  # noqa: BLE001 - 参数不对就告诉模型怎么改
         return f"[没改成] {exc}"
+    if row["status"] == "proposed":
+        raise ApprovalRequired(metadata={"strategy_id": row["id"]})
     return f"[#{row['id']} 已修改，程序按新的价位盯] {engine.describe(row)}"
 
 
@@ -918,7 +926,7 @@ async def deploy_strategy(
             (params if kind == "manage" else params.setdefault("manage", {})).setdefault("partials", part)
         params["playbook"] = book["name"]
     try:
-        row = engine.deploy(ctx.deps.config, inst_id.strip().upper(), kind, side or "", params, note=reason[:300])
+        row = engine.deploy(ctx.deps.config, inst_id.strip().upper(), kind, side or "", params, note=reason[:300], require_approval=ctx.deps.propose_only)
     except Exception as exc:  # noqa: BLE001 - 参数不对就告诉模型怎么改
         return f"[没布置成] {exc}"
     if row["status"] == "proposed":  # 要用户同意才启用：这次调用挂起
@@ -997,6 +1005,8 @@ async def cancel_strategy(ctx: RunContext[Deps], strategy_id: int, reason: str, 
     只是重新估了一遍盈亏比或成本、觉得差一点，不能撤——布置之前就该算清楚。"""
     engine = ctx.deps.strategy
     current = ctx.deps.trader.store.get_strategy(strategy_id) if engine else None
+    if current and current["env"] != ctx.deps.config.env:
+        return "[没有撤] 当前交易环境没有这条规则。"
     if current and current["status"] in ("proposed", "armed") and current["params"].get("plan") and ctx.deps.plan_check is not None:
         return (
             f"[没有撤] #{strategy_id} 是程序按你上一轮的 plan 布置的，由 plan 管，不用手动撤。它自己会作废：价格先到止损 {current['params']['stop_loss']:g}、"
@@ -1007,7 +1017,7 @@ async def cancel_strategy(ctx: RunContext[Deps], strategy_id: int, reason: str, 
         return "[没有撤] 这条入场策略还在等触发，是你定好的计划。布置之后确实出现了新情况才撤：再调用一次并在 changed 里写明。重新估算盈亏比或成本不算。"
     if changed.strip():
         reason = f"{reason}（新情况：{changed.strip()}）"
-    row = engine.cancel(strategy_id, reason[:200]) if engine else None
+    row = engine.cancel(strategy_id, reason[:200], env=ctx.deps.config.env) if engine else None
     return f"[已撤销] 策略 #{strategy_id}" if row and row["status"] == "cancelled" else f"[没撤成] 没有正在运行的策略 #{strategy_id}"
 
 
@@ -1135,18 +1145,6 @@ async def assign_goal(
     ctx.deps.ui.append({"type": "refresh"})
     stops = [f"净赚 {target_usdt:g} USDT 就停" if target_usdt else "", f"最多亏 {max_loss_usdt:g} USDT" if max_loss_usdt else "", f"{hours:g} 小时内" if hours else "", row["stop_when"]]
     return f"已交给 {target} 的 Worker：{row['goal']}。停止条件：{'；'.join(x for x in stops if x) or '没有，一直盯到用户叫停'}。盯盘开着它会马上开工；没开的话提醒用户启动盯盘。"
-
-
-@router_toolset.tool
-async def tell_worker(ctx: RunContext[Deps], inst_id: str, message: str) -> str:
-    """对某个币的 Worker 插话，不等它回答。它正在思考时，这句话会插进它当前这一轮，下一步就读到并照办；
-    它空闲时放进它的信箱，并马上唤醒它处理。用在「先别开仓」「把止损都收紧」「这个币今天只做空」这类要它立刻知道的指示上。
-    需要它给出答案或方案时用 ask_worker（它在忙的话任务会排在后面）。"""
-    if ctx.deps.interject is None:
-        return "现在不能插话。"
-    if (wrong := _not_mentioned(ctx.deps, inst_id)) is not None:
-        return wrong
-    return str(ctx.deps.interject(_inst(inst_id), message, "Router")["message"])
 
 
 @router_toolset.tool
@@ -1663,7 +1661,7 @@ ROUTER_INSTRUCTIONS = """你是 Ouy 的 Router：常驻、唯一对用户说话�
   币种 Worker 是用来盯盘和交易的，只有问题落到「某个币现在该怎么做 / 这笔仓怎么处理」这种具体交易上，才交给那个币的 Worker。
 - 用户针对某个币要方案、要做多做空、加仓、减仓、平仓、改止盈止损、调杠杆、撤单：用 ask_worker 交给对应币种的 Worker，拿到结论后用你自己的话简洁地转述给用户。
   你没有交易工具，不要自己编行情数字或假装已经下单。
-  同一个 Worker 一次只做一件事：它正在复盘时，ask_worker 交的任务会排在后面，做完复盘马上接着做。只是要它立刻知道一句话（不需要回答）时用 tell_worker 插话。Worker 生成的方案卡片会自动显示在界面上，由用户点确认才下单；不要说已经成交。
+  同一个 Worker 一次只做一件事：它正在复盘时，ask_worker 交的任务会排在后面，做完复盘马上接着做。Worker 生成的方案和交易规则会显示为确认卡，由用户确认后才执行或启用；提交订单后以交易所回执为准。
 - 用户明确说了方向（做多 / 做空 / 加仓），就让 Worker 按这个方向给方案，不要替用户否决；Worker 提示的风险要如实转述。
 - 用户要操作这个项目本身：切换图表（show_instrument）、增删盯盘品种（edit_watchlist）、启停盯盘（set_watching）、给某个币设交易风格（set_trading_style）、记下用户的偏好比如常用杠杆（set_preference）、
   设置某个币的 Worker（set_worker：唤醒方式、模型、思考强度、这个币单独的出手尺度和入场方式；用户说「关掉 / 停掉某个币的 Worker」就 paused=true，「重新打开」就 paused=false；

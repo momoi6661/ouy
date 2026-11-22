@@ -2,11 +2,10 @@ import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ACTION_KINDS, EFFORTS, ENTRY_MODES, ENTRY_TYPE, FAST_MODES, KIND_LABEL, MODE_LABEL, NO_PLAN, STANCES, STYLES, api, shotUrl, fmtPx, fmtTime, fmtUsd, permissionFor, shortInst, STATUS_LABEL,
-  type Account, type Activity, type AppState, type FastMode, type WorkerOverride, type ConfigConfirm, type Effort, type Mode, type PendingItem, type Permission, type Stance, type Rule, type Style, type UiCommand, type WorkItem,
+  type Account, type Activity, type AppState, type FastMode, type WorkerOverride, type Effort, type Mode, type PendingItem, type Permission, type Stance, type Rule, type Style, type UiCommand, type WorkItem,
 } from "../api";
 import { Chart, useLotEntries, type ChartLine } from "../components/Chart";
 import { Positions } from "../components/Positions";
-import { Composer } from "../components/Composer";
 import { AlgoPanel } from "../components/AlgoPanel";
 import { Recorders } from "../components/Recorders";
 import { AssetsPanel } from "../components/AssetsPanel";
@@ -27,6 +26,12 @@ const RULE_MODE: Record<Rule["mode"], [string, string]> = {
   wake: ["只叫醒 Worker", "条件满足时不自动做事，只叫醒 Worker 来判断"],
   task: ["派任务", "条件满足时把写好的任务交给 Worker 自己做，或者交给 Router 去派"],
   worker: ["Worker 对照", "这个条件没法用数字算，由 Worker 自己对照是否达到"],
+};
+const RULE_ACTION: Record<string, string> = {
+  wake: "提醒 Worker", task: "交给 Worker", router_task: "交给 Router", open_market: "市价开仓", open_limit: "限价挂单",
+  cancel_orders: "撤单", set_stops: "改止盈止损", reduce: "减仓", close: "平仓", stop: "停止交易",
+  breakout: "突破入场", pullback: "回踩入场", manage: "管理仓位", profit_guard: "提前止盈",
+  range: "区间交易", martingale: "分层补仓", grid: "网格交易", reverse: "止损反手",
 };
 const TRG_FILTERS: [string, string][] = [["live", "等待中"], ["ended", "已结束"], ["all", "全部"]];
 const trgShown = (r: Rule, f: string) => f === "all" || RULE_LIVE.includes(r.status) === (f === "live");
@@ -50,8 +55,6 @@ interface Props {
   setInst: (inst: string) => void;
   refresh: () => void;
   onTrade: () => void;
-  /** 清空对话记录后，重新取一遍活动流 */
-  resetActivity: () => void;
 }
 
 const NAME: Record<string, string> = { general: "通用 Worker", adhoc: "临时子代理", watchdog: "Watchdog", router: "Router", worker: "Worker", strategy: "策略执行器", intel: "情报", smart: "聪明钱", risk: "风险复核" };
@@ -181,7 +184,7 @@ function toTurns(rows: Activity[]): Turn[] {
   return turns;
 }
 
-export function Workspace({ state, account, ticks, pending, activity, inst, redUp, loggedIn, setInst, refresh, onTrade, resetActivity }: Props) {
+export function Workspace({ state, account, ticks, pending, activity, inst, redUp, loggedIn, setInst, refresh, onTrade }: Props) {
   // 改设置时先在界面上立刻生效（不等后端和欧易那一两秒），后端存好、状态刷新回来后再以后端为准；保存失败就退回去
   const [optimistic, setOptimistic] = useState<Partial<AppState["config"]> | null>(null);
   useEffect(() => setOptimistic(null), [state.config]);
@@ -189,8 +192,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   const agent = state.agent;
   const [sel, setSel] = useStored("ouy.ws.sel", "router"); // router 或某个币（= 它的 Worker 小组）
   const inspected = cfg.instruments.includes(sel.split(":")[0]) ? sel.split(":")[0] : null;
-  const [recipient, setRecipient] = useState("router");
-  const selInst = cfg.instruments.includes(recipient) ? recipient : null;
   // 没有特意选哪个币时，先看有仓位的那个，不用自己去找
   const heldInst = account?.positions.find((p) => cfg.instruments.includes(p.inst_id))?.inst_id;
   const coin = inspected ?? heldInst ?? (cfg.instruments.includes(inst) ? inst : cfg.instruments[0]);
@@ -203,10 +204,10 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   const last = ticks[coin] || st?.last || pos?.mark_px || 0;
 
   /* ---------- 对话 ---------- */
-  // Router 页默认只看和 Router 的对话；Worker 们自己复盘的输出不往这里刷，要看点对应的 Worker，或者切到「全部」
+  // 团队动态是活动记录。对话与确认卡由 ChatPanel 提供。
   const [feed, setFeed] = useStored<"router" | "all">("ouy.ws.feed", "router");
-  const allTurns = useMemo(() => {
-    const list = toTurns(activity.filter((a) => (selInst ? a.inst_id === selInst : true)));
+  const turns = useMemo(() => {
+    const list = toTurns(activity);
     const latest = new Map<string, Turn>();
     for (const t of list) if (t.user === undefined && !t.done) latest.set(`${t.agent}:${t.inst}`, t);
     for (const t of list) {
@@ -217,12 +218,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
       if (latest.get(`${t.agent}:${t.inst}`) !== t || !busy || t.asks.length) t.done = true;
     }
     return list;
-  }, [activity, selInst, agent]);
-  const turns = useMemo(() => {
-    if (selInst || feed === "all") return allTurns;
-    return allTurns.filter((t) => (t.user !== undefined ? !t.inst : (t.agent === "router" && t.key.startsWith("router-")) || t.asks.length > 0 || !!t.error));
-  }, [allTurns, selInst, feed]);
-  const hiddenTurns = allTurns.length - turns.length;
+  }, [activity, agent]);
   const [openStep, setOpenStep] = useState<number | null>(null);
   const [openTurn, setOpenTurn] = useState<Record<string, boolean>>({});
   const scroller = useRef<HTMLDivElement>(null);
@@ -233,7 +229,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   }, [activity.length, sel]);
 
   const [acting, setActing] = useState("");
-  const [confirms, setConfirms] = useState<ConfigConfirm[]>([]);
   const [shownPlan, setShownPlan] = useState<ShownPlan | null>(null);
   const [tradePreset, setTradePreset] = useState<(Extract<UiCommand, { type: "open_trade" }> & { n: number }) | null>(null);
   const applyUi = (commands: UiCommand[]) => {
@@ -265,8 +260,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     }
   };
 
-  const [text, setText] = useState("");
-  const inputRef = useRef<HTMLTextAreaElement>(null);
   // 流式输出：Agent 正在写的内容（还没写完），按「谁:哪个币」存；写完就清掉，由正式的结论接上
   const [live, setLive] = useState<Record<string, { text: string; thinking: string }>>({});
   useEffect(() => {
@@ -282,59 +275,11 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     window.addEventListener("ouy:stream", on);
     return () => window.removeEventListener("ouy:stream", on);
   }, []);
-  const press = useRef<{ timer: number; fired: boolean }>({ timer: 0, fired: false });
-  const [atOff, setAtOff] = useState(false); // 按 Esc 关掉 @ 列表，直到再打字
-  const [sending, setSending] = useState(0);
-  const target = selInst ? `${shortInst(selInst)} Worker` : "Router";
-  const busyWorker = !!selInst && !!(agent.instruments[selInst]?.busy || agent.instruments[selInst]?.reviewing);
-  const send = async (content: string, images: string[] = []) => {
-    const message = content.trim();
-    if (!message) return;
-    setSending((n) => n + 1);
-    pinned.current = true;
-    try {
-      // @ 了别的币（或 @Router）：这句话交给 Router 去准确转发，不直接塞给当前选中的 Worker
-      const ats = [...message.matchAll(/[@＠]([A-Za-z0-9]+)/g)].map((m) => m[1].toUpperCase());
-      const atCoins = cfg.instruments.filter((i) => ats.includes(shortInst(i).toUpperCase()));
-      const direct = !!selInst && !ats.includes("ROUTER") && (atCoins.length === 0 || (atCoins.length === 1 && atCoins[0] === selInst));
-      const r = await api.chat(message, undefined, direct ? selInst! : "general", direct ? selInst! : coin, direct ? "worker" : "router", false, images);
-      if (r.confirms?.length) setConfirms((c) => [...c, ...r.confirms]);
-      applyUi(r.ui ?? []);
-    } catch (e: any) {
-      toast(e.message, "error");
-    } finally {
-      setSending((n) => n - 1);
-      refresh();
-    }
-  };
-  const lastUserTs = turns.reduce((ts, t) => (t.user !== undefined ? Math.max(ts, t.ts) : ts), 0);
   // 每个 Agent 最新一条还没结束的消息：流式内容就显示在这一条里
   const liveKey = (t: Turn) => `${t.agent}:${t.agent === "router" ? "" : t.inst}`;
   const liveTurn = new Map<string, string>();
   for (const t of turns) if (t.user === undefined && !t.done) liveTurn.set(liveKey(t), t.key);
   const liveOf = (t: Turn) => (t.key === "router-live" ? live["router:"] : !t.done && !t.body && liveTurn.get(liveKey(t)) === t.key ? live[liveKey(t)] : undefined);
-
-  // 输入框里正在打 @：弹出可以 @ 的对象（Router 和盯盘里的每个币）
-  const atMatch = /[@＠]([A-Za-z0-9]*)$/.exec(text);
-  const atList = atMatch && !atOff ? ["Router", ...cfg.instruments.map(shortInst)].filter((n) => n.toUpperCase().startsWith(atMatch[1].toUpperCase())) : [];
-  const insertAt = (name: string) => {
-    setText((t) => (/[@＠]([A-Za-z0-9]*)$/.test(t) ? t.replace(/[@＠]([A-Za-z0-9]*)$/, `@${name} `) : `${t}${t && !t.endsWith(" ") ? " " : ""}@${name} `));
-    inputRef.current?.focus();
-  };
-  /** 长按输入框上面的 Worker 标签：把 @这个币 插进输入框（短按还是切换对话） */
-  const longPress = (name: string) => ({
-    onPointerDown: () => {
-      press.current.fired = false;
-      window.clearTimeout(press.current.timer);
-      press.current.timer = window.setTimeout(() => {
-        press.current.fired = true;
-        insertAt(name);
-      }, 450);
-    },
-    onPointerUp: () => window.clearTimeout(press.current.timer),
-    onPointerLeave: () => window.clearTimeout(press.current.timer),
-    onContextMenu: (e: { preventDefault: () => void }) => e.preventDefault(),
-  });
 
   /** 这条要你同意的操作现在还在等吗（同意、拒绝、过期之后就不等了） */
   const askWaiting = (a: Activity) => {
@@ -344,7 +289,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     return !!sid && (agent.instruments[a.inst_id]?.strategies ?? []).some((x) => x.id === sid && x.status === "proposed");
   };
 
-  /** 一条要你同意的操作：在它所在的那条消息里直接点 */
+  /** 活动记录保留这一步的状态。 */
   const askCard = (a: Activity) => {
     const pid = a.data?.pending_id as number | undefined;
     const sid = a.data?.strategy_id as number | undefined;
@@ -374,16 +319,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
         )}
         {s && <div className="ask-text">{s.text}</div>}
         {(p?.action.reason || s?.note) && <div className="muted small">{p?.action.reason || s?.note}</div>}
-        {waiting && (
-          <div className="row">
-            <button className="btn sm primary" disabled={!!acting} onClick={() => act(`a${a.id}`, () => (p ? api.approve(p.id) : api.strategyAct(sid!, "approve")), p ? undefined : "策略已启用")}>
-              {acting === `a${a.id}` ? "处理中…" : p ? "同意执行" : "同意启用"}
-            </button>
-            <button className="btn sm" disabled={!!acting} onClick={() => act(`r${a.id}`, () => (p ? api.reject(p.id) : api.strategyAct(sid!, "cancel")))}>
-              不执行
-            </button>
-          </div>
-        )}
       </div>
     );
   };
@@ -447,6 +382,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   const [sideRaw, setSideTab] = useStored("ouy.ws.sidetab", "overview");
   const sideTab = SIDE_TABS.some(([id]) => id === sideRaw) ? sideRaw : "overview"; // 存下来的值不认识就打开总览
   const [trgFilter, setTrgFilter] = useStored("ouy.ws.trg", "live");
+  const [trgAction, setTrgAction] = useState("");
   const [goalTarget, setGoalTarget] = useState<number | "">("");
   const [goalStop, setGoalStop] = useState("");
 
@@ -467,10 +403,12 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     if (!/^s\d+$/.test(suffix ?? "")) return undefined;
     return agent.instruments[instrument]?.rules?.find((r) => r.strategy_id === Number(suffix.slice(1)));
   };
-  const rules = allRules.filter((r) => !r.recorder && (r.mode === "wake") === watchPage); // 记录器在总览里 Worker 自己的卡片上
-  const shownRules = rules.filter((r) => trgShown(r, trgFilter));
-  const liveAuto = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status) && r.mode === "auto").length;
-  const liveWatch = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status) && r.mode === "wake").length;
+  const rules = allRules.filter((r) => !r.recorder && (r.type === "watch") === watchPage);
+  const actions = [...new Set(rules.flatMap((r) => r.action ? [r.action] : []))];
+  const actionFilter = !watchPage && actions.includes(trgAction) ? trgAction : "";
+  const shownRules = rules.filter((r) => trgShown(r, trgFilter) && (!actionFilter || r.action === actionFilter));
+  const liveTriggers = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status) && r.type !== "watch").length;
+  const liveWatch = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status) && r.type === "watch").length;
   const openWork = work.filter((w) => w.status === "running" || w.status === "queued" || w.status === "waiting");
   const pastWork = work.filter((w) => w.status === "done" || w.status === "failed").slice(0, 4);
 
@@ -689,12 +627,14 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
         onSelect={(v) => {
           setSel(v);
           if (v === "router") {
-            setRecipient("router");
             setTab("chat");
           } else {
             const rule = stForNode(v);
-            setSideTab(v.endsWith(":pos") ? "positions" : rule ? (rule.recorder ? "overview" : rule.mode === "wake" ? "watch" : "triggers") : v.includes(":") && !v.endsWith(":quant") ? "tasks" : "overview");
-            if (rule) setTrgFilter("all");
+            setSideTab(v.endsWith(":pos") ? "positions" : rule ? (rule.recorder ? "overview" : rule.type === "watch" ? "watch" : "triggers") : v.includes(":") && !v.endsWith(":quant") ? "tasks" : "overview");
+            if (rule) {
+              setTrgFilter("all");
+              setTrgAction("");
+            }
             setTab("coin");
           }
         }}
@@ -745,7 +685,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
       <div className="ws3-panel">
         <div className="ws3-tabs">
           <button className={tab === "chat" ? "on" : ""} onClick={() => setTab("chat")}>
-            {selInst ? `${shortInst(selInst)} Worker` : "Router"}
+            Agent 对话
             {waiting > 0 && <i>{waiting}</i>}
           </button>
           <button className={tab === "coin" ? "on" : ""} onClick={() => setTab("coin")}>
@@ -754,13 +694,12 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
         </div>
       <section className="ws2-chat" hidden={tab !== "chat"}>
         <div className="ws-chat-head">
-          <strong>{target}</strong>
+          <strong>{feed === "all" ? "团队动态" : "Agent 对话"}</strong>
           <button className="btn xs" aria-pressed={feed === "all"} onClick={() => setFeed(feed === "router" ? "all" : "router")}>
-            {feed === "all" ? "收起团队动态" : `查看团队动态${hiddenTurns ? ` (${hiddenTurns})` : ""}`}
+            {feed === "all" ? "返回对话" : "查看团队动态"}
           </button>
         </div>
-        {feed === "router" ? (
-          <ChatPanel inst={coin} config={cfg} agent={agent} defaultEffort={cfg.reasoning_effort} shown={shownPlan}
+          <ChatPanel inst={coin} config={cfg} agent={agent} defaultEffort={cfg.reasoning_effort} shown={shownPlan} hidden={feed === "all"}
             onShow={(plan) => {
               setShownPlan(plan);
               if (plan) {
@@ -770,7 +709,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                 setSideTab("chart");
               }
             }} onActed={refresh} onUi={applyUi} />
-        ) : <>
+        {feed === "all" && (
         <div
           className="thread"
           ref={scroller}
@@ -781,10 +720,10 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
         >
           {turns.length === 0 && (
             <div className="ws-empty">
-              {selInst ? `直接和 ${target} 对话。` : "直接问 Router，或告诉它你的目标和偏好。输入 /简报 查看最近记录。"}
+              暂无团队动态
             </div>
           )}
-          {[...turns, ...(!selInst && live["router:"] && !liveTurn.has("router:") ? [{ key: "router-live", ts: Date.now(), agent: "router", inst: "", steps: [], asks: [], notes: [], done: false } as Turn] : [])].map((t) =>
+          {[...turns, ...(live["router:"] && !liveTurn.has("router:") ? [{ key: "router-live", ts: Date.now(), agent: "router", inst: "", steps: [], asks: [], notes: [], done: false } as Turn] : [])].map((t) =>
             t.user !== undefined ? (
               <div key={t.key} className="msg user">
                 <div className="bub">
@@ -800,7 +739,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                   )}
                 </div>
                 <time>
-                  {selInst == null ? (t.inst ? `对 ${shortInst(t.inst)} Worker · ` : "对 Router · ") : ""}
+                  {t.inst ? `对 ${shortInst(t.inst)} Worker · ` : "对 Router · "}
                   {t.sub ? `${t.sub} · ` : ""}
                   {fmtTime(t.ts)}
                 </time>
@@ -815,7 +754,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                       {NAME[t.agent] ?? t.agent}
                     </b>
                     <time>{fmtTime(t.ts)}</time>
-                    {!t.done && !t.asks.length && liveTurn.get(liveKey(t)) === t.key && (t.agent !== "router" || sending > 0 || liveOf(t)) && <span className="typing">处理中…</span>}
+                    {!t.done && !t.asks.length && liveTurn.get(liveKey(t)) === t.key && (t.agent !== "router" || liveOf(t)) && <span className="typing">处理中…</span>}
                   </div>
                   <div className="bub">
                     {t.trigger && t.agent !== "strategy" && t.agent !== "watchdog" && <div className="trigger">{t.agent === "router" ? t.trigger : `被唤醒：${t.trigger}`}</div>}
@@ -867,114 +806,8 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               </div>
             ),
           )}
-          {confirms.map((c, k) => (
-            <div key={`c${k}`} className="msg agent ag-router has-ask">
-              <i className="ava">R</i>
-              <div className="col">
-                <div className="bub">
-                  <div className="ask-card waiting">
-                    <div className="ask-head">
-                      <b>修改设置</b>
-                      <span>等你同意</span>
-                    </div>
-                    <div className="ask-text">{c.summary}</div>
-                    <div className="row">
-                      <button
-                        className="btn sm primary"
-                        onClick={() =>
-                          act(`cf${k}`, async () => {
-                            await api.saveConfig({ ...cfg, ...c.patch, risk: { ...cfg.risk, ...(c.patch.risk ?? {}) } }, cfg.env === "live");
-                            setConfirms((all) => all.filter((x) => x !== c));
-                          }, "设置已修改")
-                        }
-                      >
-                        同意修改
-                      </button>
-                      <button className="btn sm" onClick={() => setConfirms((all) => all.filter((x) => x !== c))}>
-                        不改
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          ))}
-          {sending > 0 && !turns.some((t) => t.user === undefined && (!t.done || t.handed) && t.ts >= lastUserTs) && !live["router:"] && (
-            <div className="msg agent running">
-              <i className="ava">{selInst ? "W" : "R"}</i>
-              <div className="col">
-                <div className="meta">
-                  <b>{target}</b>
-                  <span className="typing">收到了，正在处理…</span>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
-        <div className="composer">
-          <Composer
-            value={text}
-            onChange={(v) => (setAtOff(false), setText(v))}
-            inputRef={inputRef}
-            placeholder={selInst ? `直接问 ${target}` : "问 Router，或交代目标和偏好"}
-            queueKey={`ws:${cfg.env}:${selInst ?? "router-chat"}`}
-            busy={busyWorker || sending > 0}
-            busyText={`${target} 正在忙`}
-            onSend={send}
-            onKey={(e) => {
-              if (!atList.length) return false;
-              if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                insertAt(atList[0]);
-                return true;
-              }
-              if (e.key === "Escape") setAtOff(true);
-              return false;
-            }}
-            pop={
-              atList.length > 0 && (
-                <div className="at-pop">
-                  {atList.map((n, i) => (
-                    <button type="button" key={n} className={i === 0 ? "first" : ""} onMouseDown={(e) => e.preventDefault()} onClick={() => insertAt(n)}>
-                      @{n}
-                      <span>{n === "Router" ? "Router" : `${n} Worker`}</span>
-                    </button>
-                  ))}
-                </div>
-              )
-            }
-            left={
-              <div className="to-tabs">
-                <button type="button" className={!selInst ? "on" : ""} onClick={() => setRecipient("router")}>
-                  Router
-                </button>
-                {cfg.instruments.map((i) => (
-                  <button type="button" key={i} className={selInst === i ? "on" : ""} title="切换为直接对话；长按插入 @币种" {...longPress(shortInst(i))} onClick={() => { if (press.current.fired) press.current.fired = false; else { setRecipient(i); setSel(i); } }}>
-                    {shortInst(i)} Worker
-                  </button>
-                ))}
-              </div>
-            }
-            right={
-              <button
-                type="button"
-                className="cmp-link"
-                disabled={!!acting}
-                title={selInst ? `清空和 ${target} 的这段对话记录。正在进行的任务、触发器、持仓不受影响` : "清空全部对话记录。正在进行的任务、触发器、持仓不受影响"}
-                onClick={() =>
-                  window.confirm(`清空${selInst ? `和 ${target} 的` : "全部"}对话记录？正在进行的任务、触发器、持仓和挂单不受影响。`) &&
-                  act("clear-talk", async () => {
-                    await api.clearHistory(selInst ?? "", "talk");
-                    resetActivity();
-                  }, "对话记录已清空")
-                }
-              >
-                清空对话
-              </button>
-            }
-          />
-        </div>
-        </>}
+        )}
       </section>
 
       <aside className="ws2-side" hidden={tab !== "coin"}>
@@ -1008,7 +841,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             <button key={id} className={sideTab === id ? "on" : ""} onClick={() => setSideTab(id)}>
               {label}
               {id === "tasks" && openWork.length > 0 && <em>{openWork.length}</em>}
-              {id === "triggers" && liveAuto > 0 && <em>{liveAuto}</em>}
+              {id === "triggers" && liveTriggers > 0 && <em>{liveTriggers}</em>}
               {id === "watch" && liveWatch > 0 && <em>{liveWatch}</em>}
               {id === "positions" && pos && <em>1</em>}
             </button>
@@ -1381,9 +1214,15 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               ))}
             </div>
           </div>
+          {!watchPage && actions.length > 0 && (
+            <select aria-label="按动作筛选触发器" value={actionFilter} onChange={(e) => setTrgAction(e.target.value)}>
+              <option value="">全部动作</option>
+              {actions.map((id) => <option key={id} value={id}>{RULE_ACTION[id] ?? id}</option>)}
+            </select>
+          )}
           {shownRules.length === 0 && (
             <p className="muted trg-empty">
-              {watchPage
+              {actionFilter ? "没有符合当前动作和状态筛选的触发器。" : watchPage
                 ? trgFilter === "ended" ? "最近 12 小时没有结束的观察线。" : "现在没有观察线。Worker 写了「到某个位置叫我来看」会出现在这里。"
                 : trgFilter === "ended" ? "最近 12 小时没有执行过或结束的触发器。" : "现在没有在等的触发器。Worker 写了「到某个情况就做某件事」会出现在这里。"}
             </p>
@@ -1409,7 +1248,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                 </div>
               </div>
               <span className={`trg-mode m-${r.mode}`} title={RULE_MODE[r.mode][1]}>
-                {RULE_MODE[r.mode][0]}
+                {r.action && RULE_ACTION[r.action] || RULE_MODE[r.mode][0]}
               </span>
               <div className="trg-act">
                 {r.strategy_id && r.status === "proposed" && (

@@ -137,7 +137,10 @@ export default function App() {
         else if (msg.type === "journal") {
           setJournal((j) => [msg.data, ...j].slice(0, 300));
           if (msg.data.kind === "alert") toast(msg.data.title, "error");
-        } else if (msg.type === "pending") handlers.current.loadFeeds();
+        } else if (msg.type === "pending") {
+          handlers.current.loadFeeds();
+          window.dispatchEvent(new CustomEvent("ouy:chat"));
+        }
         else if (msg.type === "activity") {
           lastActivity.current = Math.max(lastActivity.current, msg.data.id);
           setActivity((all) => (all.some((x) => x.id === msg.data.id) ? all : [...all, msg.data].slice(-600)));
@@ -313,11 +316,6 @@ export default function App() {
             setInst={setInst}
             refresh={refresh}
             onTrade={() => setTab("cockpit")}
-            resetActivity={() => {
-              lastActivity.current = 0;
-              setActivity([]);
-              loadActivity();
-            }}
           />
         )}
         {tab === "cockpit" && (

@@ -868,14 +868,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/api/agent/interject")
     async def agent_interject(request: Request, body: InterjectIn):
-        """对某个币的 Worker 插话：它正在思考就插进这一轮，空闲就放进信箱。"""
+        """旧对话入口也走 Worker 提案流程。"""
         rt = rt_of(request)
         inst = body.inst_id.upper()
         if inst not in rt.config().instruments:
             raise HTTPException(400, "这个品种不在盯盘列表里。")
-        out = rt.watcher.interject(inst, body.message.strip(), "用户")
-        rt.bus.publish("agent", rt.watcher.status())
-        return out
+        out = await rt.watcher.chat(body.message.strip(), thread=inst, inst_id=inst, to="worker", queue=True)
+        return {"delivered": True, "message": out["reply"], **out}
 
     @app.get("/api/strategies")
     async def strategies(request: Request, inst_id: str = "", all: bool = False):
@@ -913,20 +912,25 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         rt = rt_of(request)
         try:
             changes = body.model_dump(exclude_none=True)
-            row = rt.watcher.strategies.edit(strategy_id, changes, "用户改的")
+            row = rt.watcher.strategies.edit(strategy_id, changes, "用户改的", env=rt.config().env)
         except Rejected as exc:
             raise HTTPException(400, str(exc)) from exc
         rt.bus.publish("agent", rt.watcher.status())
+        rt.bus.publish("chat", {})
         return row
 
     @app.post("/api/strategies/{strategy_id}/{verb}")
     async def strategy_act(request: Request, strategy_id: int, verb: Literal["approve", "cancel"]):
-        engine = rt_of(request).watcher.strategies
-        row = engine.approve(strategy_id) if verb == "approve" else engine.cancel(strategy_id, "用户撤销")
+        rt = rt_of(request)
+        engine, env = rt.watcher.strategies, rt.config().env
+        try:
+            row = engine.approve(strategy_id, env=env) if verb == "approve" else engine.cancel(strategy_id, "用户撤销", env=env)
+        finally:
+            rt.watcher.on_decided()
+            rt.bus.publish("agent", rt.watcher.status())
+            rt.bus.publish("chat", {})
         if not row:
             raise HTTPException(404, "没有这条策略。")
-        rt_of(request).watcher.on_decided()
-        rt_of(request).bus.publish("agent", rt_of(request).watcher.status())
         return row
 
     @app.get("/api/logs")

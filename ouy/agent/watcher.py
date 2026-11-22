@@ -840,6 +840,8 @@ class Watcher:
         """活动流里记一步并实时推给界面。agent: router / worker / intel / smart / risk；kind: wake / tool / result / handoff / action / done / skip / error。"""
         try:
             self.bus.publish("activity", self.store.add_activity(env, inst_id, agent, kind, text, work_id, data))
+            if agent == "strategy" and kind == "done" and (data or {}).get("strategy_id"):
+                self.bus.publish("chat", {})
             if agent == "strategy" and (data or {}).get("notify_worker"):
                 self._algo(env, inst_id, "rule", text, "程序已按规则处理，并通知 Worker")
                 feedback = f"策略 #{data['strategy_id']} 的执行回报（不是新的交易指令）：{text}"
@@ -927,9 +929,11 @@ class Watcher:
             observation = bool(p.get("observation"))
             task = row["kind"] == "trigger" and p["do"] in ("task", "router_task")
             wake = (row["kind"] == "trigger" and p["do"] == "wake") or (row["kind"] == "profit_guard" and p["on_trigger"] == "notify")
+            action = p["do"] if row["kind"] == "trigger" else "wake" if wake else row["kind"]
             level = p.get("level") if row["kind"] == "trigger" and p["when"].startswith(("price", "close")) else p.get("trigger")
             out.append({
-                "id": f"s{row['id']}", "type": "watch" if observation else row["kind"], "label": "观察线" if observation else label_of(row), "when": when, "do": do, "mode": "task" if task else "wake" if wake else "auto",
+                "id": f"s{row['id']}", "type": "watch" if observation else row["kind"], "label": "观察线" if observation else label_of(row), "when": when, "do": do,
+                "action": action, "mode": "task" if task else "wake" if wake else "auto",
                 "status": status.get(row["status"], row["status"]), "by": p.get("by") or "Worker", "ts": row["ts"], "updated_ts": row["updated_ts"], "note": row["note"],
                 "level": level, "strategy_id": row["id"], "expires_ts": p.get("expires_ts"),
                 # 记录器：Worker 小组里的节点，条件是程序记录的数据，数值可以直接改
@@ -938,14 +942,14 @@ class Watcher:
             })
         for g in self.trader.order_guards(env, inst_id):
             what = f"撤掉 {g['price']:g} 的限价{'买' if g['side'] in ('long', 'buy') else '卖'}单"
-            base = {"type": "order", "label": "挂单撤单", "do": what, "mode": "auto", "status": "waiting", "by": "Worker", "ts": g["ts"], "updated_ts": g["ts"], "note": "", "strategy_id": None, "ord_id": g["ord_id"]}
+            base = {"type": "order", "label": "挂单撤单", "do": what, "action": "cancel_orders", "mode": "auto", "status": "waiting", "by": "Worker", "ts": g["ts"], "updated_ts": g["ts"], "note": "", "strategy_id": None, "ord_id": g["ord_id"]}
             if g.get("cancel_px"):
                 out.append({**base, "id": f"o{g['ord_id']}c", "when": f"还没成交，价格先到 {g['cancel_px']:g}", "level": g["cancel_px"], "expires_ts": None})
             if g.get("expires_ts"):
                 out.append({**base, "id": f"o{g['ord_id']}t", "when": "到时间还没成交", "level": None, "expires_ts": g["expires_ts"]})
         goal = self.goal(env, inst_id)
         if goal and goal["status"] == "active":
-            base = {"type": "stop", "label": "停止条件", "mode": "auto", "status": "waiting", "by": goal.get("by") or "你", "ts": goal["ts"], "updated_ts": goal["ts"], "note": goal["goal"], "level": None, "strategy_id": None, "expires_ts": None}
+            base = {"type": "stop", "label": "停止条件", "action": "stop", "mode": "auto", "status": "waiting", "by": goal.get("by") or "你", "ts": goal["ts"], "updated_ts": goal["ts"], "note": goal["goal"], "level": None, "strategy_id": None, "expires_ts": None}
             do = "撤单、平仓，这个 Worker 停下不再开仓"
             if goal.get("target_usdt") is not None:
                 together = "（和 " + "、".join(i.split("-")[0] for i in goal["shared_with"]) + " 合起来算）" if goal.get("shared_with") else ""
@@ -3212,9 +3216,11 @@ class Watcher:
                 return "denied", "超过 10 分钟没有得到用户同意，这次操作已作废。行情可能已经变了，请按最新情况重新判断。"
             return ("waiting", "") if row["status"] in ("waiting", "running") else ("approved", "")
         row = self.store.get_strategy(call.get("strategy_id") or 0)
+        if row:
+            row = self.strategies.expire(row)
         if row and row["status"] == "proposed":
             return "waiting", ""
-        if not row or row["status"] == "cancelled":
+        if not row or row["status"] in ("cancelled", "expired"):
             return "denied", f"用户没有同意启用这条策略（{row['note'] if row else '已删除'}）。"
         return "approved", ""
 
@@ -3728,6 +3734,11 @@ class Watcher:
         work_id = self.store.add_work(cfg.env, inst_id, "user", (goal or task)[:300], "queued" if st.lock.locked() else "running", model=cfg.model_for(inst_id))
         self.bus.publish("work", {"inst_id": inst_id})
         async with self._turn(cfg, inst_id, "处理交来的任务"):
+            if cfg.env != self.get_config().env:
+                reason = "交易环境已切换，请在当前环境重新发起任务。"
+                self.store.update_work(work_id, "failed", reason)
+                self.bus.publish("work", {"inst_id": inst_id})
+                return reason
             return await self._dispatch_once(cfg, inst_id, task, parent, work_id, said=goal if who == "用户" else "")
 
     async def _dispatch_once(self, cfg: AgentConfig, inst_id: str, task: str, parent: Deps, work_id: int, said: str = "") -> str:
@@ -3887,7 +3898,7 @@ class Watcher:
             self.store.set(f"chat:{thread}", log[-200:])
             return {"reply": "", "steered": True, "actions": [], "steps": [], "confirms": [], "ui": [], "from": f"{inst_id} Worker"}
         actions = [a.model_dump(mode="json") for a in deps.actions]
-        if any(r["kind"] == "task" for r in self.awaiting(cfg.env, inst_id)):  # 它调用的工具要你同意：这一轮挂着
+        if deps.cards:  # 只看这一轮的确认卡
             reply = "我想做下面这件事，需要你同意。你点同意或不执行之后，我接着往下做，结果发在这里。"
             actions = [*[a for a in actions if a.get("status") != "pending"], *deps.cards]
         steps = deps.trace[0] if deps.trace else []
@@ -3898,6 +3909,7 @@ class Watcher:
             {"role": "ai", "text": reply, "actions": actions, "steps": steps, "confirms": [], "from": who, "ts": now},
         ]
         self.store.set(f"chat:{thread}", log[-200:])
+        self.bus.publish("chat", {"thread": thread})
         return {"reply": reply, "actions": self._with_pending_status(actions), "steps": steps, "confirms": [], "ui": [], "from": who}
 
     async def chat(self, message: str, effort: str | None = None, thread: str = "general", inst_id: str | None = None, to: str = "router", queue: bool = False,
@@ -3914,7 +3926,7 @@ class Watcher:
             trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, propose_only=True, control=self.control,
             dispatch=self._dispatch, board=self._board, intel=self.intel, effort=effort,
             general=self._general, only=at or None, user_request=message if origin == "用户" else "",  # 触发器派来的不是用户本人的话：不能启停盯盘
-            emit=self._emitter(cfg.env, inst_id or "", "router", None), interject=self.interject, goal=self.set_goal,
+            emit=self._emitter(cfg.env, inst_id or "", "router", None), goal=self.set_goal,
             images=pics, image_names=list(images or []) if pics else [],
         )
         self._emit(cfg.env, inst_id or "", "router", "wake", f"{origin}：{message}", None, {"source": "user" if origin == "用户" else "trigger", "thread": thread, **({"images": deps.image_names} if pics else {})})
@@ -3939,6 +3951,8 @@ class Watcher:
         self._chat_histories[thread] = history
         self.store.set(f"chat_hist:{thread}", ModelMessagesTypeAdapter.dump_python(history, mode="json"))
         actions = [a.model_dump(mode="json") for a in deps.actions]
+        card_ids = {card["pending_id"] for card in deps.cards if card.get("pending_id")}
+        actions = [a for a in actions if a.get("pending_id") not in card_ids] + deps.cards
         # Router 自己的步骤里，每个 ask_worker 后面接上那个 Worker 实际做的事
         steps, traces = [], list(deps.trace)
         for step in _tool_steps(result.new_messages()):
@@ -3950,23 +3964,34 @@ class Watcher:
         log = self.store.get(f"chat:{thread}", [])
         log += [
             {"role": "user", "text": message if origin == "用户" else f"【{origin}】{message}", "ts": now, **({"images": deps.image_names} if pics else {})},
-            {"role": "ai", "text": result.output, "actions": actions, "steps": steps, "confirms": confirms, "ts": now},
+            {"role": "ai", "text": result.output, "actions": actions, "steps": steps, "confirms": confirms, "ts": now, "env": cfg.env},
         ]
         self.store.set(f"chat:{thread}", log[-200:])
+        self.bus.publish("chat", {"thread": thread})
         self._emit(cfg.env, inst_id or "", "router", "done", result.output, None, {"thread": thread})
         return {"reply": result.output, "actions": self._with_pending_status(actions), "steps": steps, "confirms": confirms, "ui": deps.ui}
 
     def _with_pending_status(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """方案卡片要显示它现在的状态：等确认 / 已执行 / 已忽略 / 已过期。"""
         out = []
+        env = self.get_config().env
         for action in actions:
-            if action.get("strategy_id"):  # 等同意的策略：proposed 还在等，cancelled 是没同意，其余是已启用
+            if action.get("strategy_id"):
                 srow = self.store.get_strategy(action["strategy_id"])
-                state = "waiting" if srow and srow["status"] == "proposed" else "declined" if not srow or srow["status"] == "cancelled" else "executed"
-                out.append({**action, "pending_status": state, "pending_result": {"message": (srow or {}).get("note", "")}})
+                if not srow or srow["env"] != env:
+                    out.append({**action, "pending_status": "unavailable"})
+                    continue
+                srow = self.strategies.expire(srow)
+                state = "waiting" if srow["status"] == "proposed" else srow["status"]
+                if srow["params"].get("off") and state in ("armed", "active"):
+                    state = "disabled"
+                result = srow["state"].get("last_result") or {}
+                out.append({**action, "message": describe_strategy(srow), "pending_status": state,
+                            "pending_result": {**result, "message": srow["note"]}})
                 continue
             row = self.store.get_pending(action["pending_id"]) if action.get("pending_id") else None
-            out.append({**action, "pending_status": row["status"] if row else None, "pending_result": (row or {}).get("result") or None})
+            status = row["status"] if row and row["env"] == env else "unavailable" if action.get("pending_id") else None
+            out.append({**action, "pending_status": status, "pending_result": (row or {}).get("result") or None})
         return out
 
     def chat_log(self, thread: str) -> list[dict[str, Any]]:
@@ -3980,3 +4005,4 @@ class Watcher:
         self._chat_histories.pop(thread, None)
         self.store.delete(f"chat_hist:{thread}")
         self.store.delete(f"chat:{thread}")
+        self.bus.publish("chat", {"thread": thread})

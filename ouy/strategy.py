@@ -231,7 +231,7 @@ class StrategyEngine:
 
     # ---------- 布置 / 撤销 ----------
 
-    def deploy(self, cfg: AgentConfig, inst_id: str, kind: str, side: str, params: dict[str, Any], *, source: str = "agent", note: str = "", by: str = "") -> dict[str, Any]:
+    def deploy(self, cfg: AgentConfig, inst_id: str, kind: str, side: str, params: dict[str, Any], *, source: str = "agent", note: str = "", by: str = "", require_approval: bool = False) -> dict[str, Any]:
         if kind not in KINDS:
             raise Rejected(f"没有这种策略：{kind}")
         if inst_id not in cfg.instruments:
@@ -270,10 +270,6 @@ class StrategyEngine:
             params["max_layers"] = min(int(params.get("max_layers") or 4), cfg.risk.max_adds + 1)  # 补几次受「最多加仓次数」限制
             params.setdefault("take_profit_pct", round(cfg.taker_fee_pct * 2 + 0.05, 3))  # 保本位：均价再让出往返手续费
         self._validate(kind, side, params)
-        if kind == "martingale":  # 这笔仓改由马丁管：原来挂在它上面的移保本 / 超时离场会和补仓打架，先停掉
-            for old in self.store.strategies(cfg.env, inst_id):
-                if old["kind"] == "manage" and old["status"] in LIVE:
-                    self.store.update_strategy(old["id"], status="cancelled", note="这笔仓改由程序马丁管理")
         if params.get("expires_minutes"):
             params["expires_ts"] = now_ms() + int(params["expires_minutes"]) * 60_000
         params["by"] = by or ("Worker" if source == "agent" else "你")
@@ -282,20 +278,49 @@ class StrategyEngine:
             permission = "observe"
         if source == "agent" and permission == "off":
             raise Rejected("用户把这类操作设成了不允许 Agent 做，不能布置自动执行的策略。")
-        status = "proposed" if source == "agent" and permission == "confirm" else "active" if kind in ("manage", "profit_guard") else "armed"
-        if kind not in ("profit_guard", "trigger"):  # 触发器、分笔止盈可以同时有好几条，互不替换
-            for old in self.store.strategies(cfg.env, inst_id):
-                if old["kind"] == kind and old["side"] == side and old["status"] in ("proposed", "armed"):
-                    self.store.update_strategy(old["id"], status="cancelled", note="被新布置的同类策略替换")
+        needs_approval = permission == "confirm" or (require_approval and permission != "observe")
+        status = "proposed" if source == "agent" and needs_approval else "active" if kind in ("manage", "profit_guard") else "armed"
         row = self.store.add_strategy(cfg.env, inst_id, kind, side, params, status, note)
+        if status != "proposed":
+            self._replace_rules(row)
         if not params.get("observation"):
             self.emit(cfg.env, inst_id, "strategy", "wake", f"{'等你同意后启用' if status == 'proposed' else '已布置'}{KINDS[kind]['label']}：{describe(row)}", None, {"strategy_id": row["id"], "status": status})
         return row
 
-    def edit(self, strategy_id: int, changes: dict[str, Any], why: str = "", side: str | None = None, replace: bool = False) -> dict[str, Any]:
+    def _replace_rules(self, row: dict[str, Any]) -> None:
+        if row["kind"] in ("profit_guard", "trigger"):
+            return
+        for old in self.store.strategies(row["env"], row["inst_id"]):
+            if old["id"] == row["id"]:
+                continue
+            if row["kind"] == "martingale" and old["kind"] == "manage" and old["status"] in LIVE:
+                self.cancel(old["id"], "这笔仓改由程序马丁管理")
+            elif old["kind"] == row["kind"] and old["side"] == row["side"] and (
+                old["status"] == "armed" or (old["status"] == "proposed" and old["id"] < row["id"])
+            ):
+                self.cancel(old["id"], "被新启用的同类策略替换")
+
+    def expire(self, row: dict[str, Any]) -> dict[str, Any]:
+        if row["status"] not in ("proposed", "armed"):
+            return row
+        clock = now_ms()
+        p = row["params"]
+        # An edited proposal gets its own approval window.
+        if (p.get("expires_ts") and clock >= p["expires_ts"]) or (
+            row["status"] == "proposed" and clock - p.get("effective_ts", row["ts"]) >= PROPOSAL_TTL_MS
+        ):
+            note = "到时间还没触发，规则已过期" if row["status"] == "armed" else "等待确认超时，规则已过期，应按最新行情重新评估"
+            self.store.update_strategy(row["id"], status="expired", note=note)
+            return {**row, "status": "expired", "note": note}
+        return row
+
+    def edit(self, strategy_id: int, changes: dict[str, Any], why: str = "", side: str | None = None, replace: bool = False, *, env: str | None = None, require_approval: bool = False) -> dict[str, Any]:
         """直接改一条还没触发的触发器 / 入场策略的价位（条件价、挂单价、止损止盈、有效期），不用撤掉重写。改完重新开始等条件。"""
         row = self.store.get_strategy(strategy_id)
-        if not row or row["kind"] not in ("trigger", "breakout", "pullback") or row["status"] not in ("proposed", "armed"):
+        if not row or (env is not None and row["env"] != env):
+            raise Rejected("当前交易环境没有这条规则。")
+        row = self.expire(row)
+        if row["kind"] not in ("trigger", "breakout", "pullback") or row["status"] not in ("proposed", "armed"):
             raise Rejected("只能修改还没触发的触发器或入场策略；已经触发、结束的改不了。")
         changes = {k: v for k, v in changes.items() if v is not None}
         if row["kind"] != "trigger" and "level" in changes:
@@ -311,25 +336,49 @@ class StrategyEngine:
         self._validate(row["kind"], side, params)
         if changes.get("expires_minutes"):
             params["expires_ts"] = now_ms() + int(changes["expires_minutes"]) * 60_000
-        keep = {k: row["state"][k] for k in ("runs", "last_run") if k in row["state"]}  # 改数值不清掉「执行过几次」
-        self.store._exec("UPDATE strategies SET params=?, side=?, state=?, note=?, updated_ts=? WHERE id=?", (json.dumps(params, ensure_ascii=False), side, json.dumps(keep), why[:300] or row["note"], now_ms(), strategy_id))
+        status = "proposed" if require_approval else row["status"]
+        keep = {k: row["state"][k] for k in ("runs", "last_run") if k in row["state"]}
+        if require_approval and row["status"] == "armed":
+            keep.update(replaces=row["id"], replaces_params=row["params"], replaces_side=row["side"])
+            updated = self.store.add_strategy(row["env"], row["inst_id"], row["kind"], side, params, status, why[:300] or row["note"])
+            self.store.update_strategy(updated["id"], state=keep)
+            return self.store.get_strategy(updated["id"])
+        keep.update({k: row["state"][k] for k in ("replaces", "replaces_params", "replaces_side") if k in row["state"]})
+        if status == "armed" and not replace:
+            keep.update({k: row["state"][k] for k in ("approved", "approved_ts") if k in row["state"]})
+        self.store._exec("UPDATE strategies SET params=?, side=?, state=?, status=?, note=?, updated_ts=? WHERE id=?", (json.dumps(params, ensure_ascii=False), side, json.dumps(keep), status, why[:300] or row["note"], now_ms(), strategy_id))
         row = self.store.get_strategy(strategy_id)
         self.emit(row["env"], row["inst_id"], "strategy", "wake", f"{label_of(row)} #{strategy_id} 已修改：{describe(row)}", None, {"strategy_id": strategy_id})
         return row
 
-    def cancel(self, strategy_id: int, why: str = "手动撤销") -> dict[str, Any] | None:
+    def cancel(self, strategy_id: int, why: str = "手动撤销", *, env: str | None = None) -> dict[str, Any] | None:
         row = self.store.get_strategy(strategy_id)
-        if row and row["status"] in ("proposed", *LIVE):
+        if not row or (env is not None and row["env"] != env):
+            return None
+        if row["status"] in ("proposed", *LIVE):
             self.store.update_strategy(strategy_id, status="cancelled", note=why)
             self.emit(row["env"], row["inst_id"], "strategy", "done", f"{label_of(row)}已撤销：{why}", None, {"strategy_id": strategy_id})
         return self.store.get_strategy(strategy_id)
 
-    def approve(self, strategy_id: int) -> dict[str, Any] | None:
+    def approve(self, strategy_id: int, *, env: str | None = None) -> dict[str, Any] | None:
         row = self.store.get_strategy(strategy_id)
-        if row and row["status"] == "proposed":
-            self.store.update_strategy(strategy_id, status="active" if row["kind"] in ("manage", "profit_guard") else "armed",
-                                       state={**row["state"], "approved": True, "approved_ts": now_ms()})
+        if not row or (env is not None and row["env"] != env):
+            return None
+        row = self.expire(row)
+        if row["status"] == "proposed":
+            if old_id := row["state"].get("replaces"):
+                old = self.store.get_strategy(old_id)
+                if (not old or old["status"] != "armed" or old["params"] != row["state"]["replaces_params"]
+                        or old["side"] != row["state"]["replaces_side"] or old["state"].get("last_run") != row["state"].get("last_run")):
+                    self.cancel(row["id"], "原规则已改变或触发，请重新核对")
+                    raise Rejected("原规则已改变或触发，请重新核对。")
+                self.cancel(old_id, f"被确认后的规则 #{row['id']} 替换")
+            status = "active" if row["kind"] in ("manage", "profit_guard") else "armed"
+            self.store.update_strategy(strategy_id, status=status, state={**row["state"], "approved": True, "approved_ts": now_ms()})
+            self._replace_rules(row)
             self.emit(row["env"], row["inst_id"], "strategy", "wake", f"你已同意，{label_of(row)}开始运行：{describe(row)}", None, {"strategy_id": strategy_id})
+        else:
+            raise Rejected(f"这条规则已处理：{row['note']}" if row["status"] == "expired" else "这条规则已经处理过了。")
         return self.store.get_strategy(strategy_id)
 
     @staticmethod
@@ -340,6 +389,8 @@ class StrategyEngine:
                 raise Rejected(f"{KINDS[kind]['label']}缺少参数：{'、'.join(missing)}")
 
         if kind == "trigger":
+            if p.get("observation") and (p.get("when"), p.get("do")) != ("price_touch", "wake"):
+                raise Rejected("观察线只支持碰价时叫醒 Worker。")
             need("when", "do")
             if p["do"] not in TRIGGER_DO:
                 raise Rejected(f"触发器的操作只能是 {' / '.join(TRIGGER_DO)}。")
@@ -468,16 +519,14 @@ class StrategyEngine:
         self._busy = True
         try:
             for row in self.store.strategies(cfg.env):
-                if row["status"] == "proposed" and now_ms() - row["ts"] > PROPOSAL_TTL_MS:
-                    self.cancel(row["id"], "超过 10 分钟没有同意，行情已变，作废")
+                if not self._current(row) or self.trader.get_config().env != cfg.env:
                     continue
+                row = self.expire(row)
                 px = prices.get(row["inst_id"])
                 if row["status"] not in LIVE or not px:
                     continue
                 if cfg.worker(row["inst_id"]).paused or time.time() < row["state"].get("retry_at", 0) or row["params"].get("off"):
                     continue
-                if row["params"].get("recorder") and cfg.worker(row["inst_id"]).standby and not account.position(row["inst_id"]):
-                    continue  # Worker 停下且空仓：它的记录器也不动
                 bound = row["params"].get("lot_id") if row["kind"] == "trigger" else None
                 if bound and not self._lot(cfg.env, row["inst_id"], bound) and not any(l["id"] == bound for l in self.trader.lots(cfg.env, row["inst_id"])):
                     self.cancel(row["id"], f"第 #{bound} 笔仓位已经平掉，这条规则跟着作废")  # 不是出错：不报警、不重试
@@ -520,6 +569,8 @@ class StrategyEngine:
                 current = self.trader.get_config()
                 if not self._current(row) or current.env != cfg.env or current.worker(row["inst_id"]).paused:
                     raise Rejected("规则已经修改、撤销或暂停")
+                if self.expire(row)["status"] == "expired":
+                    raise Rejected("规则已过期")
                 permission = current.permission_for(action.kind, action.inst_id)
                 if permission == "off" or (permission == "confirm" and row["params"].get("by") != "你" and not row["state"].get("approved")):
                     raise Rejected("当前权限不允许执行这条规则")
@@ -759,6 +810,7 @@ class StrategyEngine:
             return "cancelled", f"{cond} 已满足，但你把这类操作关掉了，没有执行"
         try:
             result = await self._order(cfg, row, action, "触发器执行")
+            state["last_result"] = result.model_dump(mode="json")
             verb = "订单已提交，成交以交易所为准" if action.kind in ("open", "add") else "已执行"
             ok, text = True, f"{cond} 已满足，{verb}：{result.message}"
         except (Rejected, OkxError) as exc:

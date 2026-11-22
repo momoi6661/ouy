@@ -437,6 +437,29 @@ async def test_chat_turns_an_entry_into_a_proposal_the_user_confirms(settings, f
     assert rt.watcher.chat_log("BTC-USDT-SWAP") == []
 
 
+async def test_router_returns_workers_trigger_approval_in_the_shared_conversation(settings, fake):
+    def run(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        router = any(tool.name == "ask_worker" for tool in info.function_tools)
+        answered = any(isinstance(part, ToolReturnPart) for msg in messages[-1:] for part in msg.parts)
+        if router:
+            assert not any(tool.name == "tell_worker" for tool in info.function_tools)
+            if not answered:
+                return ModelResponse(parts=[ToolCallPart("ask_worker", {"inst_id": BTC, "task": "准备突破入场触发器"})])
+            return ModelResponse(parts=[TextPart("等你同意。")])
+        return ModelResponse(parts=[ToolCallPart("add_trigger", {
+            "inst_id": BTC, "when": "price_above", "level": 60_250, "do": "open_market",
+            "side": "long", "stop_loss": 59_900, "reason": "突破入场",
+        })])
+
+    rt = make_rt(settings, fake, FunctionModel(run))
+    result = await rt.watcher.chat("@BTC 准备突破入场触发器", inst_id=BTC)
+    [card] = result["actions"]
+    assert card == rt.watcher.chat_log("general")[-1]["actions"][0]
+    assert card["pending_status"] == "waiting"
+    assert rt.store.get_strategy(card["strategy_id"])["status"] == "proposed"
+    assert not fake.orders and not fake.positions
+
+
 async def test_style_changes_timeframes_and_alt_reviews_carry_btc(settings, fake):
     prompts: list[str] = []
     rt = make_rt(settings, fake, scripted_model(prompts))

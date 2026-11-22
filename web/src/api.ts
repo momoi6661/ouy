@@ -423,6 +423,7 @@ export interface RecorderCond {
 }
 
 export interface Rule {
+  action?: string;
   id: string;
   type: string;
   label: string;
@@ -708,7 +709,7 @@ export interface ActionResult {
   strategy_id?: number | null;
   /** 方案卡片的当前状态：waiting 等确认 / running / executed / rejected / failed / declined / expired */
   pending_status?: string | null;
-  pending_result?: { message?: string } | null;
+  pending_result?: { message?: string; detail?: Record<string, any> } | null;
 }
 
 /** Agent 给出的交易方案里算好的数字 */
@@ -732,6 +733,7 @@ export interface ChatMessage {
   role: "user" | "ai";
   text: string;
   ts?: number;
+  env?: AgentConfig["env"];
   actions?: ActionResult[];
   steps?: ChatStep[];
   confirms?: ConfigConfirm[];
