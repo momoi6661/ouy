@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, EFFORTS, KIND_LABEL, fmtPx, fmtUsd, shortInst, shotUrl, STATUS_LABEL, type ActionResult, type ChatMessage, type Effort, type PlanPreview, type AgentConfig, type AgentStatus, type UiCommand } from "../api";
 import { Markdown } from "./Markdown";
 import { toast, useStored } from "./ui";
 import { Composer } from "./Composer";
+import { ErrorDetails } from "./ErrorDetails";
 
 /** 图上正在展示的那份方案 */
 export interface ShownPlan {
@@ -99,7 +100,9 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const [sending, setSending] = useState(0);
   const busy = sending > 0;
   const [acting, setActing] = useState<number | null>(null);
-  const end = useRef<HTMLDivElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const followLatest = useRef(true);
   const current = useRef(activeThread);
   current.current = activeThread;
   const readId = useRef(0);
@@ -109,7 +112,10 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     const id = ++readId.current;
     try {
       const r = await api.chatLog(thread);
-      if (current.current === thread && readId.current === id) setMsgs(r.messages);
+      if (current.current === thread && readId.current === id) {
+        setMsgs(r.messages);
+        return r.messages;
+      }
     } catch {
       /* 读不到历史不影响继续聊 */
     }
@@ -121,9 +127,25 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThread, config.env]);
 
+  useLayoutEffect(() => {
+    followLatest.current = true;
+  }, [activeThread, config.env, hidden]);
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!hidden && el && followLatest.current) el.scrollTop = el.scrollHeight;
+  }, [msgs, busy, activeThread, hidden]);
   useEffect(() => {
-    end.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [msgs, busy]);
+    const el = scroller.current;
+    const body = content.current;
+    if (!el || !body) return;
+    // A hidden panel and lazy images acquire their height after messages have loaded.
+    const observer = new ResizeObserver(() => {
+      if (el.clientHeight > 0 && followLatest.current) el.scrollTop = el.scrollHeight;
+    });
+    observer.observe(el);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, []);
 
   // Agent 主动发来的消息（Worker 的方案、对仓位的建议）：正在看这段对话就直接刷新，否则记成未读
   useEffect(() => {
@@ -169,6 +191,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     const thread = target === "router" ? "general" : inst;
     if (target !== to) setTo(target);
     if (content === text) setText("");
+    followLatest.current = true;
     setMsgs((m) => [...m, { role: "user", text: message, to: target, images }]);
     setSending((n) => n + 1);
     try {
@@ -181,7 +204,8 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
       }
       onActed();
     } catch (e: any) {
-      if (current.current === thread) setMsgs((m) => [...m, { role: "ai", text: `出错了：${e.message}` }]);
+      const history = await load(thread);
+      if (current.current === thread && !history?.[history.length - 1]?.error) setMsgs((m) => [...m, { role: "ai", text: `出错了：${e.message}` }]);
     } finally {
       setSending((n) => n - 1);
     }
@@ -387,7 +411,11 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
           </select>
         )}
       </div>
-      <div className="chat-body">
+      <div className="chat-body" ref={scroller} onScroll={(event) => {
+        const el = event.currentTarget;
+        if (el.clientHeight > 0) followLatest.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      }}>
+        <div className="chat-messages" ref={content}>
         {msgs.length === 0 && !busy && (
           <div className="chat-empty">
             <div className="chips">
@@ -410,6 +438,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
             {m.role === "user" && m.to === "worker" && <div className="bubble-from">直接对 Worker 说</div>}
             {m.steps && m.steps.length > 0 && <StepChips steps={m.steps} />}
             {m.role === "ai" ? <Markdown text={m.text} /> : <div className="bubble-text">{m.text}</div>}
+            {m.error && <ErrorDetails error={m.error} />}
             {!!m.images?.length && (
               <div className="msg-shots">
                 {m.images.map((x, k) => (
@@ -460,7 +489,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
           </div>
         ))}
         {busy && <div className="bubble ai thinking">Agent 正在看行情和账户…</div>}
-        <div ref={end} />
+        </div>
       </div>
       <Composer
         value={text}

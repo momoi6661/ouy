@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { api, fmtPx, fmtTime, shortInst, MODE_LABEL, NO_PLAN, STATUS_LABEL, STYLES, type Account, type Style, type AgentConfig, type AgentStatus, type PendingItem } from "../api";
+import { api, fmtPx, fmtTime, shortInst, MODE_LABEL, noPlanText, STATUS_LABEL, STYLES, type Account, type Style, type AgentConfig, type AgentStatus, type PendingItem } from "../api";
 import { PlanExecution } from "./PlanExecution";
+import { ErrorDetails } from "./ErrorDetails";
 import { toast } from "./ui";
 
 interface Props {
@@ -112,7 +113,9 @@ export function AgentPanel({ inst, agent, config, pending, account = null, onCha
         <>
           <div className="agent-status">
             {st?.reviewing || busy ? (
-              <span className="thinking">Agent 正在复盘…{st?.last_reason ? `（${st.last_reason}）` : ""}</span>
+              <span className="thinking">{st?.reviewing && st.review_started_ts === null ? "复盘已排队，等待 Worker…" : "Agent 正在复盘…"}{st?.last_reason ? `（${st.last_reason}）` : ""}</span>
+            ) : st?.retry_after_ts ? (
+              <span className="muted small">模型调用失败，约 {st.next_review_in ?? 0} 秒后重试</span>
             ) : agent.running ? (
               <span className="muted small">{st?.next_review_in != null ? `约 ${st.next_review_in} 秒后例行复盘，价格异动会提前叫醒` : "盯盘中"}</span>
             ) : (
@@ -122,7 +125,7 @@ export function AgentPanel({ inst, agent, config, pending, account = null, onCha
               立即复盘
             </button>
           </div>
-          {st?.error && <div className="alert error">{st.error}</div>}
+          {st?.error && <div className="alert error">{st.error}<ErrorDetails workId={st.error_work_id} message={st.error} /></div>}
 
           {report ? (
             <div className="report">
@@ -132,7 +135,7 @@ export function AgentPanel({ inst, agent, config, pending, account = null, onCha
                   <i style={{ width: `${Math.round(report.confidence * 100)}%` }} />
                 </span>
                 <span className="muted small">把握 {Math.round(report.confidence * 100)}%</span>
-                <span className="muted small right">{fmtTime(report.ts)}</span>
+                <span className="muted small right">{st?.reviewing || busy || st?.error ? "上次完成 · " : ""}{fmtTime(report.ts)}</span>
               </div>
               <p className="summary">{report.summary}</p>
 
@@ -181,7 +184,7 @@ export function AgentPanel({ inst, agent, config, pending, account = null, onCha
                 </div>
               ) : (
                 <div className="muted small plan-none">
-                  {report.no_plan_reason ? `这一轮没给计划：${NO_PLAN[report.no_plan_reason]}。` : "当前没有交易计划。"}
+                  {report.no_plan_reason ? `这一轮没给计划：${noPlanText(report.no_plan_reason)}。` : "当前没有交易计划。"}
                 </div>
               )}
               <PlanExecution inst={inst} report={report} account={account} onChanged={onChanged} />

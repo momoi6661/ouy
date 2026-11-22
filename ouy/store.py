@@ -277,6 +277,13 @@ class Store:
         rows = self._rows(sql + " ORDER BY id DESC LIMIT ?", (*params, limit))
         return [dict(row) for row in rows]
 
+    def work_detail(self, env: str, work_id: int) -> dict[str, Any] | None:
+        rows = self._rows("SELECT * FROM work_items WHERE env=? AND id=?", (env, work_id))
+        if not rows:
+            return None
+        events = self._rows("SELECT * FROM activity WHERE env=? AND work_id=? ORDER BY id DESC LIMIT 200", (env, work_id))
+        return {**dict(rows[0]), "activity": [{**r, "data": json.loads(r["data"] or "{}")} for r in reversed(events)]}
+
     def clear_history(self, env: str, inst_id: str, what: str) -> int:
         """清掉已经结束的记录，返回清了几条。inst_id 为空 = 这个环境里所有币。只清记录：进行中的任务、还在等的触发器和策略、持仓和挂单都不动。
         what: tasks 已完成 / 失败的任务；triggers 已结束的触发器和策略；talk 对话区的活动流（还没结束的任务的那几步留着）。"""

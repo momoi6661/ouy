@@ -832,6 +832,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         rt = rt_of(request)
         return rt.store.work_items(rt.config().env, max(min(limit, 200), 1), inst_id.upper() if inst_id else None)
 
+    @app.get("/api/work/{work_id}")
+    async def work_detail(request: Request, work_id: int):
+        rt = rt_of(request)
+        row = rt.store.work_detail(rt.config().env, work_id)
+        if row is None:
+            raise HTTPException(404, "当前环境没有这条任务记录。")
+        return row
+
     @app.post("/api/history/clear")
     async def clear_history(request: Request, body: ClearIn):
         """清除记录：已完成的任务、已结束的触发器、对话区。只删记录，不碰进行中的任务、等待中的触发器、持仓和挂单。"""

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { api, ENTRY_MODES, ENTRY_TYPE, fmtPx, fmtTime, NO_PLAN, shortInst, STANCES, STYLES, type Account, type AgentConfig, type AgentStatus, type Stance, type Style, type Wake, type WorkerOverride, type WorkItem } from "../api";
+import { api, ENTRY_MODES, ENTRY_TYPE, fmtPx, fmtTime, noPlanText, shortInst, STANCES, STYLES, type Account, type AgentConfig, type AgentStatus, type Stance, type Style, type Wake, type WorkerOverride, type WorkItem } from "../api";
 import { Empty, Pnl, toast, useInterval } from "./ui";
+import { ErrorDetails } from "./ErrorDetails";
 
 const BIAS = { long: "偏多", short: "偏空", neutral: "中性" } as const;
 const VERDICT = { hold: "继续拿", tighten_stop: "收紧止损", adjust_tp: "调整止盈", reduce: "减仓", add: "加仓", close: "平仓" } as const;
@@ -109,7 +110,7 @@ export function WorkersPanel({ agent, config, account, inst, onSelect, onChanged
                 <span className="muted">还没复盘过</span>
               )}
             </div>
-            {!plan && report?.no_plan_reason && <div className="wk-line small muted">这一轮没给计划：{NO_PLAN[report.no_plan_reason]}</div>}
+            {!plan && report?.no_plan_reason && <div className="wk-line small muted">这一轮没给计划：{noPlanText(report.no_plan_reason)}</div>}
             {report?.plan_order?.text && <div className={`wk-line small plan-order ${report.plan_order.status}`}>{report.plan_order.text}</div>}
             {expanded && (
               <div className="wk-detail">
@@ -185,7 +186,7 @@ export function WorkersPanel({ agent, config, account, inst, onSelect, onChanged
                     这个币在模拟盘里{st.illiquid}，成交价和真实市场差得远，测不出真实效果。Agent 在它上面只挂限价单，每笔风险压到上限的四分之一。
                   </div>
                 )}
-                {!!st?.fails && <div className="muted small">已连续 {st.fails} 次复盘失败，重试间隔会自动拉长：{st.error}</div>}
+                {!!st?.fails && <div className="muted small">已连续 {st.fails} 次复盘失败，重试间隔会自动拉长：{st.error}<ErrorDetails workId={st.error_work_id} message={st.error} /></div>}
                 {!!st?.skips && (
                   <div className="muted small">
                     Router 已过滤掉 {st.skips} 次不值得唤醒的事件{st.last_gate ? `，最近一次：${st.last_gate}` : ""}
@@ -285,6 +286,7 @@ export function TasksPanel({ onSelect }: { onSelect: (inst: string) => void }) {
           </div>
           <div className="small">{w.goal}</div>
           {w.result && <div className="small muted">{w.result}</div>}
+          {w.status === "failed" && <ErrorDetails workId={w.id} message={w.result} />}
         </div>
       ))}
     </div>

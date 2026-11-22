@@ -22,6 +22,7 @@ from pydantic_ai.tools import DeferredToolRequests, DeferredToolResults, ToolDen
 from pydantic_ai.usage import UsageLimits
 
 from ..events import EventBus
+from ..diagnostics import exception_detail, redact
 from ..knowledge import KnowledgeBase
 from ..indicators import BAR_MINUTES, ROW_BLOCK, day_profile, value_area
 from ..market import Market, _f, session_anchor, us_stock_session
@@ -42,10 +43,10 @@ from .plan import REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, maj
 log = logging.getLogger("ouy.watcher")
 
 def _fail_text(exc: BaseException) -> tuple[str, str]:
-    """一轮没跑完：被主动中断（停止盯盘、重启、被新任务取代）不算出错，说清楚没有因此下单。"""
+    """中断一轮不会撤回该轮先前已提交的委托。"""
     if isinstance(exc, asyncio.CancelledError):
-        return "skip", "这一轮被中断了（停止盯盘、服务重启或被新任务取代），没有跑完，也没有因此下单"
-    return "error", str(exc)[:300] or type(exc).__name__
+        return "skip", "这一轮被中断了（停止盯盘、服务重启或被新任务取代）；已提交的委托和已生效的规则仍以执行回执为准"
+    return "error", redact(str(exc))[:300] or type(exc).__name__
 
 
 def _partial_summary(args: str) -> str:
@@ -157,6 +158,9 @@ class InstState:
     last_review_ts: float = 0.0
     last_review_px: float = 0.0
     next_due_ts: float = 0.0
+    retry_after_ts: float = 0.0
+    pending_wakes: list[str] = field(default_factory=list)
+    error_work_id: int | None = None
     had_position: bool | None = None
     reviewing: bool = False
     last_error: str = ""
@@ -603,6 +607,8 @@ class Watcher:
         self._gate_agent: Any = None
         self._beat = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._patrol_task: asyncio.Task[None] | None = None
+        self._maintenance_task: asyncio.Task[None] | None = None
         self.watchdog: dict[str, Any] = {"restarts": 0, "last": ""}
         self._chat_histories: dict[str, list[ModelMessage]] = {}
         self.control: Any = None  # 由 Runtime 注入：让对话里的 Agent 能改项目设置、启停盯盘
@@ -859,6 +865,12 @@ class Watcher:
         except Exception as exc:  # noqa: BLE001 - 活动流写不进去不能影响交易
             log.warning("活动流记录失败：%s", exc)
 
+    def _failed_work(self, env: str, inst_id: str, agent: str, work_id: int, exc: BaseException, data: dict[str, Any] | None = None) -> str:
+        kind, why = _fail_text(exc)
+        self.store.update_work(work_id, "failed", why)
+        self._emit(env, inst_id, agent, kind, why, work_id, {**(data or {}), "error": exception_detail(exc)})
+        return why
+
     def _emitter(self, env: str, inst_id: str, agent: str, work_id: int | None) -> Any:
         """给 Deps.emit 用：Agent 每调一次工具就在活动流里出现一步。"""
 
@@ -1007,9 +1019,7 @@ class Watcher:
             self._emit(cfg.env, inst_id, role, "done", brief["summary"], work_id, {"bias": brief.get("bias"), "points": brief.get("points")})
             return brief
         except BaseException as exc:
-            kind, why = _fail_text(exc)
-            self.store.update_work(work_id, "failed", why)
-            self._emit(cfg.env, inst_id, role, kind, why, work_id)
+            self._failed_work(cfg.env, inst_id, role, work_id, exc)
             raise
         finally:
             st.sub_running.discard(role)
@@ -1161,9 +1171,7 @@ class Watcher:
                 row.update(running=False, summary=f"没查成：{str(exc)[:160] or type(exc).__name__}")
             elif row in rows:
                 rows.remove(row)
-            kind, why = _fail_text(exc)
-            self.store.update_work(work_id, "failed", why)
-            self._emit(cfg.env, inst_id, "adhoc", kind, why, work_id, {"name": name})
+            self._failed_work(cfg.env, inst_id, "adhoc", work_id, exc, {"name": name})
             raise
         finally:
             self.bus.publish("work", {"inst_id": inst_id})
@@ -1194,13 +1202,14 @@ class Watcher:
         fresh = [t for t in trades if ident(t) not in seen]
         if not fresh:
             return 0
-        done, count = [], 0
+        done, count, attempts = [], 0, 0
         for t in sorted(fresh, key=lambda t: t.closed_ts):
             if "部分" in t.how or now_ms() - t.closed_ts > 24 * 3_600_000:
                 done.append(ident(t))
                 continue
-            if count >= 3:
+            if attempts >= 3:
                 break
+            attempts += 1
             try:
                 await self._review_trade(cfg, t)
                 done.append(ident(t))
@@ -1302,9 +1311,7 @@ class Watcher:
             return answer
         except BaseException as exc:
             self.general.update(busy=False, summary=f"没做成：{str(exc)[:160] or type(exc).__name__}", ts=now_ms())
-            kind, why = _fail_text(exc)
-            self.store.update_work(work_id, "failed", why)
-            self._emit(cfg.env, "", "general", kind, why, work_id)
+            self._failed_work(cfg.env, "", "general", work_id, exc)
             raise
         finally:
             self.bus.publish("work", {"inst_id": ""})
@@ -1356,21 +1363,20 @@ class Watcher:
         self.bus.publish("agent", self.status())
 
     async def stop(self, reason: str = "已手动停止") -> None:
-        if not self.running:
-            return
+        was_running = self.running
         self.running = False
-        if self._task and self._task is not asyncio.current_task():
-            self._task.cancel()
-        if self._watchdog_task and self._watchdog_task is not asyncio.current_task():
-            self._watchdog_task.cancel()
+        tasks = [self._task, self._watchdog_task, self._patrol_task, self._maintenance_task]
         for st in self.states.values():
-            if st.observe_task:
-                st.observe_task.cancel()
+            tasks.extend([st.observe_task, st.task])
             st.quote_watch, st.observe_price, st.pending_observation = QuoteWatch(), None, None
-            if st.task and not st.task.done() and st.task is not asyncio.current_task():
-                st.task.cancel()
             st.reviewing = False
-        self._note("system", f"Agent 已停止盯盘：{reason}")
+        tasks = [t for t in tasks if t and t is not asyncio.current_task() and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if was_running:
+            self._note("system", f"Agent 已停止盯盘：{reason}")
         self.bus.publish("agent", self.status())
 
     def _note(self, kind: str, title: str, body: dict[str, Any] | None = None, inst_id: str = "") -> None:
@@ -1403,9 +1409,12 @@ class Watcher:
                     "last": st.last_px,
                     "reviewing": st.reviewing,
                     "last_review_ts": int(st.last_review_ts * 1000) if st.last_review_ts else None,
-                    "next_review_in": max(int(st.next_due_ts - now), 0) if self.running and st.next_due_ts else None,
+                    "next_review_in": max(int(max(st.next_due_ts, st.retry_after_ts) - now), 0) if self.running and st.next_due_ts else None,
+                    "retry_after_ts": int(st.retry_after_ts * 1000) if st.retry_after_ts > now else None,
                     "last_reason": st.last_reason,
                     "error": st.last_error,
+                    "error_work_id": st.error_work_id,
+                    "review_started_ts": int(st.review_started * 1000) if st.review_started else None,
                     "style": cfg.style_for(inst),
                     "stance": cfg.stance_for(inst),
                     "entry_mode": cfg.entry_mode_for(inst),
@@ -1619,17 +1628,19 @@ class Watcher:
                     else:
                         reason = f"{retest} 同时：{reason}" if reason else retest
             # 软事件（价格波动、定时）先过 Router 的第二级过滤；硬事件（首次、持仓变化、触及价位、进入入场区间、BTC 异动）直接唤醒
-            soft = bool(reason) and (reason == "定时复盘" or reason.startswith("距上次复盘价格"))
-            if not reason and not standby and cfg.wake_for(inst_id) == "always" and now - st.last_review_ts >= cfg.min_review_seconds:
-                reason = "持续盯盘"
             if (not reason and btc_alert and inst_id != BTC and self._asset.get(inst_id, "crypto") == "crypto"
                     and account.position(inst_id) and now - st.last_review_ts >= cfg.min_review_seconds):
                 reason = f"{btc_alert}，这个品种有持仓，检查要不要跟着处理"
             if cfg.env == "demo" and st.report:
                 self._sample_observation(cfg, inst_id, st, _f(ticker.get("ts")) / 1000, now, bool(reason))
-            if reason and not st.reviewing:
+            if reason and reason != "定时复盘" and not reason.startswith("距上次复盘价格"):
+                if reason not in st.pending_wakes:
+                    st.pending_wakes = [*st.pending_wakes, reason][-10:]
+            reason = "；".join(st.pending_wakes) or reason
+            if reason and not st.reviewing and now >= st.retry_after_ts:
                 st.reviewing = True
-                st.review_started = now
+                st.review_started = 0.0
+                soft = reason == "定时复盘" or reason.startswith("距上次复盘价格")
                 gate = soft and cfg.slow_path and cfg.wake_for(inst_id) == "event" and account.position(inst_id) is None
                 st.task = asyncio.create_task(self._review_task(inst_id, reason, gate), name=f"review-{inst_id}")
 
@@ -1649,7 +1660,7 @@ class Watcher:
         if now - st.pending_observation[0] > 15:
             st.pending_observation = None
             return
-        if normal_wake or st.reviewing or st.lock.locked():
+        if normal_wake or st.reviewing or st.lock.locked() or now < st.retry_after_ts:
             return
         if st.observe_task and not st.observe_task.done():
             return
@@ -2342,10 +2353,10 @@ class Watcher:
         st.had_position = has_pos
         if not st.last_review_ts:
             return "开始盯盘，首次复盘"
-        if st.has_mail:
-            return "信箱里有新的留言要处理"
         if changed:
             return "持仓已被平掉（止盈/止损触发或手动平仓），重新评估" if not has_pos else "出现了新的持仓（挂单成交或手动开仓），接管并制定持仓计划"
+        if st.has_mail:
+            return "信箱里有新的留言要处理"
         cooling = now - st.last_review_ts < cfg.min_review_seconds
         if cooling:
             return None
@@ -2460,7 +2471,7 @@ class Watcher:
         try:
             account = await self.trader.account(cfg.env)
         except Exception as exc:  # noqa: BLE001
-            return [{"key": "okx", "level": "bad", "inst_id": "", "text": f"读不到欧易账户：{str(exc)[:120]}"}]
+            return [{"key": "okx", "level": "bad", "inst_id": "", "text": f"读不到欧易账户：{_fail_text(exc)[1][:120]}", "error": exception_detail(exc)}]
         out: list[dict[str, Any]] = []
         for pos in account.positions:
             if not any(p.inst_id == pos.inst_id and p.stop_loss for p in account.protections):
@@ -2471,7 +2482,7 @@ class Watcher:
                 out.append({"key": f"stuckclose:{o.inst_id}", "level": "warn", "inst_id": o.inst_id, "text": f"{o.inst_id} 的平仓单挂了 {int(mins)} 分钟还没成交，仓位还在"})
         for inst_id, st in self.states.items():
             if st.fails >= 3:
-                out.append({"key": f"fails:{inst_id}", "level": "bad", "inst_id": inst_id, "text": f"{inst_id} 的 Worker 连续 {st.fails} 次复盘失败：{st.last_error[:100]}"})
+                out.append({"key": f"fails:{inst_id}", "level": "bad", "inst_id": inst_id, "text": f"{inst_id} 的 Worker 连续 {st.fails} 次复盘失败：{st.last_error[:100]}", "related_work_id": st.error_work_id})
         for row in self.store.strategies(cfg.env, None, False):
             if row["status"] == "failed" and now_ms() - row["updated_ts"] < 15 * 60_000:
                 out.append({"key": f"strategy:{row['id']}", "level": "warn", "inst_id": row["inst_id"], "text": f"{row['inst_id']} 的策略 #{row['id']} 连续出错已停止：{row['note'][:100]}"})
@@ -2479,9 +2490,8 @@ class Watcher:
             out.append({"key": "halted", "level": "bad", "inst_id": "", "text": "当日亏损已到上限，风控已禁止开新仓"})
         return out
 
-    async def _patrol(self, cfg: AgentConfig) -> None:
-        """每分钟巡检一次：新发现的问题记进日志和活动流，能交给 Worker 处理的直接叫醒它；问题消失了也说一声。"""
-        self._resume_due(cfg)
+    async def _maintenance(self, cfg: AgentConfig) -> None:
+        """战绩和模型复盘单独运行，避免阻塞健康巡检。"""
         try:  # 顺手把用策略库做完的单记进战绩
             await self.strategies.score_playbooks(cfg.env)
         except Exception as exc:  # noqa: BLE001 - 记战绩失败不能影响巡检
@@ -2505,13 +2515,18 @@ class Watcher:
             await self._review_trades(cfg)
         except Exception as exc:  # noqa: BLE001 - 复盘失败不能影响巡检
             log.warning("平仓复盘没做成：%s", exc)
+
+    async def _patrol(self, cfg: AgentConfig) -> None:
+        """每分钟巡检账户和团队；同一问题只在出现和恢复时通知。"""
+        self._resume_due(cfg)
         found = await self._health(cfg)
         before = {c["key"]: c for c in self.watchdog.get("checks", [])}
         for c in found:
             if c["key"] in before:
                 continue
             self._note("alert", f"Watchdog：{c['text']}", inst_id=c["inst_id"])
-            self._emit(cfg.env, c["inst_id"], "watchdog", "error" if c["level"] == "bad" else "wake", c["text"], None, {"key": c["key"]})
+            self._emit(cfg.env, c["inst_id"], "watchdog", "error" if c["level"] == "bad" else "wake", c["text"], None,
+                       {k: c[k] for k in ("key", "error", "related_work_id") if k in c})
             if c["key"].startswith("naked:") and c["inst_id"] in self.states:
                 self._state(c["inst_id"]).lot_alert = (
                     f"Watchdog 发现 {c['inst_id']} 有持仓但交易所里没有止损单。先按结构位给它补上止损（move_stops），再判断这笔仓要不要继续拿，在结论里说明。"
@@ -2527,31 +2542,72 @@ class Watcher:
         beats = 0
         while self.running:
             await asyncio.sleep(15)
-            now = time.time()
+            if not self.running:
+                return
             cfg = self.get_config()
             beats += 1
+            try:
+                await self._recover(cfg)
+                self.watchdog.pop("control_error", None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # A failed recovery must not kill the supervisor itself.
+                why = _fail_text(exc)[1]
+                if self.watchdog.get("control_error") != why:
+                    self._emit(cfg.env, "", "watchdog", "error", f"恢复巡检失败，将再次检查：{why}", None, {"error": exception_detail(exc)})
+                self.watchdog["control_error"] = why
+                log.warning("Watchdog 恢复巡检失败：%s", why)
             if beats % 4 == 1:
-                try:
-                    await self._patrol(cfg)
-                except Exception as exc:  # noqa: BLE001 - 巡检出错不能让看门狗自己停掉
-                    log.warning("Watchdog 巡检出错：%s", exc)
-            if self.running and now - self._beat > max(60, cfg.tick_seconds * 8):
-                if self._task and not self._task.done():
-                    self._task.cancel()
-                self._beat = now
+                for attr, job, timeout in (("_patrol_task", self._patrol, 45), ("_maintenance_task", self._maintenance, 900)):
+                    task = getattr(self, attr)
+                    if task and not task.done():
+                        continue
+                    if task and not task.cancelled():
+                        try:
+                            task.result()
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("Watchdog 后台任务 %s 出错：%s", attr, exc)
+                    setattr(self, attr, asyncio.create_task(asyncio.wait_for(job(cfg), timeout), name=f"ouy{attr}"))
+
+    @staticmethod
+    async def _cancel_finished(task: asyncio.Task[Any] | None) -> bool:
+        if task is None:
+            return True
+        if not task.done():
+            if not task.cancelling():
+                task.cancel()
+            done, _ = await asyncio.wait([task], timeout=5)
+            if not done:
+                return False
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("旧任务退出：%s", exc)
+        return True
+
+    async def _recover(self, cfg: AgentConfig) -> None:
+        now = time.time()
+        if self.running and now - self._beat > max(60, cfg.tick_seconds * 8):
+            if await self._cancel_finished(self._task) and self.running:
+                self._beat = time.time()
                 self._task = asyncio.create_task(self._loop(), name="ouy-watcher")
                 self.watchdog = {**self.watchdog, "restarts": self.watchdog["restarts"] + 1, "last": f"{time.strftime('%H:%M:%S')} 盯盘循环停跳，已重启"}
                 self._emit(cfg.env, "", "watchdog", "action", "盯盘循环停跳，已自动重启", None)
                 self._note("alert", "Watchdog：盯盘循环停跳，已自动重启")
-            for inst_id, st in self.states.items():
-                if st.reviewing and st.review_started and now - st.review_started > REVIEW_TIMEOUT + 60:
-                    if st.task and not st.task.done():
-                        st.task.cancel()
-                    st.reviewing, st.review_started = False, 0.0
-                    st.last_review_ts, st.next_due_ts = now, now + 120
-                    self.watchdog = {**self.watchdog, "restarts": self.watchdog["restarts"] + 1, "last": f"{time.strftime('%H:%M:%S')} {inst_id} 的 Worker 卡住，已重置"}
-                    self._emit(cfg.env, inst_id, "watchdog", "action", "Worker 超时没有返回，已重置，2 分钟后重试", None)
-                    self._note("alert", f"Watchdog：{inst_id} 的 Worker 超时没有返回，已重置，2 分钟后重试", inst_id=inst_id)
+        for inst_id, st in list(self.states.items()):
+            if st.reviewing and st.review_started and time.time() - st.review_started > REVIEW_TIMEOUT + 60:
+                if st.task is None or st.task.done():
+                    continue  # 手动复盘和排队的任务由它们自身的超时管理
+                if not await self._cancel_finished(st.task):
+                    continue
+                st.reviewing, st.review_started = False, 0.0
+                st.last_review_ts = time.time()
+                st.retry_after_ts = max(st.retry_after_ts, st.last_review_ts + 120)
+                st.next_due_ts = st.retry_after_ts
+                self.watchdog = {**self.watchdog, "restarts": self.watchdog["restarts"] + 1, "last": f"{time.strftime('%H:%M:%S')} {inst_id} 的 Worker 卡住，已重置"}
+                self._emit(cfg.env, inst_id, "watchdog", "action", "Worker 超时没有返回，已重置，2 分钟后重试", None)
+                self._note("alert", f"Watchdog：{inst_id} 的 Worker 超时没有返回，已重置，2 分钟后重试", inst_id=inst_id)
 
     async def _should_wake(self, cfg: AgentConfig, inst_id: str, reason: str) -> tuple[bool, str]:
         """事件的第二级过滤（Slow Path）：让 Router 判断这个软事件值不值得唤醒 Worker。判断失败就唤醒。"""
@@ -2571,8 +2627,10 @@ class Watcher:
 
     async def _review_task(self, inst_id: str, reason: str, gate: bool = False) -> None:
         st = self._state(inst_id)
+        pending = list(st.pending_wakes)
         try:
             if gate:
+                st.review_started = time.time()
                 cfg = self.get_config()
                 why = quiet_reason(st, cfg.wake_move_pct) if reason == "定时复盘" else ""
                 act = not why
@@ -2590,16 +2648,20 @@ class Watcher:
                     self.bus.publish("work", {"inst_id": inst_id})
                     return
             await self.review(inst_id, reason, source="event")
+            st.pending_wakes = [r for r in st.pending_wakes if r not in pending]
             st.last_error = ""
             st.fails = 0
+            st.retry_after_ts = 0.0
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            st.last_error = str(exc)[:300]
+            st.last_error = _fail_text(exc)[1]
+            if not pending and reason not in st.pending_wakes:
+                st.pending_wakes = [*st.pending_wakes, reason][-10:]
             st.fails += 1
-            wait = min(120 * 2 ** (st.fails - 1), 900)  # 连续失败就拉长间隔，免得一直空烧 token
+            wait = min(120 * 2 ** min(st.fails - 1, 3), 900)
             st.last_review_ts = time.time()
-            st.next_due_ts = time.time() + wait
+            st.retry_after_ts = st.next_due_ts = st.last_review_ts + wait
             self._note(
                 "alert",
                 f"{inst_id} 本次 Agent 复盘失败" + (f"（连续第 {st.fails} 次）" if st.fails > 1 else "") + f"，{wait // 60} 分钟后重试",
@@ -2607,7 +2669,7 @@ class Watcher:
             )
             log.warning("复盘失败 %s: %s", inst_id, exc)
         finally:
-            st.reviewing = False
+            st.reviewing, st.review_started = False, 0.0
             self.bus.publish("agent", self.status())
 
     async def review(self, inst_id: str, reason: str, source: str = "manual") -> dict[str, Any]:
@@ -2617,6 +2679,7 @@ class Watcher:
             self.on_decided()
             raise RuntimeError(f"{inst_id} 的 Worker 有操作在等你同意，先点同意或不执行，它会接着做。")
         st.reviewing = True
+        st.review_started = 0.0  # 排队时间不算 Worker 执行超时
         try:
             async with self._turn(self.get_config(), inst_id, "复盘"):
                 st.review_started = time.time()
@@ -2634,6 +2697,7 @@ class Watcher:
         work_id = self.store.add_work(cfg.env, inst_id, source, reason, "running", model=cfg.model_for(inst_id))
         self.bus.publish("work", {"inst_id": inst_id})
         self._emit(cfg.env, inst_id, "worker", "wake", reason, work_id, {"source": source})
+        notes: list[dict[str, Any]] = []
         try:
             agent = self._worker_agent(cfg, inst_id)
             style = STYLES[cfg.style_for(inst_id)]
@@ -2712,9 +2776,14 @@ class Watcher:
             extra["plan_order"] = await self._arm_plan(cfg, inst_id, result.output, deps, work_id)
             return self._finish_review(cfg, inst_id, work_id, result, deps, extra)
         except BaseException as exc:
-            kind, why = _fail_text(exc)
-            self.store.update_work(work_id, "failed", why)
-            self._emit(cfg.env, inst_id, "worker", kind, why, work_id)
+            if notes:
+                current = self.inbox(cfg.env, inst_id)
+                existing = {(n.get("ts"), n.get("who"), n.get("text")) for n in current}
+                unread = [n for n in notes if (n.get("ts"), n.get("who"), n.get("text")) not in existing]
+                self.store.set(f"inbox:{cfg.env}:{inst_id}", [*unread, *current][-10:])
+            why = self._failed_work(cfg.env, inst_id, "worker", work_id, exc)
+            if not isinstance(exc, asyncio.CancelledError):
+                st.last_error, st.error_work_id = why, work_id
             raise
         finally:
             st.reviewing, st.review_started = False, 0.0
@@ -3032,8 +3101,8 @@ class Watcher:
                         + ("，等你同意后启用" if row["status"] == "proposed" else ""),
             }
         except Exception as exc:  # noqa: BLE001 - 没做成要让用户和 Worker 都看得到原因，不能让整轮复盘跟着失败
-            text = f"照计划下单没做成：{str(exc)[:260] or type(exc).__name__}"
-            self._emit(cfg.env, inst_id, "strategy", "error", text, work_id)
+            text = f"照计划下单没做成：{_fail_text(exc)[1]}"
+            self._emit(cfg.env, inst_id, "strategy", "error", text, work_id, {"error": exception_detail(exc)})
             return {"status": "failed", "text": text}
 
     async def apply_plan(self, inst_id: str, stamp: int) -> dict[str, Any]:
@@ -3128,6 +3197,8 @@ class Watcher:
             self.store.set(f"usage:{cfg.env}", log[-USAGE_LOG:])
         previous = st.report
         st.report = record
+        st.fails, st.retry_after_ts, st.last_error = 0, 0.0, ""
+        st.error_work_id = None
         st.observe_price = None
         st.skips = 0
         st.last_review_ts = time.time()
@@ -3278,8 +3349,7 @@ class Watcher:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 后台任务：失败要落到任务和活动流里，不能悄悄没了
-            self.store.update_work(work_id, "failed", str(exc)[:300] or type(exc).__name__)
-            self._emit(cfg.env, inst_id, "worker", "error", f"按你的决定继续时出错：{str(exc)[:260] or type(exc).__name__}", work_id)
+            self._failed_work(cfg.env, inst_id, "worker", work_id, exc, {"phase": "继续执行"})
             log.warning("恢复挂起的任务失败 %s: %s", inst_id, exc)
         finally:
             self.bus.publish("work", {"inst_id": inst_id})
@@ -3733,13 +3803,20 @@ class Watcher:
             return f"{inst_id} 的 Worker 正在思考，这件事已经直接送进它当前这一轮，它下一步就会读到并处理，不用等、也不用再交一次；结果会由它发到这个币的对话里。"
         work_id = self.store.add_work(cfg.env, inst_id, "user", (goal or task)[:300], "queued" if st.lock.locked() else "running", model=cfg.model_for(inst_id))
         self.bus.publish("work", {"inst_id": inst_id})
-        async with self._turn(cfg, inst_id, "处理交来的任务"):
-            if cfg.env != self.get_config().env:
-                reason = "交易环境已切换，请在当前环境重新发起任务。"
-                self.store.update_work(work_id, "failed", reason)
+        try:
+            async with self._turn(cfg, inst_id, "处理交来的任务"):
+                if cfg.env != self.get_config().env:
+                    reason = "交易环境已切换，请在当前环境重新发起任务。"
+                    self.store.update_work(work_id, "failed", reason)
+                    self.bus.publish("work", {"inst_id": inst_id})
+                    return reason
+                return await self._dispatch_once(cfg, inst_id, task, parent, work_id, said=goal if who == "用户" else "")
+        except asyncio.CancelledError as exc:
+            row = self.store.work_detail(cfg.env, work_id)
+            if row and row["status"] != "failed":
+                self._failed_work(cfg.env, inst_id, "worker", work_id, exc)
                 self.bus.publish("work", {"inst_id": inst_id})
-                return reason
-            return await self._dispatch_once(cfg, inst_id, task, parent, work_id, said=goal if who == "用户" else "")
+            raise
 
     async def _dispatch_once(self, cfg: AgentConfig, inst_id: str, task: str, parent: Deps, work_id: int, said: str = "") -> str:
         st = self._state(inst_id)
@@ -3782,10 +3859,12 @@ class Watcher:
                 self._task_agent(cfg, inst_id), [prompt, *pics] if pics else prompt, st, REVIEW_TIMEOUT, live=LiveText(self.bus.publish, "worker", inst_id),
                 deps=deps, usage_limits=UsageLimits(request_limit=20), model_settings=_effort(parent.effort or cfg.effort_for(inst_id), _worker_cache_key("task", inst_id)),
             )
-        except Exception as exc:  # noqa: BLE001
-            self.store.update_work(work_id, "failed", str(exc)[:300])
+        except BaseException as exc:
+            why = self._failed_work(cfg.env, inst_id, "worker", work_id, exc)
             self.bus.publish("work", {"inst_id": inst_id})
-            return f"{inst_id} 的 Worker 没有完成任务：{str(exc)[:200]}"
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return f"{inst_id} 的 Worker 没有完成任务（任务 #{work_id}）：{why}"
         parent.actions.extend(deps.actions)
         parent.trace.append([{**step, "worker": inst_id} for step in _tool_steps(result.new_messages())])
         if isinstance(result.output, DeferredToolRequests):  # Worker 调用了要用户同意的工具：这一轮挂起，卡片已经在界面上
@@ -3942,11 +4021,25 @@ class Watcher:
         prompt = f"{whom}【盯盘状态】{'盯盘中' if self.running else '未启动'}，盯盘列表：{'、'.join(cfg.instruments)}\n{message}" if whom else message
         if pics:  # 用户附了截图：你和接手的 Worker 都看得到
             prompt += f"\n【用户附了 {len(pics)} 张图片（截图 / K 线图），就在这句话后面。交给 Worker 时它也会收到这些图，不用你转述图里的内容】"
-        result = await self._run(
-            agent, [prompt, *pics] if pics else prompt, None, REVIEW_TIMEOUT * 3, live=LiveText(self.bus.publish, "router", ""),
-            deps=deps, message_history=_trim_history(self._history(thread)), usage_limits=UsageLimits(request_limit=20),
-            model_settings=_effort(effort or cfg.router_effort, "ouy-router"),
-        )
+        try:
+            result = await self._run(
+                agent, [prompt, *pics] if pics else prompt, None, REVIEW_TIMEOUT * 3, live=LiveText(self.bus.publish, "router", ""),
+                deps=deps, message_history=_trim_history(self._history(thread)), usage_limits=UsageLimits(request_limit=20),
+                model_settings=_effort(effort or cfg.router_effort, "ouy-router"),
+            )
+        except BaseException as exc:
+            kind, why = _fail_text(exc)
+            diagnostic = exception_detail(exc)
+            self._emit(cfg.env, inst_id or "", "router", kind, why, None, {"thread": thread, "error": diagnostic})
+            log = self.store.get(f"chat:{thread}", [])
+            stamp = now_ms()
+            log.extend([
+                {"role": "user", "text": message, "ts": stamp},
+                {"role": "ai", "text": f"本轮未完成：{why}", "ts": stamp, "error": diagnostic, "env": cfg.env},
+            ])
+            self.store.set(f"chat:{thread}", log[-200:])
+            self.bus.publish("chat", {"thread": thread})
+            raise
         history = self._without_images(_trim_history(result.all_messages()))
         self._chat_histories[thread] = history
         self.store.set(f"chat_hist:{thread}", ModelMessagesTypeAdapter.dump_python(history, mode="json"))

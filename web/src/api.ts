@@ -287,7 +287,8 @@ export interface TradePlan {
 }
 
 export const ENTRY_TYPE: Record<string, string> = { now: "现价进", pullback: "等回到入场区间", breakout: "等突破" };
-export const NO_PLAN: Record<string, string> = { cost: "扣完手续费净盈亏比不够", objection: "有明确的反对信号", limit: "到了亏损上限或你不让开仓" };
+export const NO_PLAN: Record<string, string> = { cost: "扣完手续费净盈亏比不够", objection: "有明确的反对信号", limit: "到了亏损上限或你不让开仓", no_edge: "本轮没有合适候选，或回测未显示优势且没有额外依据" };
+export const noPlanText = (reason: string) => NO_PLAN[reason] ?? "暂未给出可执行计划，具体依据见复盘结论";
 export const ENTRY_MODES: { id: "market" | "limit" | "auto"; label: string }[] = [
   { id: "market", label: "市价优先" },
   { id: "limit", label: "挂单优先" },
@@ -300,7 +301,7 @@ export interface Report {
   summary: string;
   plan: TradePlan | null;
   /** 空仓又不给计划时的原因 */
-  no_plan_reason?: "" | "cost" | "objection" | "limit";
+  no_plan_reason?: "" | "cost" | "objection" | "limit" | "no_edge";
   /** 程序照计划做了什么：executed 已进场 / armed 已布置等触发 / kept 沿用上一轮 / skipped 没通过核对 / pending 等你同意 / cancelled 已撤 / failed */
   plan_order?: { status: string; text: string; strategy_id?: number; pending_id?: number; ord_id?: string } | null;
   watch_levels: { price: number; note: string }[];
@@ -328,6 +329,9 @@ export interface InstStatus {
   next_review_in: number | null;
   last_reason: string;
   error: string;
+  error_work_id?: number | null;
+  review_started_ts?: number | null;
+  retry_after_ts?: number | null;
   report: Report | null;
   style?: Style;
   stance?: Stance;
@@ -480,6 +484,17 @@ export interface Activity {
   kind: "wake" | "tool" | "result" | "handoff" | "action" | "done" | "skip" | "error" | "queued" | "interject" | "ask" | "answer" | "closed";
   text: string;
   data: Record<string, any>;
+}
+
+export interface ErrorDiagnostic {
+  type: string;
+  message: string;
+  status_code?: string;
+  model_name?: string;
+  request_id?: string;
+  truncated?: boolean;
+  causes?: ErrorDiagnostic[];
+  frames?: { file: string; line: number; function: string }[];
 }
 
 /** 情报 Worker 的简报 */
@@ -732,6 +747,7 @@ export interface PlanPreview {
 export interface ChatMessage {
   role: "user" | "ai";
   text: string;
+  error?: ErrorDiagnostic;
   ts?: number;
   env?: AgentConfig["env"];
   actions?: ActionResult[];
@@ -864,6 +880,7 @@ export const api = {
     get<Candle[]>(`/api/market/candles?inst_id=${inst}&bar=${bar}&limit=${limit}&src=${src}`),
   lots: (inst?: string) => get<Lot[]>(`/api/lots${inst ? `?inst_id=${inst}` : ""}`),
   work: (limit = 60, inst?: string) => get<WorkItem[]>(`/api/work?limit=${limit}${inst ? `&inst_id=${inst}` : ""}`),
+  workDetail: (id: number) => get<WorkItem & { activity: Activity[] }>(`/api/work/${id}`),
   intel: (inst: string, role: SubRole = "intel", question = "") => post<IntelBrief>("/api/agent/intel", { inst_id: inst, role, question }),
   logsInfo: () => get<LogsInfo>("/api/logs"),
   clearLogs: (keepDays: number) => post<LogsInfo & { cleared: Record<string, number>; okx_files: number }>("/api/logs/clear", { keep_days: keepDays }),

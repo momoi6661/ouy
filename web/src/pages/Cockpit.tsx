@@ -324,6 +324,7 @@ export function Cockpit({ state, account, ticks, journal, pending, inst, redUp, 
     chat: (
       <ChatPanel
         inst={inst}
+          hidden={!narrow && side !== "chat"}
         agent={state.agent}
         defaultEffort={state.config.reasoning_effort}
         shown={shown}

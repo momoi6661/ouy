@@ -1,10 +1,11 @@
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ACTION_KINDS, EFFORTS, ENTRY_MODES, ENTRY_TYPE, FAST_MODES, KIND_LABEL, MODE_LABEL, NO_PLAN, STANCES, STYLES, api, shotUrl, fmtPx, fmtTime, fmtUsd, permissionFor, shortInst, STATUS_LABEL,
+  ACTION_KINDS, EFFORTS, ENTRY_MODES, ENTRY_TYPE, FAST_MODES, KIND_LABEL, MODE_LABEL, noPlanText, STANCES, STYLES, api, shotUrl, fmtPx, fmtTime, fmtUsd, permissionFor, shortInst, STATUS_LABEL,
   type Account, type Activity, type AppState, type FastMode, type WorkerOverride, type Effort, type Mode, type PendingItem, type Permission, type Stance, type Rule, type Style, type UiCommand, type WorkItem,
 } from "../api";
 import { Chart, useLotEntries, type ChartLine } from "../components/Chart";
+import { ErrorDetails } from "../components/ErrorDetails";
 import { Positions } from "../components/Positions";
 import { AlgoPanel } from "../components/AlgoPanel";
 import { Recorders } from "../components/Recorders";
@@ -88,6 +89,7 @@ interface Turn {
   notes: Activity[]; // 排队、插话、你的决定、执行的操作
   body?: string;
   error?: string;
+  errorEvent?: Activity;
   done: boolean;
   handed?: boolean; // Router 已经把事情交出去了：这条消息到此为止
   quiet?: Step[]; // 不出标签的步骤（开子代理的调用）；出错了才显示
@@ -175,6 +177,7 @@ function toTurns(rows: Activity[]): Turn[] {
       t.done = true;
     } else if (a.kind === "error") {
       t.error = a.text;
+      t.errorEvent = a;
       t.done = true;
     } else if (a.kind === "skip") {
       t.body = a.text;
@@ -699,7 +702,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             {feed === "all" ? "返回对话" : "查看团队动态"}
           </button>
         </div>
-          <ChatPanel inst={coin} config={cfg} agent={agent} defaultEffort={cfg.reasoning_effort} shown={shownPlan} hidden={feed === "all"}
+          <ChatPanel inst={coin} config={cfg} agent={agent} defaultEffort={cfg.reasoning_effort} shown={shownPlan} hidden={feed === "all" || tab !== "chat"}
             onShow={(plan) => {
               setShownPlan(plan);
               if (plan) {
@@ -800,7 +803,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                         <Markdown text={t.body} />
                       </div>
                     )}
-                    {t.error && <div className="note error">出错：{t.error}</div>}
+                    {t.error && <div className="note error">出错：{t.error}<ErrorDetails workId={t.errorEvent?.work_id ?? t.errorEvent?.data?.related_work_id} error={t.errorEvent?.data?.error} message={t.error} /></div>}
                   </div>
                 </div>
               </div>
@@ -1067,7 +1070,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                   {st.report.plan.invalidation ? `。作废条件：${st.report.plan.invalidation}` : ""}
                 </p>
               )}
-              {!st.report.plan && st.report.no_plan_reason && <p className="muted small">这一轮没给计划：{NO_PLAN[st.report.no_plan_reason]}</p>}
+              {!st.report.plan && st.report.no_plan_reason && <p className="muted small">这一轮没给计划：{noPlanText(st.report.no_plan_reason)}</p>}
               <PlanExecution inst={coin} report={st.report} account={account} onChanged={refresh} />
               {!!st.report.knowledge?.length && (
                 <details className="ws-kb-used">
@@ -1183,6 +1186,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               <div>
                 <b>{WORK_FROM[w.source] ?? w.source}：{w.goal}</b>
                 {w.result && <span>{w.result.replace(/[*#`]/g, "")}</span>}
+                {w.status === "failed" && <ErrorDetails workId={w.id} message={w.result} />}
               </div>
               <time>{fmtTime(w.ts)}</time>
             </div>

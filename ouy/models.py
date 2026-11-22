@@ -190,7 +190,7 @@ class AgentConfig(BaseModel):
     style: Style = Field("intraday", description="默认交易风格：scalp 超短线 / intraday 日内短线 / swing 波段")
     router_model: str = Field("", description="Router（负责和用户沟通、分派任务、过滤事件）用的模型；留空用 .env 里的 AI_MODEL")
     worker_model: str = Field("", description="Worker（每个币一个，负责分析和交易）用的模型；留空用 .env 里的 AI_MODEL")
-    wake: Wake = Field("event", description="Worker 的唤醒方式：event 有事才唤醒（省 token）/ always 一直唤醒（按最短间隔持续复盘）")
+    wake: Wake = Field("event", description="Worker 的唤醒方式：event 有事才唤醒（软事件先过滤）/ always 按 Worker 给出的下次检查时间持续复盘（软事件不过滤）；硬事件可提前唤醒，自动唤醒都遵守失败退避")
     max_parallel: int = Field(3, ge=1, le=8, description="最多同时有几个 Worker 在思考（不同的币并行）；超出的排队。子代理另有一组名额，是它的 2 倍")
     intel_minutes: int = Field(0, ge=0, le=1440, description="子代理多久定时更新一次简报（分钟）；0 = 不定时更新，只在 Worker 觉得需要时才派（默认）")
     trigger_effort: Effort = Field("low", description="Worker 被行情事件叫醒（价格触及盯盘价位、进入入场区间、突然异动）时的思考强度：要快，默认低")

@@ -154,14 +154,14 @@ async def test_one_turn_wakes_the_worker_once_and_logs_the_rest_under_one_algori
     shift = {"side": "long", "kind": "反转", "level": 100.0, "origin": 99.0, "ts": int((start - 400) * 1000), "bars_ago": 1, "why": "收盘站上前一个摆动高点 100"}
     woken: list[str] = []
 
-    async def review(inst_id, reason, gate):
+    async def review(inst_id, reason, source):
         woken.append(reason)
         st.reviewing = False
 
     async def no_rules(*args, **kwargs):
         return None
 
-    monkeypatch.setattr(w, "_review_task", review)
+    monkeypatch.setattr(w, "review", review)
     monkeypatch.setattr(w.strategies, "tick", no_rules)
     stamp = [start - 9]
     base = fake._market_get_ticker
