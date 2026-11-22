@@ -1,0 +1,9 @@
+{
+  "name": "ouy-okx-runtime",
+  "private": true,
+  "description": "欧易官方 Agent Trade Kit（扫码授权 + 全量交易能力），由后端以子进程方式调用",
+  "dependencies": {
+    "@okx_ai/okx-trade-cli": "1.5.1",
+    "@okx_ai/okx-trade-mcp": "1.5.1"
+  }
+}

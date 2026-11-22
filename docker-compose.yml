@@ -1,0 +1,37 @@
+# 启动：docker compose up -d      关闭：docker compose down      看日志：docker compose logs -f
+# 改了代码或更新版本后：docker compose up -d --build
+services:
+  ouy:
+    build:
+      context: .
+      args:
+        # 构建时下载依赖用的代理和 pip 源（在 .env 里设 DOCKER_PROXY_URL / PIP_INDEX_URL 可以改）
+        HTTP_PROXY: ${DOCKER_PROXY_URL-http://host.docker.internal:7890}
+        HTTPS_PROXY: ${DOCKER_PROXY_URL-http://host.docker.internal:7890}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+    image: ouy:local
+    container_name: ouy
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 容器里的 127.0.0.1 是容器自己，所以代理要写成宿主机地址。
+      # 后端、欧易官方组件、模型调用和知识库模型下载都走这个代理；不需要代理就在 .env 里写一行 DOCKER_PROXY_URL=（等号后面留空）
+      LOCAL_PROXY_URL: ${DOCKER_PROXY_URL-http://host.docker.internal:7890}
+      OUY_HOST: 127.0.0.1
+      OUY_BIND: 0.0.0.0
+      OUY_PORT: "8899"
+      OUY_DATA_DIR: /app/data
+      TZ: ${TZ:-Asia/Shanghai}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${OUY_PUBLISH_PORT:-8899}:8899"   # 只有本机能访问
+    volumes:
+      - ./data:/app/data             # 数据库、日志、知识库向量和模型缓存，和不用 Docker 时是同一份
+      - ./knowledge:/app/knowledge   # 策略资料，改了以后在知识库页点重新索引
+      - okx-home:/root/.okx          # 欧易授权状态，容器重建后不用重新授权
+
+volumes:
+  okx-home:
