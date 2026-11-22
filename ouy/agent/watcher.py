@@ -1590,8 +1590,8 @@ class Watcher:
                         st.lot_alert = ""
                 elif not reason or reason == "定时复盘" or reason.startswith("距上次复盘价格"):
                     reason, st.lot_alert = st.lot_alert, ""
-            try:  # 走势变了：撤掉等不到的旧入场，叫醒 Worker 按新的走势重新给计划
-                turned = await self._shift_watch(cfg, inst_id, st) if self._shift_actions_on(cfg, inst_id) else None
+            try:
+                turned = await self._shift_watch(cfg, inst_id, st)
             except Exception as exc:  # noqa: BLE001
                 turned = None
                 log.warning("看走势变化失败 %s: %s", inst_id, exc)
@@ -1792,7 +1792,7 @@ class Watcher:
             row("regime", "行情判断", watching and bool(st.regime), st.regime.get("ts"),
                 f"{st.regime.get('label', '')}：{st.regime.get('why', '')}" if st.regime else "等下一根结构周期 K 线", "程序自己按结构周期算，决定给 Worker 哪几类入场候选"),
             row("turn", "转折", watching and fresh, turn_ts, turn_text if fresh else off,
-                ("苗头只写进 Worker 的输入；确认时撤掉过时挂单并叫醒 Worker；" if self._shift_actions_on(cfg, inst) else "快判关着，苗头和确认都只记录；")
+                ("苗头只写进 Worker 的输入；确认时撤掉过时挂单并叫醒 Worker；" if self._shift_actions_on(cfg, inst) else "确认转折时，有生效入场计划就叫醒 Worker 复核；")
                 + "确认后盘中第一次失守再叫醒一次，之后的来回只记录"),
             row("cand", "算法候选位", watching and bool(st.regime), st.regime.get("ts"), cand_text, "给 Worker 当参考位，不下单；回测扣费后亏的打法会标出来"),
             row("fast", "快判", watching and fast_on, (st.fast_last or {}).get("ts"),
@@ -2046,6 +2046,11 @@ class Watcher:
         """新增只读采样不能顺带扩大原有的变盘唤醒、撤单范围。"""
         return cfg.fast_entry_for(inst_id) != "off" or self.strategies.wants_data(cfg.env, inst_id)
 
+    def _has_resting_plan(self, cfg: AgentConfig, inst_id: str) -> bool:
+        return any(g.get("plan") for g in self.trader.order_guards(cfg.env, inst_id)) or any(
+            r["status"] == "armed" and r["params"].get("plan") for r in self.store.strategies(cfg.env, inst_id)
+        )
+
     def _set_regime(self, cfg: AgentConfig, inst_id: str, st: InstState, snapshot: dict[str, Any], pos: Position | None, shift: dict[str, Any] | None) -> list[dict[str, Any]]:
         """算法这一层的结论：行情判断 + 候选位。纯计算，不问大模型；复盘和算法自己的时钟（_algo_tick）共用。
         行情判断变了记一条算法事件。返回候选（持仓时不出候选）。"""
@@ -2148,8 +2153,13 @@ class Watcher:
             was = prior.get("turn") or {}
             if shift_now and shift_now["bars_ago"] <= 1 and shift_now["ts"] != (prior.get("shift") or {}).get("ts"):
                 swept = turn if turn and turn["stage"] == 3 and turn.get("choch_ts") == shift_now["ts"] else None
+                effect = "只记录"
+                if self._shift_actions_on(cfg, inst_id):
+                    effect = "撤掉过时挂单，叫醒 Worker 重新判断"
+                elif self._has_resting_plan(cfg, inst_id):
+                    effect = "叫醒 Worker 复核已有计划"
                 self._algo(cfg.env, inst_id, "turn", f"确认（{shift_now['kind']}）：{shift_now['why']}" + (f"。之前{swept['why']}" if swept else ""),
-                           "撤掉过时挂单，叫醒 Worker 重新判断" if self._shift_actions_on(cfg, inst_id) else "只记录", shift_now["side"], px, atr5)
+                           effect, shift_now["side"], px, atr5)
             elif turn and turn["stage"] == 2 and (turn["side"], turn["stage"], turn["ts"]) != (was.get("side"), was.get("stage"), was.get("ts")):
                 self._algo(cfg.env, inst_id, "turn", f"苗头：{turn['text']}", "写进 Worker 的输入，不叫醒、不下单", turn["side"], px, atr5)
         if shift_now and shift_now.get("ts") == (prior.get("shift") or {}).get("ts"):
@@ -2183,8 +2193,7 @@ class Watcher:
                     self.strategies.cancel(row["id"], "默认记录器已经换成快判")
 
     async def _shift_watch(self, cfg: AgentConfig, inst_id: str, st: InstState) -> str | None:
-        """走势变了（5 分钟 K 线收盘有力地越过了前一个摆动点）：之前照计划挂着的入场，逆着新方向的、留在起动点后面到不了的，程序直接撤掉；
-        然后返回一句叫醒 Worker 的话，让它按新的走势重新给计划。同一次变化只处理一次。"""
+        """转折确认后复核已有计划。同一次变化只处理一次。"""
         m = self.strategies.metrics.get(inst_id) or {}
         shift = m.get("shift")
         if not shift or shift["ts"] == st.shift_ts:
@@ -2192,6 +2201,12 @@ class Watcher:
         first, st.shift_ts = st.shift_ts == 0, shift["ts"]
         if first or shift["bars_ago"] > 3:  # 刚启动时看到的是早就发生的事；隔了好几根才看到的也不当新事件
             return None
+        if not self._shift_actions_on(cfg, inst_id):
+            if not self._has_resting_plan(cfg, inst_id):
+                return None
+            text = f"走势变了：{shift['why']}。复核已有入场计划，判断是保留、调整还是撤销。"
+            self._emit(cfg.env, inst_id, "strategy", "wake", text, None, {"shift": shift})
+            return text
         _, mine = await self._plan_state(cfg, inst_id, [])
         dropped = []
         for r in mine:

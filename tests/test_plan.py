@@ -383,6 +383,12 @@ async def test_procrastinating_tools_steer_into_real_limit_orders_and_shift_clea
         "ts": 200, "values": {"atr": 80.0}, "levels": {}, "why": {},
         "shift": {"side": "long", "kind": "反转", "level": 60_500.0, "ts": 200, "bars_ago": 1, "origin": 59_800.0, "extreme": 61_200.0, "why": "收盘站上前高 60500"},
     }
+    assert rt.config().fast_entry_for(BTC) == "off"
+    woke = await w._shift_watch(rt.config(), BTC, st)
+    assert woke and "复核已有入场计划" in woke and len(fake.orders) == 1
+    assert await w._shift_watch(rt.config(), BTC, st) is None
+    w.strategies.metrics[BTC]["shift"]["ts"] = 201
+    rt.save_config(rt.config().model_copy(update={"fast_entry": "verify"}))
     woke = await w._shift_watch(rt.config(), BTC, st)
     assert woke and "走势变了" in woke and "撤掉这些等不到的入场" in woke and not fake.orders
 
