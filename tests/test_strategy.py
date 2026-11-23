@@ -320,3 +320,42 @@ async def test_rule_bound_to_a_closed_lot_retires_quietly_and_algo_events_are_ch
     report = rt.watcher.algo_report("demo", BTC)
     assert report["events"][0]["checks"]["15m"]["ok"] == "right" and report["stats"]["turn"]["right"] == 1  # 旧记录里的「结构转折」归到「转折」
     assert any(a["id"] == "turn" for a in rt.watcher.status()["instruments"][BTC]["algos"])
+
+
+async def test_breakout_cancels_stale_plan_limit_and_manages_atr_trail_and_stale_exit(rt, fake):
+    """顺势突破点火时自动撤掉未成交的远端计划限价单；脉冲持仓支持 ATR 吊灯止损与超时未起爆动能证伪离场。"""
+    engine = rt.watcher.strategies
+    limit_res = await rt.trader.submit(
+        TradeAction(kind="open", inst_id=BTC, side="long", order_type="limit", price=59_400, stop_loss=59_000, take_profit=61_500, leverage=5, risk_pct=0.4, cancel_px=61_000, reason="远端回踩"),
+        source="agent",
+    )
+    assert limit_res.status == "executed" and len(fake.orders) == 1
+    guards = rt.trader.order_guards("demo", BTC)
+    rt.store.set("order_guard:demo:BTC-USDT-SWAP", [{**g, "plan": True} for g in guards])
+
+    brk = engine.deploy(rt.config(), BTC, "breakout", "long", {
+        "trigger": 60_300, "stop_loss": 59_900, "take_profit": 63_000, "leverage": 5, "risk_pct": 0.5,
+        "confirm_vol": 1.3,
+        "manage": {"lock_r": 0, "breakeven_r": 1.3, "trail_atr": 2.0, "trail_bar": "15m", "trail_start_r": 1.2, "stale_minutes": 20, "stale_min_r": 0.4},
+    })
+    now = int(time.time() * 1000)
+    engine.metrics[BTC] = {"source_env": "demo", "ts": now, "fast_ts": now, "values": {"vol_1m": 0.6, "move_1m": -0.02, "atr": 120.0}, "levels": {}, "bar_atrs": {"15m": 150.0}}
+    await tick(rt, fake, 60_310)
+    assert BTC not in fake.positions and one(rt, brk["id"])["status"] == "armed" and len(fake.orders) == 1
+
+    engine.metrics[BTC]["values"].update(vol_1m=1.8, move_1m=0.25)
+    await tick(rt, fake, 60_330)
+    assert not fake.orders and fake.positions[BTC]["pos"] > 0 and one(rt, brk["id"])["status"] == "active"
+
+    await tick(rt, fake, 61_000)
+    assert rt.trader.lots("demo", BTC)[0]["stop_loss"] == pytest.approx(60_700)
+
+    fake._flatten(BTC)
+    await tick(rt, fake, 60_000)
+    opened = await rt.trader.execute(TradeAction(kind="open", inst_id=BTC, side="long", stop_loss=59_600, leverage=5, risk_pct=0.3), "demo", source="agent")
+    stale_row = engine.deploy(rt.config(), BTC, "manage", "", {"lot_id": opened.detail["lot_id"], "stale_minutes": 15, "stale_min_r": 0.4})
+    await tick(rt, fake, 60_020)
+    rt.store.update_strategy(stale_row["id"], state={**one(rt, stale_row["id"])["state"], "since": time.time() - 16 * 60})
+    await tick(rt, fake, 60_010)
+    assert BTC not in fake.positions and one(rt, stale_row["id"])["status"] == "done" and "动能证伪" in one(rt, stale_row["id"])["note"]
+

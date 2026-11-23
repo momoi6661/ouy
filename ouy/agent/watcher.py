@@ -25,7 +25,7 @@ from pydantic_ai.usage import UsageLimits
 from ..events import EventBus
 from ..diagnostics import exception_detail, redact
 from ..knowledge import KnowledgeBase
-from ..indicators import BAR_MINUTES, ROW_BLOCK, day_profile, value_area
+from ..indicators import BAR_MINUTES, ROW_BLOCK, atr as atr_series, day_profile, value_area
 from ..market import Market, _f, session_anchor, us_stock_session
 from ..backtest_plans import evidence, losing
 from ..scoreboard import Scoreboard
@@ -39,7 +39,7 @@ from .core import SUBAGENTS, Deps, build_review_agent, build_adhoc_agent, build_
 from .early_watch import ShiftRetest
 from .signals import KIND as FAST_KIND, FastParams, describe_tape, detect, key_lines, line_status, strengths, structure_shift, trend_run, turn_state, turn_watch
 from .core import STABLE_MARK
-from .plan import TURN_BY, REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, major_direction, market_regime, build_candidates, candidates_text, check_plan, far_target, plan_origin, manage_rules, order_params, plan_terms, safe_leverage, same_plan, trade_cost_pct
+from .plan import TURN_BY, REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, major_direction, market_regime, miss_price, build_candidates, candidates_text, check_plan, far_target, plan_origin, manage_rules, order_params, plan_terms, safe_leverage, same_plan, trade_cost_pct
 
 log = logging.getLogger("ouy.watcher")
 
@@ -196,6 +196,7 @@ class InstState:
     shift_ts: int = 0  # 上次看到的走势变化发生在哪一根 K 线：同一次只处理一次
     fast_checked: float = 0.0  # 快判上次看 1 分钟 K 线的时间
     fast_bar_ts: int = 0  # 快判上次出信号的那根 K 线：同一根只处理一次
+    fast_shift_ts: int = 0  # 同一次 5 分钟转折最多触发一次快判回踩，不在阴跌途中连画圆点
     fast_at: dict[str, float] = field(default_factory=dict)  # 每个方向上次出手 / 叫醒 Worker 的时间
     fast_last: dict[str, Any] | None = None  # 最近一次快判信号和程序怎么处理的（给界面和 Worker 看）
     kb_picks: dict[tuple[str, ...], tuple[float, list[Any]]] = field(default_factory=dict)  # 行情状态对应的查询 → (什么时候查的, 查到的条目)
@@ -1530,6 +1531,10 @@ class Watcher:
                 if time.time() < self._auth_retry_at:
                     await self._market_only(cfg)
                 else:
+                    if auth_failures:
+                        recover = getattr(self.control, "recover_okx_auth", None)
+                        if callable(recover) and await recover():
+                            await self.gw.restart()
                     await self._tick(cfg)
                     if auth_failures:
                         self._note("system", "欧易账户读取已恢复，已继续检查订单、持仓和触发线")
@@ -2137,15 +2142,21 @@ class Watcher:
             r["status"] == "armed" and r["params"].get("plan") for r in self.store.strategies(cfg.env, inst_id)
         )
 
+    @staticmethod
+    def _follow_trend(cfg: AgentConfig, inst_id: str) -> bool:
+        """出手尺度「积极」：按趋势做，方向打架时不停手，回测成绩只作参考、不拦单。"""
+        return bool(STANCES[cfg.stance_for(inst_id)].get("follow_trend"))
+
     def _set_regime(self, cfg: AgentConfig, inst_id: str, st: InstState, snapshot: dict[str, Any], pos: Position | None, shift: dict[str, Any] | None) -> list[dict[str, Any]]:
         """算法这一层的结论：行情判断 + 候选位。纯计算，不问大模型；复盘和算法自己的时钟（_algo_tick）共用。
         行情判断变了记一条算法事件。返回候选（持仓时不出候选）。"""
         style = cfg.style_for(inst_id)
+        follow = self._follow_trend(cfg, inst_id)
         rows = [] if pos else build_candidates(
             snapshot, style=style, min_rr=STANCES[cfg.stance_for(inst_id)]["min_rr"],
             maker_fee_pct=cfg.maker_fee_pct, taker_fee_pct=cfg.taker_fee_pct, entry_mode=cfg.entry_mode_for(inst_id),
-            quant_mode=cfg.quant_mode_for(inst_id), quant_bias=cfg.quant_bias_for(inst_id), shift=shift)
-        regime = market_regime(snapshot, style, shift)
+            quant_mode=cfg.quant_mode_for(inst_id), quant_bias=cfg.quant_bias_for(inst_id), shift=shift, follow_trend=follow)
+        regime = market_regime(snapshot, style, shift, follow)
         was = st.regime or {}
         st.regime = {**regime, "label": REGIME_LABEL[regime["kind"]], "ts": now_ms(), "plays": list(REGIME_PLAYS[regime["kind"]]),
                      "candidates": candidate_rows(rows, style), "holding": bool(pos)}
@@ -2162,14 +2173,14 @@ class Watcher:
                     head = f"{seen.get('label') or REGIME_LABEL.get(seen.get('kind') or '', '')} → {label}"
                 self._algo(cfg.env, inst_id, "regime", f"{head}：{regime['why']}", f"候选改成：{plays}", regime["side"],
                            sub=label, data=self._regime_basis(snapshot, style, regime, shift), score=regime["kind"] in ("trend", "reversal"))
-        # 新出现的合格候选（同一条打法、同一个方向之前没有）：记下来，之后核对价格有没有照它的方向走
-        had = {(c["strategy"], c["side"]) for c in was.get("candidates") or [] if c["ok"]}
+        # 新出现的合格主推参考位（同一条打法、同一个方向之前没有）：记下来，之后核对价格有没有照它的方向走
+        had = {(c["strategy"], c["side"]) for c in was.get("candidates") or [] if c["ok"] and c.get("in_regime", True)}
         for c in st.regime["candidates"]:
-            if c["ok"] and (c["strategy"], c["side"]) not in had:
+            if c["ok"] and c.get("in_regime", True) and (c["strategy"], c["side"]) not in had:
                 goals = " / ".join(f"{t:g}" for t in c["targets"])
                 self._algo(cfg.env, inst_id, "cand",
                            f"{c['strategy']}{'做多' if c['side'] == 'long' else '做空'}：入场 {c['entry']:g}，止损 {c['stop']:g}，目标 {goals}，扣费后盈亏比 {c['net_rr']:g}",
-                           "回测扣费后亏：只给 Worker 参考，它要写出额外依据才能用" if c["losing"] else "给 Worker 当候选，不下单", c["side"],
+                           "给 Worker 当盘面参考位，由它综合判断", c["side"],
                            sub="回测亏的打法" if c["losing"] else "合格候选",
                            data={"strategy": c["strategy"], "how": c["how"], "regime": regime["kind"], "align": c["align"], "net_rr": c["net_rr"], "evidence": c["evidence"]})
         return rows
@@ -2212,13 +2223,16 @@ class Watcher:
             return
         if st.algo_clock and st.algo_clock[:2] == scope and closed <= st.algo_clock[2]:
             return
-        previous = {(c["strategy"], c["side"]) for c in st.regime.get("candidates", []) if c["ok"] and not c["losing"]}
+        follow = self._follow_trend(cfg, inst_id)
+        previous = {(c["strategy"], c["side"]) for c in st.regime.get("candidates", []) if c["ok"] and c.get("in_regime", True)}
         self._set_regime(cfg, inst_id, st, snapshot, pos, self.strategies.fresh_metrics(cfg.env, inst_id).get("shift"))
         st.algo_clock = (*scope, closed)
-        fresh = [c for c in st.regime["candidates"] if c["ok"] and not c["losing"] and (c["strategy"], c["side"]) not in previous]
+        fresh = [c for c in st.regime["candidates"] if c["ok"] and c.get("in_regime", True) and (c["strategy"], c["side"]) not in previous]
         if notify and closed == expected and fresh and not cfg.worker(inst_id).standby:
             levels = "、".join(f"{c['strategy']} {c['side']} @ {c['entry']:g}（止损 {c['stop']:g}）" for c in fresh)
-            self.interject(inst_id, f"{spec['struct_bar']} 新合格候选：{levels}。核对现价和已有委托；认可且只差到价就准备挂单，还缺确认则写明等待条件。",
+            todo = ("方向认可就在这一轮给出 plan，程序马上挂限价单等成交（走势反了或过期会自动撤），不要只划叫醒线等到价再看。" if follow
+                    else "认可且只差到价就准备挂单，还缺确认则写明等待条件。")
+            self.interject(inst_id, f"{spec['struct_bar']} 新合格候选：{levels}。核对现价和已有委托；{todo}",
                            "走势记录器", market_key="candidate")
         run = trend_run(await self.market.candles(inst_id, spec["struct_bar"], 60, cfg.env))
         if run and run["bar_ts"] == closed and (run["ts"] != st.run_seen[0] or run["step"] > st.run_seen[1]):
@@ -2310,11 +2324,17 @@ class Watcher:
             narrative = f"转折苗头：{turn['text']}。{narrative}"
         if session:  # 开盘以来怎么走的：开盘价、先去了哪边、现在是单边 / 冲高回落 / 探底回升 / 围绕开盘价
             narrative = f"{narrative} {session['text']}。"
+        m15_closed = [c for c in st.area_bars[1] if c.confirmed] if st.area_bars[1] else []
+        h1_closed = [c for c in h1 if c.confirmed]
+        atr15 = atr_series(m15_closed)[-1] if len(m15_closed) > 15 else None
+        atr1h = atr_series(h1_closed)[-1] if len(h1_closed) > 15 else None
         self.strategies.metrics[inst_id] = {
             "source_env": cfg.env, "asset": asset,
             "forming_5m": {"ts": m5[-1].ts, "open": m5[-1].open, "previous_closes": [
                 {"ts": c.ts, "close": c.close} for c in closed[-3:] if c.ts < m5[-1].ts]} if not m5[-1].confirmed else None,
-            "ts": now_ms(), "fast_ts": fast_ts, "quote_ts": prior.get("quote_ts", 0), "values": values, "levels": levels, "why": {n["label"]: n["value"] for n in j["nodes"]},
+            "ts": now_ms(), "fast_ts": fast_ts, "quote_ts": prior.get("quote_ts", 0), "values": values, "levels": levels,
+            "bar_atrs": {"5m": atr5, "15m": atr15, "1H": atr1h},
+            "why": {n["label"]: n["value"] for n in j["nodes"]},
             "structure_closes": {
                 bar: {"end": candle.ts + 300_000, "price": candle.close}
                 for bar, minutes in (("5m", 5), ("15m", 15), ("1H", 60))
@@ -2371,7 +2391,9 @@ class Watcher:
         qmode, qbias = cfg.quant_mode_for(inst_id), cfg.quant_bias_for(inst_id)
         kinds = tuple(cfg.fast_kinds) if qmode == "auto" else QUANT_MODES[qmode]["kinds"]
         v_ratio = cfg.worker(inst_id).quant_vol_ratio or FastParams.vol_ratio
-        sig = detect(bars, st.last_px, m["levels"], atr5=values.get("atr"), trend=values.get("trend") or 0, shift=m.get("shift"),
+        bar_atrs = m.get("bar_atrs") or {}
+        fast_atr = bar_atrs.get("15m") or values.get("atr")
+        sig = detect(bars, st.last_px, m["levels"], atr5=fast_atr, trend=values.get("trend") or 0, shift=m.get("shift"),
                      p=FastParams(kinds=kinds, vol_ratio=v_ratio)) if kinds else None
         closed = [c for c in bars if c.confirmed]
         m["fast_ts"] = closed[-1].ts + 60_000 if closed else 0
@@ -2380,6 +2402,8 @@ class Watcher:
             values.update(move_1m=round((closed[-1].close / closed[-1].open - 1) * 100, 3), vol_1m=round(closed[-1].volume / avg, 2) if avg else None)
         values.update(strengths(sig))
         if sig is None or sig.bar_ts == st.fast_bar_ts or (qbias in ("long", "short") and sig.side != qbias):
+            return None
+        if sig.kind == "retest" and m.get("shift") and m["shift"].get("ts") == st.fast_shift_ts:
             return None
         st.fast_bar_ts = sig.bar_ts
         late = not 0 <= now_ms() - (sig.bar_ts + 60_000) <= FAST_DATA_MS
@@ -2410,15 +2434,25 @@ class Watcher:
             done("skipped", f"这类信号机械照做的回测是亏的（{evidence(style).get(plan.strategy, '')}）：只记录，不下单、不叫醒 Worker", emit=False)
             return None
         check = await self._check_plan(cfg, inst_id, plan)
-        if not check.ok:  # 程序自己算的价位都过不了核对：不值得为它叫醒 Worker
-            done("skipped", "没有处理：" + "；".join(check.issues)[:200], emit=False)
+        if not check.ok:  # 程序自己算的价位都过不了成本/盈亏比核对：不当有效信号画上 K 线图，也不叫醒 Worker
+            done("ignored", "没有处理：" + "；".join(check.issues)[:200], emit=False)
             return None
         st.fast_at[sig.side] = now
+        if sig.kind == "retest" and m.get("shift"):
+            st.fast_shift_ts = int(m["shift"].get("ts") or 0)
         allowed = mode == "agent" and (st.report or {}).get("on_signal") in (sig.side, "both")
         if allowed:
             if mine:
-                done("skipped", "已有计划入场委托，快判不叠加市价单；换单由计划复核处理")
-                return None
+                if all(r["kind"] == "limit" and r["side"] == sig.side for r in mine):
+                    try:
+                        for r in mine:
+                            await self._drop_plan(cfg, inst_id, r, "快判顺势起爆，撤掉远端未成交的回踩限价单改现价跟进")
+                    except Rejected as exc:
+                        done("skipped", f"撤远端回踩挂单未确认，不叠加市价单：{exc}")
+                        return None
+                else:
+                    done("skipped", "已有计划入场委托，快判不叠加市价单；换单由计划复核处理")
+                    return None
             who = "Worker 授权过这个方向"
             result = await self._enter_now(cfg, inst_id, plan, check, f"快判{FAST_KIND[sig.kind]}（{check.numbers()}）", "快判")
             done(result.status, f"{who}。{result.message}")
@@ -2495,19 +2529,12 @@ class Watcher:
             tell(f"没有执行成：{_fail_text(exc)[1]}", soft=True)
 
     async def _lines_gate(self, cfg: AgentConfig, inst_id: str, report: CycleReport, deps: Deps) -> str | None:
-        """结论交出来之前核对计划线：空仓时现价上方、下方各至少一条；进场线按「到了那个价位再进」预检一遍。
+        """结论交出来之前核对计划线：只预检 Worker 主动写的 do=enter 进场线（不再硬逼空仓上下各划一条线，避免凑出无意义的叫醒线）。
         第一次有问题退回去改；已经退回过一次就不再退：过不了预检的进场线改成只叫醒，其余原样收下。核对本身出错不拦。"""
         try:
             st = self._state(inst_id)
             px = st.last_px
-            worker = self.get_config().worker(inst_id)
             issues = []
-            if px and not worker.standby and not worker.paused and not (await self.trader.account(cfg.env)).position(inst_id):
-                above, below = sum(l.price > px for l in report.lines), sum(l.price < px for l in report.lines)
-                if not above or not below:
-                    issues.append(
-                        f"计划线不全：现在空仓，现价 {px:g} 上方有 {above} 条、下方有 {below} 条，两边各至少要一条。"
-                        "往上走到哪个结构位你要做什么、往下走到哪个结构位你要做什么，都划出来（do=enter 进场 / cancel 撤单 / wake 叫你来看），不能只押一个方向")
             pref = cfg.leverage_pref()
             for line in report.lines:
                 if line.do != "enter":
@@ -3009,7 +3036,7 @@ class Watcher:
                     for row in rows
                 ]
             prompt = self._prompt(cfg, inst_id, reason, snapshot, account, st.report, knowledge, closed, candidates=rows)
-            best = next((c for c in rows if c["ok"] and not c.get("losing") and not c.get("execution_blocker")
+            best = next((c for c in rows if c["ok"] and (self._follow_trend(cfg, inst_id) or not c.get("losing")) and not c.get("execution_blocker")
                          and c["check"].limit and not c["align"].startswith("逆")), None) if (snapshot.get("orderbook") or {}).get("spread_pct") is not None else None
             deps = Deps(
                 trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons,
@@ -3028,6 +3055,8 @@ class Watcher:
                     "\n【这次是被行情事件叫醒的，要快】先看触发这件事的那个周期的 candles 和 patterns：这次是真突破、假突破，还是正常回踩？"
                     "然后直接决定——动手、调整策略或止损、还是不动。不做全面复盘，不派子代理（除非要下大单），结论两三句话。"
                 )
+                if self._follow_trend(cfg, inst_id):
+                    prompt += "出手尺度是「积极」：价格到了你等的位置、方向和你的看法一致，就这一轮给出 plan 下单或挂限价单，不要再划一条叫醒线等下一次。"
             notes = self.inbox(cfg.env, inst_id)
             if notes:  # 空闲时收到的留言：这一轮先处理
                 prompt += "\n【未读留言，时间为写入信箱的本地时间】行情和执行回执是历史证据，不是再执行一次的指令；与当前挂单、持仓及最新收盘核对。\n" + "\n".join(
@@ -3166,11 +3195,6 @@ class Watcher:
         spread = (ask - bid) / bid * 100 if bid and ask >= bid else 0.0
         check = check_plan(plan, _f(ticker.get("last")), min_rr=STANCES[cfg.stance_for(inst_id)]["min_rr"], cost_pct=trade_cost_pct(cfg.taker_fee_pct, spread),
                            limit_cost_pct=cfg.maker_fee_pct + cfg.taker_fee_pct + spread)
-        name = (getattr(plan, "strategy", "") or "").strip()
-        if name in losing(cfg.style_for(inst_id)) and not (getattr(plan, "edge", "") or "").strip():
-            check.issues.append(
-                f"「{name}」机械照做的回测是亏的（{evidence(cfg.style_for(inst_id)).get(name, '')}）：要做就在 plan.edge 写出算法看不到的额外依据（具体数据），"
-                "拿不出来就不给 plan，no_plan_reason 选 no_edge")
         if check.ok:
             issue = self._reentry_issue(plan, check.ref, RETRY_MINUTES[cfg.style_for(inst_id)],
                                         self.store.lots(cfg.env, inst_id, live=False, limit=10), now_ms())
@@ -3201,15 +3225,33 @@ class Watcher:
             if skip:
                 return None
             if report.plan is None:
-                if (not mine and best and report.no_plan_reason == "cost"
+                follow = self._follow_trend(cfg, inst_id)
+                auto_off = "走势反了、没回来就先到第一目标、或者过了有效期，程序会自动撤单"
+                if (not mine and best and report.no_plan_reason in (("cost", "no_edge", "objection") if follow else ("cost",))
                         and not deps.actions and self.get_config().quant_mode_for(inst_id) == cfg.quant_mode_for(inst_id)
                         and self.get_config().quant_bias_for(inst_id) == cfg.quant_bias_for(inst_id)):
                     plan = best["plan"]
                     live = await self._check_plan(cfg, inst_id, plan)
+                    if live.ok and report.no_plan_reason == "objection":
+                        return (f"出手尺度是「积极」：方向认定了就先把单挂出去，不等到价、不等下一根收盘确认。本轮「{best['strategy']}」"
+                                f"{'做多' if plan.direction == 'long' else '做空'}，入场 {live.ref:g}、止损 {plan.stop_loss:g}，刚按现价复算：{live.numbers()}。"
+                                f"你看的也是这个方向、只是在等价格或等确认，就现在给出完整计划，程序马上挂单（{auto_off}）。"
+                                "只有工具返回了具体的反对数据（资金费率、点差、重大事件）才保留 objection，并在 summary 里写出数字。")
+                    if live.ok and report.no_plan_reason == "no_edge":
+                        return (f"出手尺度是「积极」：按趋势做，回测成绩只作参考，不能当不做的理由。本轮「{best['strategy']}」"
+                                f"{'做多' if plan.direction == 'long' else '做空'}，入场 {live.ref:g}、止损 {plan.stop_loss:g}，刚按现价复算：{live.numbers()}。"
+                                "趋势方向没有问题就给出完整计划；有工具返回的反对信号或限制，改选 objection / limit 并写出具体依据。")
                     if live.ok and live.limit:
                         return (f"成本结论需要复核：本轮「{best['strategy']}」挂位 {live.ref:g}、止损 {plan.stop_loss:g}，"
                                 f"刚按现价复算：{live.numbers()}。若符合用户目标且只是在等到价，给出完整 pullback 计划，"
                                 "按用户授权决定仓位，不必等下一轮。如果有真实反对信号或限制，说明具体依据；不要为了交差下单。")
+                waits = [l for l in report.lines if l.do == "wake"]
+                if (follow and not mine and not deps.actions and report.no_plan_reason in ("cost", "no_edge", "objection")
+                        and waits and not any(l.do == "enter" for l in report.lines)):
+                    return ("出手尺度是「积极」：你划了叫醒线（" + "、".join(f"{l.price:g}" for l in waits[:4]) + "）但没有挂单。"
+                            "其中到了你就愿意做的位置，现在就写成 plan（entry_type=pullback，入场区间放在那个结构位上，带止损和目标），"
+                            f"程序马上在欧易挂限价单等成交（{auto_off}），不要等碰到了再看一遍。"
+                            "没有一条是你愿意接的，就保持原结论，并在 summary 里写明缺的是哪个结构位或哪条硬理由。")
                 if report.no_plan_reason or mine:
                     return None
                 return (
@@ -3332,7 +3374,7 @@ class Watcher:
                 tps = sorted(plan.take_profits, reverse=plan.direction == "short")
                 action = TradeAction(
                     kind="open", inst_id=inst_id, side=plan.direction, order_type="limit", price=check.ref, stop_loss=plan.stop_loss, take_profit=far_target(plan),
-                    leverage=safe_leverage(plan.leverage, check.stop_pct), risk_pct=plan.risk_pct, margin_usdt=plan.margin_usdt, cancel_px=tps[0],
+                    leverage=safe_leverage(plan.leverage, check.stop_pct), risk_pct=plan.risk_pct, margin_usdt=plan.margin_usdt, cancel_px=miss_price(plan, check.ref, self._state(inst_id).last_px),
                     require_flat=True, cancel_before_entry=plan.cancel_before_entry,
                     expires_minutes=plan.valid_minutes or STYLES[style]["plan_minutes"], reason=f"照计划挂限价单（{check.numbers()}）",
                 )
@@ -3358,7 +3400,7 @@ class Watcher:
                 deps.actions.append(result)
                 extra = self._arm_reverse(cfg, inst_id, plan, 5) if result.status == "executed" else ""
                 return {"status": result.status, "ord_id": result.detail.get("ordId"), "text": f"程序照计划现价{side}：{result.message}{extra}"}
-            row = self.strategies.deploy(cfg, inst_id, check.how, plan.direction, {**order_params(plan, check, style), "strategy_name": plan.strategy or None}, note=f"照计划布置（{check.numbers()}）", by="计划")
+            row = self.strategies.deploy(cfg, inst_id, check.how, plan.direction, {**order_params(plan, check, style, px=self._state(inst_id).last_px), "strategy_name": plan.strategy or None}, note=f"照计划布置（{check.numbers()}）", by="计划")
             return {
                 "status": row["status"], "strategy_id": row["id"],
                 "text": f"程序照计划布置了突破追单 #{row['id']}（突破单不能提前挂限价单，否则会当场按现价成交；已由执行器秒级盯盘）：{describe_strategy(row)}"
@@ -3719,13 +3761,14 @@ class Watcher:
                 f"在这之后：顺着新方向的回踩位在 {turn['level']:g} 附近；留在起动点 {turn['origin']:g} 后面的旧支撑阻力，价格基本回不去了，不要再把单挂在那里；"
                 "逆着新方向的单只在更大周期的关键位上出现反转信号时才做。"
                 + ("盘中已经失守过被越过的摆动点：这次转折可能是假突破，顺着它的单先别加。" if state["stage"] == "lost" else "")
-                + "它的用处是判断旧方向是不是已经失效（手里逆着它的仓要重新评估）；回测里机械地照它进场并不赚钱（见知识库 evidence），要和大周期位置、目标距离一起看。"
+                + "它的用处是标记结构变化（手里逆着它的仓要重新评估）；机械盲做不代表盈利，需要你结合大周期位置、目标距离和盘口一起判断。"
             )
         if not pos and isinstance(snapshot, dict) and snapshot.get("last"):
             cands = candidates_text(
                 snapshot, style=cfg.style_for(inst_id), min_rr=stance["min_rr"],
                 maker_fee_pct=cfg.maker_fee_pct, taker_fee_pct=cfg.taker_fee_pct, shift=turn,
                 quant_mode=qmode, quant_bias=qbias, entry_mode=cfg.entry_mode_for(inst_id), rows=candidates,
+                follow_trend=self._follow_trend(cfg, inst_id),
             )
             if cands:
                 lines.append(cands)
@@ -3943,7 +3986,7 @@ class Watcher:
         if not cfg.auto_arm_plan:
             lines.append("【计划不会自动执行】用户关掉了「计划自动执行」：plan 只是展示给用户看的，程序不会照它下单。要进场必须自己调用 open_position / deploy_strategy / add_trigger。")
         lines.append(
-            "请完成本次复盘：定大方向 → 认行情状态、选策略 → 落成具体价位 → 过三条硬条件 → 空仓就给出 plan（程序照着下单）或者选 no_plan_reason（没有优势就选 no_edge，不要硬做）；"
+            "请完成本次复盘：看盘面地图和 K 线定方向 → 选结构位和策略 → 过三条硬条件 → 空仓认可就给出 plan（程序立刻下单或挂限价单）或者选 no_plan_reason；"
             "持仓中就管理仓位，该做的操作直接调用工具执行 → 输出结论。"
         )
         lines = [x for x in lines if x]

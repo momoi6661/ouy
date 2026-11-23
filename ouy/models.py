@@ -20,10 +20,10 @@ FAST_MODES: dict[str, str] = {"off": "关", "verify": "出信号叫醒 Worker �
 QuantMode = Literal["auto", "trend", "range", "breakout", "quiet"]
 QuantBias = Literal["both", "long", "short"]
 QUANT_MODES: dict[str, dict[str, Any]] = {
-    "auto": {"label": "自动识别", "desc": "先判断行情：趋势只做顺势回踩，震荡只做区间两头，刚反转只做变盘后回踩，方向打架不出候选", "kinds": ("retest",)},
-    "trend": {"label": "顺势回踩", "desc": "单边趋势用：只盯顺大方向的变盘回踩与前高前低回踩，不追高杀跌、屏蔽逆势信号", "kinds": ("retest",)},
+    "auto": {"label": "自动识别", "desc": "先判断行情：收敛蓄势或放量起爆盯顺势突破，趋势做浅回踩与动量延续，震荡做箱体两头", "kinds": ("breakout", "impulse", "retest")},
+    "trend": {"label": "顺势回踩", "desc": "单边趋势用：盯顺大方向的突破启动、EMA20 浅回踩与前高前低回踩，屏蔽逆势信号", "kinds": ("breakout", "retest")},
     "range": {"label": "震荡箱体", "desc": "横盘拉锯用：停止追突破，只盯箱体下沿撑住接多、上沿受阻接空", "kinds": ("reject",)},
-    "breakout": {"label": "收敛突破", "desc": "窄幅蓄势待选方向用：不在箱体中间挨打，盯放量收盘冲出边界的第一下", "kinds": ("breakout", "impulse", "retest")},
+    "breakout": {"label": "收敛突破", "desc": "窄幅蓄势待选方向用：不在箱体中间挨打，盯放量冲出边界的第一下", "kinds": ("breakout", "impulse", "retest")},
     "quiet": {"label": "静默防守", "desc": "乱插针或消息前后用：暂停新开仓快判信号，只做变盘撤旧单与持仓保护", "kinds": ()},
 }
 # 入场方式：Agent 看好方向后是按现价直接进，还是挂在更好的价位等成交
@@ -58,12 +58,16 @@ STANCES: dict[str, dict] = {
     },
     "active": {
         "label": "积极",
-        "min_rr": 1.2,
-        "guide": "用户要的是多出手、把每一段区间都做到。只要止损能放在一个明确的结构位之外、到第一目标盈亏比 ≥ 1.2，就出手，不等二次确认、不要求放量。\n"
+        "min_rr": 1.0,
+        "follow_trend": True,  # 按趋势做：方向打架时不停手（按大周期趋势，没有就按结构周期趋势）；回测成绩只作参考，不拦单
+        "guide": "用户要的是多出手、顺着趋势做，不要因为成本和回测成绩缩手。只要止损能放在一个明确的结构位之外、到第一目标盈亏比 ≥ 1，就出手，不等二次确认、不要求放量。\n"
+        "- 方向按趋势定：日内趋势（大周期）指向哪边就做哪边；大周期没有方向时看结构周期的趋势。两者打架时跟大周期，不要因此观望。\n"
         "- 震荡行情：区间上下沿就是入场点。价格进入区间下沿 1/4 直接做多、进入上沿 1/4 直接做空，止损放在区间外，先看区间中轨再看对侧。\n"
         "  区间太宽、现价离两边都远时，把区间按更小的周期再拆成小区间来做，不要把单子挂在很远的大区间边上干等。\n"
         "- 趋势行情：顺着方向现在就进，止损放在最近的回踩低点 / 反弹高点之外；不等回踩后的再次确认。\n"
-        "- 收敛行情：在收敛区间两侧外沿各看一个突破方向，突破后的第一次回踩进。\n"
+        "- 收敛与快走势起爆：波动率收口或紧贴箱体边界时，提前给顺方向的突破计划（entry_type=breakout）预埋在边界外，价格带量冲出就秒级进场；已经放量突破确认且没跑远就现在进（entry_type=now）；并把 on_signal 设成对应方向授权程序抢第一下。\n"
+        "- 方向认定了就先把单挂出去：趋势强时优先挂浅回踩（EMA20 / 突破位）或预埋突破单，不要全挂在永远回不去的远端老支撑干等；走势反了、走出足够空间仍未成交、或者过了有效期，程序会自动撤。"
+        "不要只划叫醒线（do=wake）等碰到了再看一遍，也不要等下一根收盘确认。\n"
         "- 「观望」不是默认选项：只有价差或最小报价单位太大吃掉利润、已到当日亏损上限、或者找不到任何能放止损的结构位时才可以不给计划，并且要明说是哪一条。",
     },
 }
@@ -79,46 +83,66 @@ LOCK_R: dict[str, float] = {"scalp": 0.5, "intraday": 0.5, "swing": 0.5}
 STYLES: dict[str, dict] = {
     "scalp": {
         "label": "超短线",
-        "edge": "赚 5 分钟结构里一小段的钱：靠次数和纪律，手续费占比最高，扣费后不够 1.2R 的不做",
+        "edge": "抓蓄势起爆的快速脉冲与顺势浅回踩：止损用 15m 波动留足呼吸，1m 放量点火，移动止损吃整段",
         "bars": ("1m", "5m", "15m", "1H"),
         "struct_bar": "5m",
+        "atr_bar": "15m",
+        "confirm_bar": "1m",
         "bar_minutes": 5,
         "look_minutes": 15,
         "limit_dist_pct": 0.8,
+        "min_stop_pct": 0.45,
+        "trail_atr": 3.5,
+        "trail_bar": "15m",
         "stale_min": 10,
+        "stale_impulse_min": 20,
         "plan_minutes": 30,
         "hold_minutes": 30,
-        "guide": "用 1H/15m 定方向，5m/1m 找入场；一笔单拿几分钟到一小时，当天不留仓过夜。止损放在 5m 结构外，通常 0.3%~0.6%，"
-        "目标看下一个 5m / 15m 结构位，行情不动 20~30 分钟就时间止损。手续费和滑点占比高：止损贴得太近、目标太小的单扣完成本不划算，"
-        "宁可用 5m / 15m 的结构做宽一点，也不要在 1m 的小波动里抢。",
+        "impulse_hold_minutes": 60,
+        "guide": "用 1H/15m 定方向，5m 看蓄势箱体和浅回踩、1m 抓放量起爆；止损按 15m ATR 留足空间（通常 ≥0.45%，让手续费占比低于 0.22R），"
+        "突破与脉冲单不设近端死止盈封顶，用移动止损跟完整波快速走势；进去 20 分钟完全冲不动就提前离场。",
     },
     "intraday": {
         "label": "日内短线",
-        "edge": "赚当天那一段主要走势的钱：等开盘或关键位给出方向，跟几十分钟到几小时",
+        "edge": "赚当天多小时箱体突破或顺势主推浪的钱：收敛末端预埋突破、趋势中段浅回踩，移动止损拿满波段",
         "bars": ("5m", "15m", "1H", "4H"),
         "struct_bar": "15m",
+        "atr_bar": "15m",
+        "confirm_bar": "5m",
         "bar_minutes": 15,
         "look_minutes": 60,
         "limit_dist_pct": 2.0,
+        "min_stop_pct": 0.55,
+        "trail_atr": 3.5,
+        "trail_bar": "15m",
         "stale_min": 45,
+        "stale_impulse_min": 60,
         "plan_minutes": 180,
         "hold_minutes": 240,
-        "guide": "用 4H/1H 定方向，15m/5m 找入场；一笔单拿几十分钟到几小时，尽量当天了结。止损通常放在 15m 结构外 0.5%~1.5%，"
-        "先看 1.5~2R，走出趋势再用跟踪止损多拿一段。",
+        "impulse_hold_minutes": 360,
+        "guide": "用 4H/1H 定方向，15m/5m 抓箱体放量突破或 EMA20 浅回踩；止损放在结构外（通常 ≥0.55%），"
+        "首目标减仓锁底后，余仓用 15m ATR 跟踪止损吃完整段单边推进，不因 0.5R 小幅波动过早下车。",
     },
     "swing": {
         "label": "波段",
-        "edge": "赚几天的趋势延续：止损宽、次数少，忍得住中间的回撤才拿得到大的一段",
+        "edge": "赚一到数天的大级别突破与趋势延续：止损宽、摩擦占比极低，靠吊灯止损拿 3~6R 大波段",
         "bars": ("15m", "1H", "4H", "1D"),
         "struct_bar": "1H",
+        "atr_bar": "1H",
+        "confirm_bar": "15m",
         "bar_minutes": 60,
         "look_minutes": 240,
         "limit_dist_pct": 5.0,
+        "min_stop_pct": 0.85,
+        "trail_atr": 3.8,
+        "trail_bar": "1H",
         "stale_min": 240,
+        "stale_impulse_min": 240,
         "plan_minutes": 720,
         "hold_minutes": 0,
-        "guide": "用 1D/4H 定方向，1H/15m 找入场；一笔单拿一到几天，不被 5 分钟级别的噪音洗出去。止损放在 4H 结构外 1.5%~4%，"
-        "杠杆相应降低，目标 2~4R，分批止盈。",
+        "impulse_hold_minutes": 0,
+        "guide": "用 1D/4H 定方向，1H 抓 24h 箱体放量突破或关键结构浅回踩；止损放在 1H/4H 结构外（≥0.85%），"
+        "杠杆相应降低，余仓用 1H/4H ATR 吊灯止损跟随趋势，不被 5 分钟噪音洗出去。",
     },
 }
 # 每种风格用哪两段时间的高低点对比来定大方向（先看前一个，它是震荡再看后一个）
@@ -224,9 +248,8 @@ class AgentConfig(BaseModel):
         "直接下单的照样过净盈亏比核对、权限和硬性风控。只对超短线和日内短线的币生效",
     )
     fast_kinds: list[Literal["retest", "breakout", "reject", "impulse"]] = Field(
-        default_factory=lambda: ["retest"],
-        description="快判用哪几种信号：retest 变盘后回踩（走势刚变，价格回到被突破的摆动点又朝新方向收回）/ breakout 1 分钟收盘突破关键线 / reject 假突破收回 / impulse 放量急动。"
-        "默认只开 retest：用 BTC、ETH 各 30 天的 1 分钟 K 线回测，另外三种扣掉手续费之后都是亏的（python -m ouy.backtest 可以自己跑）",
+        default_factory=lambda: ["breakout", "impulse", "retest"],
+        description="快判用哪几种信号：breakout 1 分钟放量收盘突破多小时关键边界 / impulse 顺大方向放量急动 / retest 变盘后回踩 / reject 假突破收回。",
     )
     maker_fee_pct: float = Field(0.02, ge=0, le=1, description="挂单手续费（%，单边）。计划里等价格回来的单是挂限价单成交的，进场这一边按它算")
     taker_fee_pct: float = Field(0.05, ge=0, le=1, description="吃单手续费（%，单边）。程序用它算扣掉往返手续费和点差之后的净盈亏比，不够【出手尺度】下限的计划不布置")

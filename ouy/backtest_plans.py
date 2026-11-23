@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-from .agent.plan import REGIME_LABEL, build_candidates, market_regime
+from .agent.plan import IMPULSE_PLAYS, REGIME_LABEL, build_candidates, market_regime
 from .agent.signals import structure_shift
 from . import history
 from .config import ROOT, Settings
@@ -109,6 +109,7 @@ def setups(data: dict[str, list[Candle]], *, style: str = "intraday", stance: st
 
     候选只取决于当时的行情，和手里有没有仓无关，所以先一次算完；之后换成交 / 管理规则对比时不用重算。"""
     spec, min_rr = STYLES[style], STANCES[stance]["min_rr"]
+    follow = bool(STANCES[stance].get("follow_trend"))
     bars = [b for b in spec["bars"] if b in data]
     step_bar, fine = spec["struct_bar"], bars[0]
     stamps = {b: [c.ts for c in data[b]] for b in bars}
@@ -124,16 +125,16 @@ def setups(data: dict[str, list[Candle]], *, style: str = "intraday", stance: st
         px = frames[fine][-1].close
         snapshot = {"last": px, "timeframes": {b: summarize(frames[b]) for b in bars}, "windows": window_levels(frames), "orderbook": {"spread_pct": SPREAD_PCT}}
         shift = structure_shift(closed_before(m5, m5_stamps, t, 5, 120))
-        cands = [c for c in build_candidates(snapshot, style=style, min_rr=min_rr, maker_fee_pct=maker, taker_fee_pct=taker, shift=shift, quant_mode=mode) if c["ok"]]
+        cands = [c for c in build_candidates(snapshot, style=style, min_rr=min_rr, maker_fee_pct=maker, taker_fee_pct=taker, shift=shift, quant_mode=mode, follow_trend=follow) if c["ok"]]
         if not cands:
             continue
-        regime = market_regime(snapshot, style, shift)["kind"]
-        atr = float((snapshot["timeframes"].get(step_bar) or {}).get("atr14") or 0.0)
+        regime = market_regime(snapshot, style, shift, follow)["kind"]
+        atr = float((snapshot["timeframes"].get(spec.get("atr_bar", step_bar)) or snapshot["timeframes"].get(step_bar) or {}).get("atr14") or 0.0)
         rows = []
         for c in cands[:top]:
             plan, check = c["plan"], c["check"]
-            if check.how not in ("pullback", "now"):
-                continue  # 突破追单占比很小，这里不模拟
+            if check.how not in ("pullback", "now", "breakout"):
+                continue
             tps = sorted(plan.take_profits, reverse=plan.direction != "long")
             rows.append(Setup(t, c["strategy"], c["align"], plan.direction, check.how, check.ref, plan.stop_loss, tps[0], tps[-1],
                               plan.valid_minutes or spec["plan_minutes"], regime, atr))
@@ -170,7 +171,8 @@ def execute(found: dict[int, list[Setup]], data: dict[str, list[Candle]], *, sty
         if i >= len(f):
             break
         limit = s.how == "pullback"
-        if limit:  # 挂限价单等：没成交先到第一目标、或过了有效期就撤
+        is_breakout = s.how == "breakout"
+        if limit:  # 挂限价单等：没成交先到顺向作废线、或过了有效期就撤
             expire, entry, filled = t + s.valid_minutes * 60_000, s.entry, False
             need = entry * (1 - sign * rules.through / 100)
             while i < len(f) and f[i].ts < expire:
@@ -185,6 +187,23 @@ def execute(found: dict[int, list[Setup]], data: dict[str, list[Candle]], *, sty
                 busy_until = f[min(i, len(f) - 1)].ts + fine_ms
                 continue
             j = i  # 成交的这一根里也可能直接打到止损
+        elif is_breakout:  # 预埋突破点火单：在有效期内细周期放量收盘越界（或冲出触发价）后进场；先破止损则作废
+            expire, filled, entry = t + s.valid_minutes * 60_000, False, 0.0
+            while i < len(f) - 1 and f[i].ts < expire:
+                k = f[i]
+                if (k.low <= s.stop) if long else (k.high >= s.stop):
+                    break
+                v_win = f[max(0, i - 20):i]
+                v_avg = sum(x.volume for x in v_win) / len(v_win) if v_win else 0.0
+                loud = not v_avg or k.volume >= v_avg * 1.25
+                crossed = (k.close > s.entry and k.close > k.open) if long else (k.close < s.entry and k.close < k.open)
+                if crossed and loud and abs(k.close / s.entry - 1) * 100 <= 0.8:
+                    entry, j, filled = f[i + 1].open * (1 + sign * rules.slip / 100), i + 1, True
+                    break
+                i += 1
+            if not filled:
+                busy_until = f[min(i, len(f) - 1)].ts + fine_ms
+                continue
         else:
             entry, j = f[i].open * (1 + sign * rules.slip / 100), i
         stop = entry - sign * abs(s.entry - s.stop) * rules.stop_scale if rules.stop_scale != 1.0 else s.stop
@@ -196,6 +215,13 @@ def execute(found: dict[int, list[Setup]], data: dict[str, list[Candle]], *, sty
         slip = entry * rules.slip / 100
         left, got, out, cur_stop, opened, peak, peak_close, exit_px = 1.0, 0.0, "超时离场", stop, f[j].ts, 0.0, 0.0, 0.0
         locked = entry * (1 + sign * cost / 100)
+        impulse = is_breakout or s.strategy in IMPULSE_PLAYS
+        t1_part = 0.35 if impulse else rules.t1_part
+        be_r = 1.3 if impulse and rules.be_r == 1.0 else rules.be_r
+        eff_lock_r = None if impulse else rules.lock_r
+        eff_trail_atr = rules.trail_atr or (spec.get("trail_atr") if impulse else None)
+        eff_hold = (spec.get("impulse_hold_minutes") or hold) if impulse else hold
+        stale_min = spec.get("stale_impulse_min", 0) if impulse else 0
         two = t1 != t2
         first = j
         while j < len(f) and left > 0:
@@ -214,19 +240,19 @@ def execute(found: dict[int, list[Setup]], data: dict[str, list[Candle]], *, sty
                 if not two:
                     got, left, out, exit_px = got + (t1 - entry) * sign, 0.0, "到目标", t1
                     break
-                got, left, out = got + rules.t1_part * (t1 - entry) * sign, 1.0 - rules.t1_part, "到第一目标"
+                got, left, out = got + t1_part * (t1 - entry) * sign, 1.0 - t1_part, "到第一目标"
                 cur_stop = cur_stop if (cur_stop - entry) * sign >= 0 else entry
-            if 0 < left < 1.0 and not rules.trail_atr and (best - t2) * sign >= 0:
+            if 0 < left < 1.0 and not eff_trail_atr and (best - t2) * sign >= 0:
                 got, left, out, exit_px = got + left * (t2 - entry) * sign, 0.0, "两个目标都到", t2
                 break
             peak, peak_close = max(peak, (best - entry) * sign), max(peak_close, (k.close - entry) * sign)
-            if rules.be_r and left == 1.0 and (best - entry) * sign >= risk * rules.be_r and (cur_stop - entry) * sign < 0:
+            if be_r and left == 1.0 and (best - entry) * sign >= risk * be_r and (cur_stop - entry) * sign < 0:
                 cur_stop = entry
-            if rules.lock_r and (peak_close if rules.lock_close else peak) >= risk * rules.lock_r and (cur_stop - locked) * sign < 0:
+            if eff_lock_r and (peak_close if rules.lock_close else peak) >= risk * eff_lock_r and (cur_stop - locked) * sign < 0:
                 cur_stop = locked
-            if rules.trail_atr and left < 1.0 and s.atr:
-                trail = entry + sign * peak - sign * rules.trail_atr * s.atr
-                if (trail - cur_stop) * sign > 0:
+            if eff_trail_atr and (left < 1.0 or peak >= 1.2 * risk) and s.atr:
+                trail = entry + sign * peak - sign * eff_trail_atr * s.atr
+                if (trail - cur_stop) * sign > 0 and (k.close - trail) * sign > 0:
                     cur_stop = trail
             sh = (shifts or {}).get(k.ts + fine_ms - 300_000) if rules.shift_rule and (k.ts + fine_ms) % 300_000 == 0 else None
             if sh and sh["side"] != s.side and k.ts > opened:
@@ -239,7 +265,11 @@ def execute(found: dict[int, list[Setup]], data: dict[str, list[Candle]], *, sty
                     edge = sh["extreme"] - sign * risk * 0.1
                     if (edge - cur_stop) * sign > 0 and (k.close - edge) * sign > 0:
                         cur_stop = edge
-            if (k.ts - opened) / 60_000 >= hold and (k.close - entry) * sign < risk * 0.5:
+            if stale_min and (k.ts - opened) / 60_000 >= stale_min and peak < risk * 0.4 and (k.close - entry) * sign < risk * 0.15:
+                exit_px = k.close
+                got, left, out = got + left * (k.close - entry) * sign, 0.0, "动能证伪离场"
+                break
+            if (k.ts - opened) / 60_000 >= eff_hold and (k.close - entry) * sign < risk * 0.5:
                 exit_px = k.close
                 got, left = got + left * (k.close - entry) * sign, 0.0
                 break
@@ -249,7 +279,8 @@ def execute(found: dict[int, list[Setup]], data: dict[str, list[Candle]], *, sty
             got, out = got + left * (exit_px - entry) * sign, "数据结束"
         j = min(j, len(f) - 1)
         pct = got / entry * 100 - cost
-        results.append(Result(t, s.strategy, s.align, s.side, "限价" if limit else "现价", pct / (risk / entry * 100), pct, out, peak / risk,
+        how_label = "限价" if limit else "突破" if is_breakout else "现价"
+        results.append(Result(t, s.strategy, s.align, s.side, how_label, pct / (risk / entry * 100), pct, out, peak / risk,
                               s.regime, inst, opened, f[j].ts + fine_ms, entry, stop, exit_px))
         busy_until = f[j].ts + fine_ms
     return results
@@ -309,7 +340,7 @@ def groups(rows: list[Result]) -> list[tuple[str, dict[str, Any]]]:
     out += [(f"  {name}", summary([r for r in rows if r.strategy == name])) for name in sorted({r.strategy for r in rows})]
     out += [(f"  行情:{REGIME_LABEL.get(name, name)}", summary([r for r in rows if r.regime == name])) for name in sorted({r.regime for r in rows if r.regime})]
     out += [(f"  {name[:6]}", summary([r for r in rows if r.align == name])) for name in sorted({r.align for r in rows})]
-    out += [(f"  {name}进场", summary([r for r in rows if r.how == name])) for name in ("限价", "现价")]
+    out += [(f"  {name}进场", summary([r for r in rows if r.how == name])) for name in ("限价", "现价", "突破") if any(r.how == name for r in rows)]
     out += [(f"  {label}", summary([r for r in rows if r.side == side])) for side, label in (("long", "做多"), ("short", "做空"))]
     return out
 

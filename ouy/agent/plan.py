@@ -19,6 +19,19 @@ MAX_CHASE_PCT = 0.6  # 突破单最多追多远（%）
 MIN_CHASE_PCT = 0.15
 SAME_PLAN_R = 0.25  # 触发价和止损的变动都不到止损距离的这个比例：算同一个计划
 RETRY_MINUTES = {"scalp": 10, "intraday": 30, "swing": 120}  # 同一个位置、同一个方向刚平掉一笔，隔这么久才再进
+IMPULSE_PLAYS = ("收敛突破", "趋势突破跟随", "动量延续", "开盘区间突破")
+TREND_PLAYS = ("趋势回踩", "前高前低法", "变盘后回踩")
+
+
+def miss_price(plan: TradePlan, ref: float, px: float | None = None) -> float:
+    """挂单未成交前的顺向作废线：至少留出 0.8R 且不少于入场挂距的 80%，防止现价贴近第一目标时刚挂上去几秒就被误撤。"""
+    long = plan.direction == "long"
+    tp1 = min(plan.take_profits) if long else max(plan.take_profits)
+    if not px or px <= 0:
+        return tp1
+    risk = abs(ref - plan.stop_loss)
+    floor = _sig(px + (1 if long else -1) * max(risk * 0.8, abs(ref - px) * 0.8))
+    return max(tp1, floor) if long else min(tp1, floor)
 
 
 @dataclass
@@ -114,16 +127,40 @@ def safe_leverage(leverage: int, stop_pct: float) -> int:
 
 
 def manage_rules(plan: TradePlan, check: PlanCheck, style: str) -> dict[str, Any]:
-    """进场之后交给执行器的管理规则：到 1R 移保本；有两个以上目标就在第一目标先平一半；超过这个风格的持仓时间没走出来就离场。"""
+    """进场之后交给执行器的管理规则：
+    - 突破与动量脉冲单（IMPULSE_PLAYS / breakout）：关掉 0.5R 过早保盈锁（lock_r=0），1.3R 移保本，首目标只平 35%，余仓用结构 ATR 吊灯止损跟完整段脉冲，并带迟滞时间证伪；
+    - 顺势回踩单（TREND_PLAYS）：保盈线推迟到 1.2R，首目标平 40%，余仓启用 ATR 跟踪；
+    - 普通与震荡区间单：保持 1R 移保本、首目标平一半、按风格时间止损。"""
+    spec = STYLES[style]
     long = plan.direction == "long"
     tps = sorted(plan.take_profits, reverse=not long)
-    rules: dict[str, Any] = {"breakeven_r": 1.0}
+    impulse = check.how == "breakout" or plan.strategy in IMPULSE_PLAYS
+    trend_play = not impulse and plan.strategy in TREND_PLAYS
+    rules: dict[str, Any] = {"breakeven_r": 1.3 if impulse else 1.0}
+    if impulse:
+        rules.update(
+            lock_r=0,
+            trail_atr=spec.get("trail_atr", 3.5),
+            trail_bar=spec.get("trail_bar", spec["struct_bar"]),
+            trail_start_r=1.2,
+        )
+        if spec.get("stale_impulse_min"):
+            rules.update(stale_minutes=spec["stale_impulse_min"], stale_min_r=0.4)
+    elif trend_play:
+        rules.update(
+            lock_r=1.2,
+            trail_atr=spec.get("trail_atr", 3.5),
+            trail_bar=spec.get("trail_bar", spec["struct_bar"]),
+            trail_start_r=1.5,
+        )
     if plan.review_level and min(check.ref, plan.stop_loss) < plan.review_level < max(check.ref, plan.stop_loss):
-        rules.update(review_level=plan.review_level, review_bar=STYLES[style]["struct_bar"])
+        rules.update(review_level=plan.review_level, review_bar=spec["struct_bar"])
     if len(tps) >= 2 and check.stop_pct:
-        rules["partials"] = [{"r": round(abs(tps[0] - check.ref) / check.ref * 100 / check.stop_pct, 2), "fraction": 0.5}]
-    if STYLES[style].get("hold_minutes"):
-        rules["max_hold_minutes"] = STYLES[style]["hold_minutes"]
+        frac = 0.35 if impulse else 0.4 if trend_play else 0.5
+        rules["partials"] = [{"r": round(abs(tps[0] - check.ref) / check.ref * 100 / check.stop_pct, 2), "fraction": frac}]
+    hold = spec.get("impulse_hold_minutes") if impulse else spec.get("hold_minutes")
+    if hold:
+        rules["max_hold_minutes"] = hold
     return rules
 
 
@@ -149,17 +186,19 @@ def entry_invalidation(plan: TradePlan, style: str) -> dict[str, Any] | None:
     return {"when": rule.when, "level": rule.level, "bar": rule.bar or STYLES[style]["struct_bar"]}
 
 
-def order_params(plan: TradePlan, check: PlanCheck, style: str) -> dict[str, Any]:
+def order_params(plan: TradePlan, check: PlanCheck, style: str, px: float | None = None) -> dict[str, Any]:
     """到价进场的策略参数（check.how 是 pullback 或 breakout 时用）。"""
-    long = plan.direction == "long"
+    spec = STYLES[style]
     params: dict[str, Any] = {
         "terms": plan_terms(plan, style), "trigger": check.ref, "stop_loss": plan.stop_loss, "take_profit": far_target(plan), "leverage": safe_leverage(plan.leverage, check.stop_pct),
-        "risk_pct": plan.risk_pct, "margin_usdt": plan.margin_usdt, "expires_minutes": plan.valid_minutes or STYLES[style]["plan_minutes"], "manage": manage_rules(plan, check, style), "plan": True,
+        "risk_pct": plan.risk_pct, "margin_usdt": plan.margin_usdt, "expires_minutes": plan.valid_minutes or spec["plan_minutes"], "manage": manage_rules(plan, check, style), "plan": True,
     }
-    if check.how == "pullback":  # 没回到入场区间就先到了第一目标：这一段已经走完，不再等
-        params["miss_px"] = min(plan.take_profits) if long else max(plan.take_profits)
+    if check.how == "pullback":  # 没回到入场区间就顺向走远了：这一段已经走完，不再等
+        params["miss_px"] = miss_price(plan, check.ref, px)
     else:
         params["max_chase_pct"] = check.chase_pct
+        params["confirm_bar"] = spec.get("confirm_bar", "1m")
+        params["confirm_vol"] = 1.25
     if cancel := entry_invalidation(plan, style):
         params["cancel_before_entry"] = cancel
     return params
@@ -207,13 +246,15 @@ def candidate_rows(rows: list[dict[str, Any]], style: str) -> list[dict[str, Any
         "net_rr": round(c["check"].net_rr, 2), "stop_pct": round(c["check"].stop_pct, 3),
         "cost_r": round(c["check"].cost_pct / c["check"].stop_pct, 2) if c["check"].stop_pct else None,
         "evidence": scores.get(c.get("strategy", ""), ""), "losing": bool(c.get("losing")),
+        "in_regime": bool(c.get("in_regime", True)),
     } for c in rows]
 
 
-def market_regime(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | None = None) -> dict[str, str]:
+def market_regime(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | None = None, follow_trend: bool = False) -> dict[str, str]:
     """先判断现在是什么行情，再决定用哪类打法：
     reversal 刚确认的结构反转（5 分钟收盘反向越过摆动点）；trend 大方向明确、结构周期高低点同向且 ADX 够；
-    range 结构周期没有方向、ADX 低；mixed 其余（大方向和结构周期打架）。"""
+    range 结构周期没有方向、ADX 低；mixed 其余（大方向和结构周期打架）。
+    follow_trend（出手尺度「积极」）：打架时不停手，按大周期趋势做；大周期没有方向就按结构周期的趋势做。"""
     frames = snapshot.get("timeframes") or {}
     tf = frames.get(STYLES[style]["struct_bar"]) or {}
     major, _ = major_direction(snapshot, style, shift)
@@ -227,16 +268,23 @@ def market_regime(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | 
     if major and local == major and adx >= REGIME_ADX:
         return {"kind": "trend", "side": major, "why": f"大方向和{STYLES[style]['struct_bar']}结构同向，ADX {adx:.0f}"}
     if not local and adx < REGIME_ADX:
+        if tf.get("squeeze"):
+            bw = tf.get("bb_width_pct")
+            detail = f"（布林带宽 {bw:g}% 收口蓄势）" if bw else "（波动率收口蓄势）"
+            return {"kind": "range", "side": "", "why": f"{STYLES[style]['struct_bar']}没有方向{detail}，ADX {adx:.0f}"}
         return {"kind": "range", "side": "", "why": f"{STYLES[style]['struct_bar']}没有方向，ADX {adx:.0f}"}
+    if follow_trend and (major or local):
+        word = {"long": "向上", "short": "向下"}
+        by = f"大周期趋势{word[major]}" if major else f"大周期没有方向，{STYLES[style]['struct_bar']}趋势{word[local]}"
+        return {"kind": "trend", "side": major or local, "why": f"{by}，按趋势做（出手尺度：积极），ADX {adx:.0f}"}
     return {"kind": "mixed", "side": major, "why": f"大方向{'向上' if major == 'long' else '向下' if major == 'short' else '不明'}，{STYLES[style]['struct_bar']}结构{'同向' if local == major else '不一致'}，ADX {adx:.0f}"}
 
 
-# 每种行情用哪几类打法。来自候选位回测（evidence「按行情选打法」）：趋势里只做顺势回踩，震荡只做区间两头，
-# 刚反转只做变盘后回踩，大方向和结构周期打架时不出候选；假突破反转在哪种行情里机械做都是最差的，自动档不再给。
+# 每种行情用哪几类打法：趋势纳入顺势突破与动量延续（不再只给深回踩），震荡与收口蓄势纳入区间两头与收敛突破，刚反转做变盘回踩与顺向突破。
 REGIME_PLAYS = {
-    "trend": ("趋势回踩", "前高前低法"),
-    "range": ("区间高抛低吸",),
-    "reversal": ("变盘后回踩",),
+    "trend": ("收敛突破", "动量延续", "趋势回踩", "前高前低法"),
+    "range": ("区间高抛低吸", "收敛突破"),
+    "reversal": ("变盘后回踩", "收敛突破"),
     "mixed": (),
     "unknown": (),
 }
@@ -254,6 +302,7 @@ def build_candidates(
     quant_mode: str = "auto",
     quant_bias: str = "both",
     entry_mode: str = "auto",
+    follow_trend: bool = False,
 ) -> list[dict[str, Any]]:
     """纯算法候选生成：从行情快照里的真实结构位（支撑阻力、区间上下沿、前高前低、最近变盘点）算出候选计划，
     按当前量化档位（quant_mode）和方向锁（quant_bias）过滤，并逐一过一遍净盈亏比与可达性核验。"""
@@ -268,12 +317,18 @@ def build_candidates(
     spec = STYLES[style]
     tf = frames.get(spec["struct_bar"]) or next((f for f in frames.values() if isinstance(f, dict) and f.get("atr14")), {})
     atr = float(tf.get("atr14") or px * 0.004)
+    atr_frame = frames.get(spec.get("atr_bar", spec["struct_bar"])) or tf
+    wide_atr = float(atr_frame.get("atr14") or atr)
+    has_box = bool((tf.get("range") or {}).get("upper") or len(frames) > 1)
+    stop_floor = px * (spec.get("min_stop_pct", 0.25) / 100 if has_box else 0.0025)
     spread = float(((snapshot.get("orderbook") or {}).get("spread_pct")) or 0.0)
     taker_cost = trade_cost_pct(taker_fee_pct, spread)
     limit_cost = maker_fee_pct + taker_fee_pct + max(spread, 0.0)
     windows = snapshot.get("windows") or {}
 
     major, _ = major_direction(snapshot, style, shift)
+    if follow_trend and not major:  # 大周期没有方向：按结构周期的趋势做
+        major = {"uptrend": "long", "downtrend": "short"}.get(tf.get("structure"), "")
 
     ups: list[float] = []
     downs: list[float] = []
@@ -304,18 +359,20 @@ def build_candidates(
         return [t1] if t1 == t2 else [t1, t2]
 
     raw: list[tuple[str, str, TradePlan]] = []
-    # 1. 变盘后回踩（刚发生结构转折）
+    # 1. 变盘后顺向启动与回踩（刚发生结构转折：刚破位未跑远直接现价跟进抓主升/主跌浪，跑远了在突破位挂回踩单）
     if shift and shift.get("bars_ago", 99) <= 8 and shift.get("level") and shift.get("extreme") and shift.get("origin"):
         side = shift["side"]
         long, sign = side == "long", (1 if side == "long" else -1)
         lv = float(shift["level"])
-        stop = _sig(lv - sign * max(atr, px * 0.0025))
+        stop = _sig(lv - sign * max(wide_atr, stop_floor))
         leg = abs(float(shift["extreme"]) - float(shift["origin"]))
-        t1, t2 = _sig(float(shift["extreme"])), _sig(float(shift["extreme"]) + sign * leg * 0.5)
-        how = "now" if abs(px - lv) <= 0.25 * atr and (px - stop) * sign > 0 else "pullback"
+        just_broke = shift.get("bars_ago", 99) <= 1 and 0 <= (px - lv) * sign <= 0.65 * wide_atr
+        how = "now" if entry_mode != "limit" and (abs(px - lv) <= 0.3 * atr or just_broke) and (px - stop) * sign > 0 else "pullback"
         entry = _sig(px if how == "now" else lv)
+        t1 = _sig(max(float(shift["extreme"]), entry + 1.6 * abs(entry - stop)) if long else min(float(shift["extreme"]), entry - 1.6 * abs(entry - stop)))
+        t2 = _sig(t1 + sign * max(leg * 0.6, 1.5 * abs(entry - stop)))
         if (t1 - entry) * sign > 0 and (entry - stop) * sign > 0:
-            raw.append(("变盘后回踩", f"5m {shift['kind']}突破 {lv:g} 后的首次回踩位", TradePlan(
+            raw.append(("变盘后回踩", f"5m {shift['kind']}越过 {lv:g} {'刚启动顺势跟进' if how == 'now' else '回踩位挂单'}", TradePlan(
                 direction=side, strategy="变盘后回踩", entry_low=entry, entry_high=entry, stop_loss=stop,
                 take_profits=[t1, t2], leverage=20, entry_type=how, invalidation=f"收盘回到 {lv:g} 另一侧",
             )))
@@ -367,61 +424,97 @@ def build_candidates(
                     take_profits=tps, leverage=20, entry_type=how, invalidation=f"连续收盘跌破 {stop:g}",
                 )))
 
-    # 3. 最近结构支撑 / 阻力挂单（趋势回踩或区间高抛低吸）
+    # 3. 最近结构支撑 / 阻力挂单（趋势回踩或区间高抛低吸）及 EMA20 顺势浅回踩
+    regime = market_regime(snapshot, style, shift, follow_trend)
+    boxed = regime["kind"] == "range"  # 震荡/收敛：两头按区间单保留，不因叫「趋势回踩」被筛掉
+    e20 = float(tf.get("ema20") or 0)
+    adx_val = float(tf.get("adx14") or 0)
+    last_close = float(tf.get("last_closed_price") or px)
+    vol_ratio = float(tf.get("volume_ratio") or 0)
+    if regime["kind"] == "trend" and e20 > 0 and adx_val >= 25 and vol_ratio >= 1.15 and regime["side"] in ("long", "short") and entry_mode != "limit":
+        t_long = regime["side"] == "long"
+        t_sign = 1 if t_long else -1
+        if abs(px - e20) <= 0.45 * atr and (px - e20) * t_sign >= -0.15 * atr and (last_close - e20) * t_sign >= 0:
+            stop = _sig(e20 - t_sign * max(1.4 * wide_atr, stop_floor))
+            if (px - stop) * t_sign > 0:
+                risk_m = abs(px - stop)
+                raw.append(("动量延续", f"顺势回踩 {spec['struct_bar']} EMA20（{e20:g}）企稳直接跟进", TradePlan(
+                    direction=regime["side"], strategy="动量延续", entry_low=_sig(px), entry_high=_sig(px), stop_loss=stop,
+                    take_profits=[_sig(px + t_sign * 2.0 * risk_m), _sig(px + t_sign * 4.0 * risk_m)],
+                    leverage=20, entry_type="now", invalidation=f"{spec['struct_bar']} 收盘跌破 {stop:g}" if t_long else f"{spec['struct_bar']} 收盘站上 {stop:g}",
+                )))
     near_sup = max((v for v in downs if v < px * 1.0005), default=None)
     supports = {float(s["price"]) for s in tf.get("support") or [] if isinstance(s, dict) and s.get("price") and 0 < float(s["price"]) < px}
+    if regime["kind"] == "trend" and regime["side"] == "long" and 0 < e20 < px:
+        supports.add(_sig(e20))
     for lv in sorted(supports | ({near_sup} if near_sup else set()), reverse=True)[:3]:
-        stop = _sig(lv - max(0.8 * atr, px * 0.0025))
-        how = "now" if entry_mode != "limit" and px >= lv and abs(px - lv) <= 0.2 * atr else "pullback"
+        stop = _sig(lv - max(0.8 * wide_atr, stop_floor))
+        how = "now" if entry_mode != "limit" and px >= lv and abs(px - lv) <= 0.35 * atr else "pullback"
         entry = _sig(px if how == "now" else lv)
-        if lv != near_sup and not any(v > px and v - entry >= (entry - stop) * 0.5 for v in ups):
+        if lv != near_sup and lv != _sig(e20) and not any(v > px and v - entry >= (entry - stop) * 0.5 for v in ups):
             continue  # 备选挂位必须有已知的首目标，不为凑候选外推首目标
-        strat = "趋势回踩" if major == "long" else "区间高抛低吸"
+        strat = "趋势回踩" if major == "long" and not boxed else "区间高抛低吸"
         raw.append((strat, f"依托支撑 {lv:g} 做多", TradePlan(
             direction="long", strategy=strat, entry_low=entry, entry_high=entry, stop_loss=stop,
             take_profits=targets_from(entry, stop, True), leverage=20, entry_type=how, invalidation=f"{spec['struct_bar']} 收盘跌破 {stop:g}",
         )))
     near_res = min((v for v in ups if v > px * 0.9995), default=None)
     resistances = {float(r["price"]) for r in tf.get("resistance") or [] if isinstance(r, dict) and r.get("price") and float(r["price"]) > px}
+    if regime["kind"] == "trend" and regime["side"] == "short" and e20 > px:
+        resistances.add(_sig(e20))
     for lv in sorted(resistances | ({near_res} if near_res else set()))[:3]:
-        stop = _sig(lv + max(0.8 * atr, px * 0.0025))
-        how = "now" if entry_mode != "limit" and px <= lv and abs(lv - px) <= 0.2 * atr else "pullback"
+        stop = _sig(lv + max(0.8 * wide_atr, stop_floor))
+        how = "now" if entry_mode != "limit" and px <= lv and abs(lv - px) <= 0.35 * atr else "pullback"
         entry = _sig(px if how == "now" else lv)
-        if lv != near_res and not any(v < px and entry - v >= (stop - entry) * 0.5 for v in downs):
+        if lv != near_res and lv != _sig(e20) and not any(v < px and entry - v >= (stop - entry) * 0.5 for v in downs):
             continue
-        strat = "趋势回踩" if major == "short" else "区间高抛低吸"
+        strat = "趋势回踩" if major == "short" and not boxed else "区间高抛低吸"
         raw.append((strat, f"依托阻力 {lv:g} 做空", TradePlan(
             direction="short", strategy=strat, entry_low=entry, entry_high=entry, stop_loss=stop,
             take_profits=targets_from(entry, stop, False), leverage=20, entry_type=how, invalidation=f"{spec['struct_bar']} 收盘站上 {stop:g}",
         )))
 
-    # 4. 收敛突破档专属：在箱体上下外沿给出突破追单候选（entry_type=breakout）
-    if quant_mode == "breakout" and rng.get("upper") and rng.get("lower"):
+    # 4. 箱体 / 收敛起爆（自动档、顺势档、突破档共用：解决快速单边走势踏空）
+    # - 已经放量收出箱体且未跑远：直接给 entry_type=now 顺势上车；
+    # - 正在箱体边界附近蓄势：预埋 entry_type=breakout，由执行器在带量越界第一下秒级点火。
+    if quant_mode in ("auto", "regime", "trend", "breakout") and rng.get("upper") and rng.get("lower"):
         hi_r, lo_r = float(rng["upper"]), float(rng["lower"])
         span = hi_r - lo_r
+        is_squeeze = bool(tf.get("squeeze")) or quant_mode == "breakout"
         if span > 0:
-            if major != "short":
-                b_hi = _sig(hi_r * 1.0025)
-                stop = _sig(max(hi_r - atr, lo_r))
-                if hi_r > stop:
-                    raw.append(("收敛突破", f"放量突破箱体上沿 {hi_r:g} 顺势追多", TradePlan(
-                        direction="long", strategy="收敛突破", entry_low=_sig(hi_r), entry_high=b_hi, stop_loss=stop,
-                        take_profits=[_sig(hi_r + span), _sig(hi_r + span * 1.6)], leverage=20, entry_type="breakout",
-                        invalidation=f"跌回 {hi_r:g} 箱体内侧",
+            for b_side, edge in (("long", hi_r), ("short", lo_r)):
+                b_long = b_side == "long"
+                b_sign = 1 if b_long else -1
+                if major and major != b_side and quant_mode != "breakout":
+                    continue
+                if not major and not is_squeeze and not follow_trend:
+                    continue
+                b_risk = max(1.8 * wide_atr, stop_floor)
+                b_stop = _sig(edge - b_sign * b_risk)
+                if (edge - b_stop) * b_sign <= 0:
+                    continue
+                beyond = (px - edge) * b_sign
+                closed_out = (last_close - edge) * b_sign > 0
+                if entry_mode != "limit" and closed_out and vol_ratio >= 1.25 and 0 <= beyond <= 0.85 * wide_atr and (px - b_stop) * b_sign > 0:
+                    act_risk = abs(px - b_stop)
+                    raw.append(("收敛突破", f"{spec['struct_bar']} 放量（{vol_ratio:.1f}x）突破箱体{'上沿' if b_long else '下沿'} {edge:g} 起爆", TradePlan(
+                        direction=b_side, strategy="收敛突破", entry_low=_sig(px), entry_high=_sig(px), stop_loss=b_stop,
+                        take_profits=[_sig(px + b_sign * max(span, 2.0 * act_risk)), _sig(px + b_sign * max(span * 1.8, 4.2 * act_risk))],
+                        leverage=20, entry_type="now", invalidation=f"{'跌回' if b_long else '收回'} {edge:g} 箱体内侧",
                     )))
-            if major != "long":
-                b_lo = _sig(lo_r * 0.9975)
-                stop = _sig(min(lo_r + atr, hi_r))
-                if lo_r < stop:
-                    raw.append(("收敛突破", f"放量跌破箱体下沿 {lo_r:g} 顺势追空", TradePlan(
-                        direction="short", strategy="收敛突破", entry_low=b_lo, entry_high=_sig(lo_r), stop_loss=stop,
-                        take_profits=[_sig(lo_r - span), _sig(lo_r - span * 1.6)], leverage=20, entry_type="breakout",
-                        invalidation=f"收回 {lo_r:g} 箱体内侧",
+                elif beyond < 0 and (is_squeeze or quant_mode == "breakout") and abs(beyond) <= 2.2 * wide_atr:
+                    far_edge = _sig(edge * (1.003 if b_long else 0.997))
+                    lo_e, hi_e = (_sig(edge), far_edge) if b_long else (far_edge, _sig(edge))
+                    raw.append(("收敛突破", f"波动收口贴近箱体{'上沿' if b_long else '下沿'} {edge:g}，突破秒级追{'多' if b_long else '空'}", TradePlan(
+                        direction=b_side, strategy="收敛突破", entry_low=lo_e, entry_high=hi_e, stop_loss=b_stop,
+                        take_profits=[_sig(edge + b_sign * max(span, 2.0 * b_risk)), _sig(edge + b_sign * max(span * 1.8, 4.2 * b_risk))],
+                        leverage=20, entry_type="breakout", invalidation=f"{'跌回' if b_long else '收回'} {edge:g} 箱体内侧",
                     )))
 
     from ..backtest_plans import losing
 
-    regime = market_regime(snapshot, style, shift)
+    if quant_mode in ("auto", "regime") and regime["kind"] == "unknown":
+        return []
     bad = losing(style)
     seen_keys: set[tuple[str, int]] = set()
     out: list[dict[str, Any]] = []
@@ -434,22 +527,31 @@ def build_candidates(
             continue
         if quant_mode == "breakout" and name != "收敛突破":
             continue
-        if quant_mode in ("auto", "regime") and (name not in REGIME_PLAYS[regime["kind"]] or (regime["side"] and regime["kind"] != "range" and plan.direction != regime["side"])):
-            continue
+        in_regime = bool(
+            quant_mode not in ("auto", "regime")
+            or (name in REGIME_PLAYS[regime["kind"]] and (not regime["side"] or regime["kind"] == "range" or plan.direction == regime["side"]))
+        )
         check = check_plan(plan, px, min_rr=min_rr, cost_pct=taker_cost, limit_cost_pct=limit_cost)
-        stale = "" if check.how == "now" else line_status(px, check.ref, plan.direction, shift, atr, spec["plan_minutes"], spec["bar_minutes"])
-        align = "顺大方向" if major == plan.direction else "逆大方向（需反转信号且仓位减半）" if major else "震荡边缘"
+        stale = "" if check.how in ("now", "breakout") else line_status(px, check.ref, plan.direction, shift, atr, spec["plan_minutes"], spec["bar_minutes"])
+        align = "顺大方向" if major == plan.direction else "逆大方向" if major else "震荡边缘"
         ok = check.ok and not stale
         out.append({
-            "strategy": name, "basis": basis, "align": align, "ok": ok, "plan": plan, "check": check,
+            "strategy": name, "basis": basis, "align": align, "ok": ok, "in_regime": in_regime, "plan": plan, "check": check,
             "why_not": stale or ("；".join(check.issues) if not check.ok else ""),
             "dist_pct": abs(check.ref / px - 1) * 100 if check.ref and px else 0.0,
-            "losing": name in bad,  # 只打标记，不改排序：回测要照同一个顺序才能复现
+            "losing": name in bad,  # 只打标记作参考，不再用来拦单
         })
     preferred = {"limit": "pullback", "market": "now"}.get(entry_mode)
-    out.sort(key=lambda c: (not c["ok"], 0 if c["align"] == "顺大方向" else 1 if c["align"] == "震荡边缘" else 2,
-                            bool(preferred and c["check"].how != preferred), c["dist_pct"]))
-    # 先核验、排序，再对相近价位去重，避免先生成的不合格方案挡掉合格方案。
+    squeeze_now = bool(tf.get("squeeze"))
+    out.sort(key=lambda c: (
+        not c["ok"],
+        not c["in_regime"],
+        0 if (squeeze_now and c["strategy"] == "收敛突破") or (c["check"].how == "now" and c["strategy"] in IMPULSE_PLAYS) else 1,
+        0 if c["align"] == "顺大方向" else 1 if c["align"] == "震荡边缘" else 2,
+        bool(preferred and c["check"].how != preferred),
+        c["dist_pct"],
+    ))
+    # 先核验、排序，再对相近价位去重，保留双向结构位给大模型综合判断。
     picked = []
     for candidate in out:
         plan = candidate["plan"]
@@ -457,7 +559,7 @@ def build_candidates(
         if key not in seen_keys:
             seen_keys.add(key)
             picked.append(candidate)
-    return picked[:4]
+    return picked[:6]
 
 
 NO_EDGE_HINT = (
@@ -495,6 +597,7 @@ def candidates_text(
     quant_bias: str = "both",
     entry_mode: str = "auto",
     rows: list[dict[str, Any]] | None = None,
+    follow_trend: bool = False,
 ) -> str:
     """把算法算好的候选计划排成清清楚楚的几行喂给 Worker。"""
     from ..models import QUANT_MODES
@@ -504,23 +607,22 @@ def candidates_text(
         return f"【算法候选位｜当前档位：{mlabel}】已暂停新开仓候选（只保护已有持仓与清理过时挂单）；盘面恢复清晰后可用 set_quant_mode 切回对应档位。"
     rows = rows if rows is not None else build_candidates(
         snapshot, style=style, min_rr=min_rr, maker_fee_pct=maker_fee_pct, taker_fee_pct=taker_fee_pct,
-        shift=shift, quant_mode=quant_mode, quant_bias=quant_bias, entry_mode=entry_mode,
+        shift=shift, quant_mode=quant_mode, quant_bias=quant_bias, entry_mode=entry_mode, follow_trend=follow_trend,
     )
-    regime = market_regime(snapshot, style, shift)
-    plays = "、".join(REGIME_PLAYS[regime["kind"]]) or "不出候选"
-    head = (f"【行情判断（程序算的）】{REGIME_LABEL[regime['kind']]}：{regime['why']}。自动档这轮只看：{plays}"
-            + (f"，只做{'多' if regime['side'] == 'long' else '空'}" if regime["side"] and regime["kind"] in ("trend", "reversal") else "") + "。\n"
+    regime = market_regime(snapshot, style, shift, follow_trend)
+    head = (f"【盘面地图（程序算的客观结构，不替你做决定）】行情分类：{REGIME_LABEL[regime['kind']]}（{regime['why']}）。\n"
             if quant_mode == "auto" else "")
     if not rows:
-        if quant_mode == "auto" and regime["kind"] == "mixed":
-            return head + "大方向和结构周期在打架：这轮不给入场候选。空仓就等其中一边占上风；不要用前高前低或假突破硬找理由。"
-        return head + f"【算法候选位｜{mlabel}】当前没有匹配的结构。不要编造入场点，说明缺什么条件以及下次看哪里。"
+        if quant_mode == "auto" and regime["kind"] == "unknown":
+            return head + "结构周期数据不足，先等待有效收盘。"
+        return head + f"【结构参考位｜{mlabel}】当前没有算出参考位；你可以直接看 K 线结构自己定 plan，或说明等待条件。"
     btag = "，只盯多" if quant_bias == "long" else "，只盯空" if quant_bias == "short" else ""
     from ..backtest_plans import evidence
 
     scores = evidence(style)
-    lines = [head + f"【算法算好的结构候选位（当前档位：{mlabel}{btag}｜已计入手续费与点差、已查可达性）】"
-             "分工：程序负责算价位、核成本、下单和管仓；你负责判断这一条现在该不该做。候选位只是「结构上能挂的位置」，不是「会赚的位置」。"]
+    lines = [head + f"【双向结构参考位（当前档位：{mlabel}{btag}｜已计入手续费与点差、已查可达性）】"
+             "分工：程序只提供盘面地图、参考价位和成本核对，不替你否决方向；你结合 K 线、盘口、资金费率和用户目标自己拍板，"
+             "可直接采纳参考位，也可按结构微调止损和目标。纯算法机械回测只是「不带脑子照做」的参考，不再用来禁掉你的单。"]
     for i, c in enumerate(rows, 1):
         p: TradePlan = c["plan"]
         chk: PlanCheck = c["check"]
@@ -531,27 +633,25 @@ def candidates_text(
         )
         tps = " / ".join(f"{t:g}" for t in p.take_profits)
         if not c["ok"]:
-            verdict = f"✗ 不合格：{c['why_not']}"
+            verdict = f"✗ 默认公式未过核对：{c['why_not']}"
         elif c.get("execution_blocker"):
             verdict = f"暂停入场：{c['execution_blocker']}"
         else:
-            verdict = f"✓ 通过结构与成本核验（净盈亏比 {chk.net_rr:.2f} ≥ {min_rr:g}）"
+            verdict = f"✓ 通过成本与结构核对（净盈亏比 {chk.net_rr:.2f} ≥ {min_rr:g}）"
         cost_r = f"，成本占 {chk.cost_pct / chk.stop_pct:.2f}R" if chk.stop_pct else ""
-        score = f"｜机械照做的回测：{scores[c['strategy']]}" if c["strategy"] in scores else "｜这条打法还没有回测成绩"
-        if c.get("losing"):
-            score += "（没有优势：要做必须在 plan.edge 写出算法看不到的额外依据）"
-        lines.append(f"{i}. [{c['strategy']} · {c['align']}] {c['basis']} → {how}，止损 {p.stop_loss:g}，目标 {tps}{cost_r}｜{verdict}{score}")
-    eligible = [c for c in rows if c["ok"] and not c.get("execution_blocker") and not c["align"].startswith("逆")]
-    preferred = next((c for c in eligible if not c.get("losing")), None)
+        score = f"｜纯算法盲做回测：{scores[c['strategy']]}" if c["strategy"] in scores else ""
+        if c.get("losing") and score:
+            score += "（仅作参考，不限制你的判断）"
+        tag = "主推" if c.get("in_regime", True) else "备选"
+        lines.append(f"{i}. [{tag} · {c['strategy']} · {c['align']}] {c['basis']} → {how}，止损 {p.stop_loss:g}，目标 {tps}{cost_r}｜{verdict}{score}")
+    eligible = [c for c in rows if c["ok"] and not c.get("execution_blocker")]
+    preferred = next((c for c in eligible if c.get("in_regime", True) and not c["align"].startswith("逆")), None) or (eligible[0] if eligible else None)
     if (snapshot.get("orderbook") or {}).get("spread_pct") is None:
-        lines.append("点差缺失，表中成本未计实际点差；先核实，不按这个排名直接进场。")
+        lines.append("点差缺失，表中成本未计实际点差；先核实再决定。")
     elif preferred is not None:
         check = preferred["check"]
-        lines.append(f"优先核实「{preferred['strategy']}」@ {check.ref:g}，再对比其余合格候选。"
-                     + ("若符合目标且只差价格回到入场位，可填写 pullback 计划让限价单等价。" if check.limit else "")
-                     + "仍缺确认或不满足账户、风险条件时，说明具体依据。排名不代表盈利概率。")
-    elif eligible:
-        lines.append(NO_EDGE_HINT)
+        lines.append(f"优先看「{preferred['strategy']}」@ {check.ref:g}，同时对照另一侧结构位。"
+                     + ("方向认可且只差到价，本轮直接给 pullback 计划挂限价单等成交；也可以按结构微调止损和目标。" if check.limit else "方向认可可直接给 plan，或按结构微调止损和目标。"))
     else:
-        lines.append("本轮没有可优先核实的候选。说明哪项条件未满足，以及下一次复核的条件。")
+        lines.append("以上参考位按默认固定公式（如 0.8×ATR 止损）未通过核对；如果你看盘面有更合理的结构止损和目标，可直接自己填 plan，程序会按你的价位重核成本。")
     return "\n".join(lines)

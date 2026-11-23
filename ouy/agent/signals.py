@@ -31,9 +31,9 @@ class FastParams:
     impulse_atr: float = 3.0  # 这几根合起来至少走出多少个 ATR
     impulse_pct: float = 0.25  # 而且至少是价格的百分之多少
     wick_ratio: float = 0.5  # 假突破：影线至少占整根 K 线的多少
-    stop_atr: float = 1.0  # 止损放在关键线外侧多少个 5 分钟 ATR
+    stop_atr: float = 1.2  # 止损放在关键线外侧多少个基准 ATR
     min_stop_pct: float = 0.25  # 止损离入场至少这么远（%），再近手续费占比就太高
-    target_r: float = 2.0  # 前面没有关键线可以当目标时，按止损距离的多少倍定目标
+    target_r: float = 3.0  # 前面没有够远的关键线时，按止损距离的多少倍定脉冲目标
     min_strength: int = 2  # 至少凑够几分才算信号（1 = 只有形态；带量 +1；顺大方向 +1；逆大方向 -1）
     kinds: tuple[str, ...] = ("breakout", "impulse", "reject", "retest")  # 用哪几种信号
     retest_atr: float = 0.5  # 变盘后回踩：K 线回到被突破的摆动点多近算踩到（几个 5 分钟 ATR）
@@ -113,7 +113,9 @@ def detect(bars: Sequence[Candle], px: float, levels: dict[str, float], *, atr5:
 
     found: list[Signal] = []
     # 1. 收盘突破：上一根还在线的这一边，这一根收盘站到了另一边，而且现价还在那一边、没有冲得太远
+    # 次级小摆动支撑/阻力必须同时放量且顺大方向（避免 5m 噪音频繁假突破）；箱体上下沿与多小时前高前低按常规评分
     for name, lv in levels.items():
+        minor_level = name.startswith(("支撑", "阻力"))
         for side in ("long", "short"):
             long = side == "long"
             crossed = prev.close <= lv < last.close if long else prev.close >= lv > last.close
@@ -122,9 +124,13 @@ def detect(bars: Sequence[Candle], px: float, levels: dict[str, float], *, atr5:
                 continue
             if not ((px > lv) if long else (px < lv)) or abs(px - lv) > p.chase_atr * a1:
                 continue
+            loud = ratio >= p.vol_ratio
+            sc = score(side, loud)
+            if minor_level and (not loud or sc < 3):
+                continue
             stop = lv - p.stop_atr * a5 if long else lv + p.stop_atr * a5
             why = f"1 分钟 K 线收在 {name} {lv:g} {'上' if long else '下'}方（收 {last.close:g}，量是平时的 {ratio:.1f} 倍）"
-            found.append(_finish(side, "breakout", score(side, ratio >= p.vol_ratio), lv, name, last, px, stop, levels, p, why))
+            found.append(_finish(side, "breakout", sc, lv, name, last, px, stop, levels, p, why))
     # 2. 假突破收回：影线刺穿关键线，收盘回到线的这一边，反着做
     if rng > 0 and rng >= 0.8 * a1:
         up_wick, low_wick = last.high - max(last.open, last.close), min(last.open, last.close) - last.low
@@ -149,16 +155,17 @@ def detect(bars: Sequence[Candle], px: float, levels: dict[str, float], *, atr5:
         why = f"最近 {len(run)} 分钟{'上涨' if long else '下跌'} {abs(move) / base * 100:.2f}%（平时一分钟波动 {a1 / base * 100:.2f}%），量是平时的 {sum(c.volume for c in run) / (avg * len(run)):.1f} 倍"
         found.append(_finish(side, "impulse", score(side, True), base, "", last, px, half, levels, p, why))
 
-    # 4. 变盘后回踩：走势刚变，价格回到被突破的那个摆动点附近、这根 K 线又朝新方向收回去——顺着新方向接
-    if shift and shift["bars_ago"] >= 1:
+    # 4. 变盘后回踩：走势刚变（6 根以内），价格回到被突破的摆动点附近，且这根 1 分钟 K 线吞过前一根重新朝新方向启动（防下跌瀑布里连出假回踩点）
+    if shift and 1 <= shift["bars_ago"] <= 6:
         long, lv = shift["side"] == "long", shift["level"]
         sign = 1 if long else -1
         tip = last.low if long else last.high
         near = (tip - lv) * sign <= p.retest_atr * a5 and (last.close - lv) * sign > 0 and (px - lv) * sign > 0
         room = (shift["extreme"] - px) * sign >= p.retest_room * a5
-        if near and room and (last.close > last.open) == long:
+        reclaimed = (last.close > prev.high) if long else (last.close < prev.low)
+        if near and room and reclaimed and (last.close > last.open) == long:
             leg = abs(shift["extreme"] - shift["origin"])
-            why = f"走势已转向{'上' if long else '下'}（{shift['why']}），现在回踩到 {lv:g} 附近（{'低' if long else '高'}点 {tip:g}）后朝新方向收回"
+            why = f"走势已转向{'上' if long else '下'}（{shift['why']}），现在回踩到 {lv:g} 附近（{'低' if long else '高'}点 {tip:g}）后吞过前一根重新启动"
             found.append(_finish(shift["side"], "retest", score(shift["side"], ratio >= p.vol_ratio), lv, "被突破的摆动点", last, px, lv - sign * p.stop_atr * a5, levels, p, why,
                                  targets=[shift["extreme"], shift["extreme"] + sign * leg * 0.5]))
 
@@ -303,37 +310,45 @@ def describe_tape(
     if mode == "quiet":
         return f"{big}｜当前挂在「静默防守」档，暂停新开仓信号，只保护已有仓位并自动清理过时挂单。"
 
-    # 情形 1：连跌/连涨 ≥ 3 根后刚反向收了 1~2 根（最典型的「连跌三次后涨了，该不该追？」）
+    # 情形 1：连跌/连涨 ≥ 3 根后刚反向收了 1~2 根
     if prev_run >= 3 and cur_run <= 2:
         if last_bull:
             if shift and shift["side"] == "long" and shift["bars_ago"] <= 3:
-                body = f"5m 连跌 {prev_run} 根后转阳，且已冲过前高 {shift['level']:g}（跌势已断）；但刚冲高直接追涨成本差，等回踩 {shift['level']:g} 附近挂单接多更稳"
+                body = f"5m 连跌 {prev_run} 根后转阳站上前高 {shift['level']:g}（跌势已反转）：离突破位近可直接顺势跟多（now），偏远则等回踩 {shift['level']:g} 附近挂单接多"
             elif lo and rpos <= 25:
-                body = f"5m 连跌 {prev_run} 根到箱体下沿（{lo:g} 附近）收阳止跌；震荡里可在下沿轻仓接多，单边下跌里不盲目抄底追涨"
+                body = f"5m 连跌 {prev_run} 根在箱体下沿（{lo:g} 附近）收阳承接：震荡局可依托下沿外止损做小波段反弹多（目标看中轨/上沿）"
             else:
-                body = f"5m 连续 {prev_run} 根阴线后刚收阳反弹，但尚未站上前高压力——属于下跌途中的喘气反弹，不能当反转追涨"
+                body = f"5m 连续 {prev_run} 根阴线后刚收阳反弹，但尚未越过前高压力——属于下跌喘气反弹，不能当反转追涨，关注受阻顺空或破前高再转多"
         else:
             if shift and shift["side"] == "short" and shift["bars_ago"] <= 3:
-                body = f"5m 连涨 {prev_run} 根后转阴跌破前低 {shift['level']:g}（涨势已断）；不在低位硬追空，等反抽 {shift['level']:g} 附近挂空单"
+                body = f"5m 连涨 {prev_run} 根后转阴跌破前低 {shift['level']:g}（涨势已转空）：离破位近可直接顺势跟空（now），偏远则在 {shift['level']:g} 浅挂空"
             elif hi and rpos >= 75:
-                body = f"5m 连涨 {prev_run} 根到箱体上沿（{hi:g} 附近）收阴受阻；可依托上沿挂空，不在高位追涨"
+                body = f"5m 连涨 {prev_run} 根在箱体上沿（{hi:g} 附近）收阴受阻：可依托上沿外止损做小波段回落空（目标看中轨/下沿）"
             else:
-                body = f"5m 连续 {prev_run} 根阳线后刚收阴回落，尚未跌破前低支撑——属于上涨途中的正常回踩，不盲目追空"
-    # 情形 2：正在走连续 ≥ 3 根单边阳线或阴线
+                body = f"5m 连续 {prev_run} 根阳线后收阴回调，尚未跌破前低支撑——暂按上涨途中浅回踩看待，关注企稳接多"
+    # 情形 2：正在走连续 ≥ 3 根单边阳线或阴线（区分起爆推进 vs 末端撞墙）
     elif cur_run >= 3:
         if last_bull:
-            body = f"5m 走出 {cur_run} 连阳上攻（位于区间 {rpos:.0f}% 处）：{'已贴近上沿阻力，严禁追高，等回踩支撑再接' if rpos >= 75 else '短线偏强，不追尾，只看突破回踩或台阶挂单'}"
+            body = (
+                f"5m 走出 {cur_run} 连阳推进（区间 {rpos:.0f}% 处）："
+                + ("已连拉至箱体极值上沿，看能否放量突破打开大波段（breakout），受阻收阴则做回落小波段" if cur_run >= 5 and rpos >= 82
+                   else "单边向上动能正在释放，顺势用现价或 EMA20 浅回踩跟进吃波段，勿死挂远端老低点踏空")
+            )
         else:
-            body = f"5m 走出 {cur_run} 连阴下挫（位于区间 {rpos:.0f}% 处）：{'已贴近下沿支撑，严禁杀跌追空，等反抽阻力再空' if rpos <= 25 else '短线偏弱，不在半路追空，等反抽压力位挂空'}"
+            body = (
+                f"5m 走出 {cur_run} 连阴下泄（区间 {rpos:.0f}% 处）："
+                + ("已急跌至箱体极值下沿，看放量破位延续（breakout）或止跌承接小反弹，不盲目追最后一棒" if cur_run >= 5 and rpos <= 18
+                   else "单边向下动能正在释放，顺势用现价或 EMA20 浅反弹跟空，勿死挂远端老高点踏空")
+            )
     # 情形 3：刚发生结构转折不久
     elif shift and shift["bars_ago"] <= 6:
         way = "多" if shift["side"] == "long" else "空"
-        act = "回踩挂多" if shift["side"] == "long" else "反抽挂空"
-        body = f"5m 刚确认转{way}（{shift['kind']}破位 {shift['level']:g}），现价 {now_px:g}：不追单，重点盯 {shift['level']:g} 一带的{act}机会"
-    # 情形 4：常态震荡拉锯
+        act = "浅回踩接多" if shift["side"] == "long" else "浅反抽接空"
+        body = f"5m 刚确认转{way}（{shift['kind']}越过 {shift['level']:g}），现价 {now_px:g}：离 {shift['level']:g} 近可直接跟{way}，跑远了则盯 EMA20 或 {shift['level']:g} 一带{act}"
+    # 情形 4：常态震荡或窄幅蓄势
     else:
-        edge = f"贴近箱体上沿 {hi:g}，防冲高回落" if hi and rpos >= 80 else f"贴近箱体下沿 {lo:g}，关注支撑承接" if lo and rpos <= 20 else f"处于箱体中部（{rpos:.0f}%），中间位置不追单，等上下沿台阶"
-        body = f"5m 阴阳交替震荡，{edge}"
+        edge = f"贴近箱体上沿 {hi:g}，观察放量突破或受阻短空" if hi and rpos >= 80 else f"贴近箱体下沿 {lo:g}，观察支撑低吸或放量下破" if lo and rpos <= 20 else f"处于箱体中部（{rpos:.0f}%），窄幅收口时在上下沿预埋突破单，宽震荡等两侧边缘"
+        body = f"5m 横盘蓄势或拉锯，{edge}"
 
     bias_tag = "｜只盯做多" if bias == "long" else "｜只盯做空" if bias == "short" else ""
     return f"{big}{bias_tag}｜{body}。"

@@ -42,20 +42,27 @@ def test_an_entry_line_needs_a_side_and_stops_on_the_right_side():
         CycleReport(**{**FLAT, "lines": [{"price": 60_000 + i, "note": "太多"} for i in range(9)]})
 
 
-async def test_flat_worker_must_draw_lines_on_both_sides(settings, fake):
-    """只押一个方向的计划线被退回一次；补齐后照常收下并布置成线。"""
+async def test_flat_worker_can_omit_or_draw_lines_without_forced_two_sided_retry(settings, fake):
+    """空仓不再强制上下各划一条线；Worker 按需画的撤单线和叫醒线照常同步为观察规则。"""
     seen = []
-    one_sided = {**FLAT, "lines": [{"price": 60_500, "note": "只看上方"}]}
-    both = {**FLAT, "lines": [{"price": 60_500, "note": "前高"}, {"price": 59_500, "do": "cancel", "note": "跌破原计划失效"}]}
-    rt = make_rt(settings, fake, reporting(one_sided, both, seen=seen))
+    chosen = {**FLAT, "no_plan_reason": "limit", "lines": [{"price": 60_500, "note": "前高"}, {"price": 59_500, "do": "cancel", "note": "跌破原计划失效"}]}
+    rt = make_rt(settings, fake, reporting(chosen, seen=seen))
     rt.watcher._state(BTC).last_px = 60_000
     result = await rt.watcher.review(BTC, "测试")
-    assert len(seen) == 2 and "计划线不全" in seen[1] and "上方有 1 条、下方有 0 条" in seen[1]
+    assert len(seen) == 1
     assert [l["price"] for l in result["lines"]] == [60_500, 59_500]
     rows = {r["params"]["level"]: r for r in lines(rt)}
     assert set(rows) == {60_500, 59_500} and rows[59_500]["params"]["line"] == {"do": "cancel"} and "line" not in rows[60_500]["params"]
     shown = {r["level"]: r for r in rt.watcher.rules("demo", BTC) if r["type"] == "watch"}
     assert shown[59_500]["action"] == "cancel_orders" and shown[59_500]["mode"] == "auto" and shown[60_500]["mode"] == "wake"
+
+    # 只画一侧或空列表也不会被退回
+    one_sided = {**FLAT, "no_plan_reason": "limit", "lines": [{"price": 60_500, "note": "只看上方"}]}
+    seen2 = []
+    rt2 = make_rt(settings, fake, reporting(one_sided, seen=seen2))
+    rt2.watcher._state(BTC).last_px = 60_000
+    await rt2.watcher.review(BTC, "测试")
+    assert len(seen2) == 1
 
 
 async def test_lines_gate_only_applies_when_flat_and_downgrades_bad_entries_after_one_retry(rt, fake):

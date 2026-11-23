@@ -153,7 +153,7 @@ class TokenGate:
     同一秒里的几个账户请求有的成功、有的报「没有凭据」，来回几次之后整个登录失效。
     这里的做法：缓存确定有效的时候照常并发；快到期时让需要登录的请求先等几秒，等缓存确定过期后只放一个过去取令牌，取回来再放行其余的。"""
 
-    def __init__(self, ttl: float = 60.0, margin: float = 0.75, lock: asyncio.Lock | None = None):
+    def __init__(self, ttl: float = 45.0, margin: float = 4.0, lock: asyncio.Lock | None = None):
         self.ttl, self.margin = ttl, margin
         self._lock = lock or asyncio.Lock()
         self._fresh_from = float("-inf")  # 当前这份缓存最早是什么时候取的（那个请求发出的时间）
@@ -304,14 +304,23 @@ class _Server:
 
 
 class OkxGateway:
-    def __init__(self, settings: Settings, *, timeout: float = 30, auth_lock: asyncio.Lock | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        timeout: float = 30,
+        auth_lock: asyncio.Lock | None = None,
+        on_auth_error: Callable[[], Awaitable[bool]] | None = None,
+    ):
         self.settings = settings
         self.timeout = timeout
+        self.on_auth_error = on_auth_error
         self._servers: dict[str, _Server] = {}
         self._locks: dict[str, asyncio.Lock] = {"demo": asyncio.Lock(), "live": asyncio.Lock()}
         self._tools: list[ToolInfo] | None = None
         fetch = auth_lock or asyncio.Lock()
-        self._gates: dict[str, TokenGate] = {"demo": TokenGate(lock=fetch), "live": TokenGate(lock=fetch)}
+        shared_gate = TokenGate(lock=fetch)
+        self._gates: dict[str, TokenGate] = {"demo": shared_gate, "live": shared_gate}
 
     async def _server(self, env: Env) -> _Server:
         async with self._locks[env]:
@@ -345,7 +354,17 @@ class OkxGateway:
                 if attempt == 0 and await self._is_read_only(tool):
                     continue
                 raise OkxError(f"欧易网关调用 {tool} 失败：{exc}", tool=tool) from exc
-            return _unwrap(tool, result)
+            try:
+                return _unwrap(tool, result)
+            except OkxError as exc:
+                if exc.needs_login:
+                    self._gates[env].reset()
+                    safe_read = "_get_" in tool or await self._is_read_only(tool)
+                    if attempt == 0 and self.on_auth_error is not None and await self.on_auth_error():
+                        await server.stop()
+                        if safe_read:
+                            continue
+                raise
         raise OkxError(f"欧易网关调用 {tool} 失败：{last}", tool=tool)
 
     async def _is_read_only(self, tool: str) -> bool:

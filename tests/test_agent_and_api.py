@@ -821,7 +821,7 @@ async def test_one_worker_does_one_thing_at_a_time_and_can_be_interrupted(settin
                 return ModelResponse(parts=[ToolCallPart("account_state", {})])
             seen.append(text)
             order.append("review:end")
-            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None, "no_plan_reason": "objection"})])
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None, "no_plan_reason": "limit"})])
         order.append("task")
         return ModelResponse(parts=[TextPart("现在不建议追多。")])
 
@@ -1510,7 +1510,7 @@ async def test_worker_stops_only_when_an_assigned_stop_condition_is_met(settings
         if not returns:
             return ModelResponse(parts=[ToolCallPart("stop_watching", {"inst_id": BTC, "evidence": "1H 收在 59000 下方"})])
         answers.append(str(returns[-1].content))
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None, "no_plan_reason": "objection"})])
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None, "no_plan_reason": "limit"})])
 
     rt = make_rt(settings, fake, FunctionModel(model))
     rt.save_config(rt.config().model_copy(update={"intel_minutes": 0, "wake": "always"}))

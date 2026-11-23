@@ -158,3 +158,10 @@ class OkxAuth:
             self.last_error = ""
             if code != 0:
                 raise OkxAuthError((err or out).strip()[-300:] or "退出授权失败。")
+
+    async def invalidate_cache(self) -> dict[str, Any]:
+        """清掉本地状态缓存并立即重查一次真实登录状态（okx-auth 仅允许受信的 @okx_ai 进程取 token，续期走网关调用）。"""
+        async with self._status_lock:
+            self._cached = None
+            self._cached_at = 0.0
+        return await self.status()

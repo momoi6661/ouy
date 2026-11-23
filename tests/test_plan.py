@@ -23,7 +23,7 @@ def test_strategy_selection_checks_before_deduplicating_and_respects_direction()
     params = dict(style="intraday", min_rr=1.2, entry_mode="limit", quant_bias="long", shift=shift)
     rows = build_candidates(snap, **params)
     assert len(rows) == 1 and rows[0]["ok"] and rows[0]["strategy"] == "区间高抛低吸"
-    assert "优先核实" in candidates_text(snap, **params)
+    assert "优先看" in candidates_text(snap, **params)
     assert not build_candidates(snap, quant_mode="quiet", **params)
     assert not build_candidates(snap, quant_mode="breakout", **params)  # 无箱体，不把普通回踩充作突破
     snap["orderbook"] = {}
@@ -61,7 +61,7 @@ def plan_rows(rt) -> list[dict]:
     return [r for r in rt.store.strategies("demo", BTC, live=False) if r["params"].get("plan")]
 
 
-@pytest.mark.parametrize("reason,stance,rechecks", [("cost", "active", 1), ("limit", "active", 0), ("cost", "cautious", 0)])
+@pytest.mark.parametrize("reason,stance,rechecks", [("cost", "active", 1), ("no_edge", "active", 1), ("objection", "active", 1), ("limit", "active", 0), ("cost", "cautious", 0), ("no_edge", "balanced", 0), ("objection", "balanced", 0)])
 async def test_active_worker_reconciles_cost_veto_once_without_forcing_trade(settings, fake, monkeypatch, reason, stance, rechecks):
     refused = {**REPORT, "plan": None, "no_plan_reason": reason, "lines": [{"price": 59700, "note": "等结构确认"}, {"price": 60900, "note": "站上再看"}]}
     seen = []
@@ -74,8 +74,23 @@ async def test_active_worker_reconciles_cost_veto_once_without_forcing_trade(set
     result = await rt.watcher.review(BTC, "测试")
     assert len(seen) == 1 + rechecks and not fake.orders and not fake.positions
     if rechecks:
-        assert "成本结论需要复核" in seen[-1]
+        assert {"cost": "成本结论需要复核", "no_edge": "回测成绩只作参考", "objection": "方向认定了就先把单挂出去"}[reason] in seen[-1]
     assert result["plan_order"]["status"] == "watching" and "59700" in result["plan_order"]["text"]
+
+
+@pytest.mark.parametrize("stance,rechecks", [("active", 1), ("balanced", 0)])
+async def test_active_worker_is_asked_once_to_rest_an_order_instead_of_only_wake_lines(settings, fake, monkeypatch, stance, rechecks):
+    """积极：没有合格候选、Worker 只划了叫醒线不给计划，退回一次让它把愿意接的位置挂成限价单；不替它下单。"""
+    refused = {**REPORT, "plan": None, "no_plan_reason": "cost", "lines": [{"price": 59700, "note": "回踩再看"}, {"price": 60900, "note": "站上再看"}]}
+    seen = []
+    rt = make_rt(settings, fake, reporting(refused, seen=seen))
+    rt.save_config(rt.config().model_copy(update={"stance": stance}))
+    monkeypatch.setattr("ouy.agent.watcher.build_candidates", lambda *a, **kw: [])
+    result = await rt.watcher.review(BTC, "测试")
+    assert len(seen) == 1 + rechecks and not fake.orders and not fake.positions
+    if rechecks:
+        assert "划了叫醒线（59700、60900）但没有挂单" in seen[-1] and "entry_type=pullback" in seen[-1]
+    assert result["plan_order"]["status"] == "watching"
 
 
 def test_program_checks_a_plan_with_costs_and_decides_how_to_enter():
@@ -281,7 +296,7 @@ async def test_worker_sees_cooling_candidate_and_can_choose_a_verified_alternati
 
     record = await rt.watcher.review(BTC, "定时复盘")
     assert "暂停入场：同一个位置刚做过一笔" in seen[0]
-    assert "优先核实「前高前低法」@ 59400" in seen[0]
+    assert "优先看「前高前低法」@ 59400" in seen[0]
     assert len(seen) == 2 and "另一条候选「前高前低法」@ 59400" in seen[1]
     assert [float(o["px"]) for o in fake.orders] == ([59_400] if take_alternative else [])
     assert record["plan_order"]["status"] == ("armed" if take_alternative else "watching")
@@ -322,7 +337,7 @@ async def test_each_worker_can_have_its_own_style_stance_and_entry_mode(settings
     assert cfg.stance_for(BTC) == "active" and cfg.entry_mode_for(BTC) == "limit" and cfg.stance_for("ETH-USDT-SWAP") == "cautious"
     await rt.watcher.review(BTC, "定时复盘")
     prompt = seen[0]
-    assert "【这个品种的交易风格】超短线" in prompt and "【出手尺度】积极（到第一目标的净盈亏比至少 1.2）" in prompt and "【入场方式】挂单优先" in prompt
+    assert "【这个品种的交易风格】超短线" in prompt and "【出手尺度】积极（到第一目标的净盈亏比至少 1）" in prompt and "【入场方式】挂单优先" in prompt
     assert "【成本】吃单手续费单边 0.05%" in prompt and "由程序核对" in prompt
     # 出手尺度也决定程序核对计划的下限：保守要 2，同一个计划就过不了
     assert (await rt.watcher._check_plan(cfg, BTC, TradePlan(**PLAN))).ok
@@ -400,13 +415,31 @@ def test_auto_mode_picks_plays_by_market_regime():
     snap = {"last": 100, "orderbook": {"spread_pct": 0.01}, "timeframes": {"15m": frame}, "windows": {"4H": {"trend": "上涨（高点低点都在抬高）"}}}
     assert market_regime(snap, "intraday")["kind"] == "trend"
     rows = build_candidates(snap, style="intraday", min_rr=1.2)
-    assert rows and all(r["plan"].direction == "long" and r["strategy"] in ("趋势回踩", "前高前低法") for r in rows)
-    assert any(r["plan"].direction == "short" for r in build_candidates(snap, style="intraday", min_rr=1.2, quant_mode="all"))  # 不按行情过滤时才有逆势空单
-    snap["timeframes"]["15m"] = {**frame, "structure": "downtrend"}  # 大方向向上、结构周期向下：打架
-    assert market_regime(snap, "intraday")["kind"] == "mixed" and not build_candidates(snap, style="intraday", min_rr=1.2)
-    assert "这轮不给入场候选" in candidates_text(snap, style="intraday", min_rr=1.2)
+    # 新分工：自动档不再删掉另一侧结构位，而是标注主推（in_regime=True）排在前面、备选保留在盘面地图里
+    assert rows and rows[0]["plan"].direction == "long" and rows[0]["in_regime"] and rows[0]["strategy"] in ("趋势回踩", "前高前低法")
+    assert any(r["plan"].direction == "short" and not r["in_regime"] for r in rows)
+    snap["timeframes"]["15m"] = {**frame, "structure": "downtrend"}  # 大方向向上、结构周期向下：打架，仍提供双向结构地图给模型判断
+    assert market_regime(snap, "intraday")["kind"] == "mixed"
+    mixed_rows = build_candidates(snap, style="intraday", min_rr=1.2)
+    assert mixed_rows and {r["plan"].direction for r in mixed_rows} == {"long", "short"}
+    assert "盘面地图" in candidates_text(snap, style="intraday", min_rr=1.2)
+    # 出手尺度「积极」：打架时按大周期趋势标主推；大周期没有方向就按结构周期趋势
+    follow = market_regime(snap, "intraday", follow_trend=True)
+    assert follow["kind"] == "trend" and follow["side"] == "long" and "按趋势做" in follow["why"]
+    rows = build_candidates(snap, style="intraday", min_rr=1.0, follow_trend=True)
+    assert rows and rows[0]["plan"].direction == "long" and rows[0]["in_regime"]
+    flat = {**snap, "windows": {}}
+    assert market_regime(flat, "intraday")["kind"] == "mixed" and market_regime(flat, "intraday", follow_trend=True)["side"] == "short"
+    flat_rows = build_candidates(flat, style="intraday", min_rr=1.0, follow_trend=True)
+    assert flat_rows and flat_rows[0]["plan"].direction == "short" and flat_rows[0]["in_regime"]
     shift = {"side": "short", "kind": "反转", "level": 100.5, "extreme": 99.0, "origin": 102.0, "bars_ago": 2, "why": "收盘跌破前低"}
     assert market_regime(snap, "intraday", shift)["kind"] == "reversal"
+    # 行情判成震荡而大周期有方向：两头都给，顺大周期的那一边排在前面
+    snap["timeframes"]["15m"] = {**frame, "structure": "range", "adx14": 13}
+    rows = build_candidates(snap, style="intraday", min_rr=1.2)
+    assert market_regime(snap, "intraday")["kind"] == "range"
+    assert [(r["strategy"], r["plan"].direction, r["align"]) for r in rows][0] == ("区间高抛低吸", "long", "顺大方向")
+    assert {r["plan"].direction for r in rows} == {"long", "short"} and all(r["strategy"] == "区间高抛低吸" for r in rows)
 
 
 @pytest.mark.parametrize("structure,adx", [("unknown", 10), ("range", None), ("range", float("nan"))])
@@ -429,25 +462,25 @@ def _losing_report(tmp_path, monkeypatch, name="区间高抛低吸"):
     return bp
 
 
-async def test_losing_playbook_is_not_pushed_and_needs_an_extra_reason(rt, tmp_path, monkeypatch):
-    """回测里机械照做显著亏的打法：候选照给，但程序不再催 Worker 做；Worker 要做必须写出额外依据，否则 no_edge 是合格结论。"""
+async def test_losing_playbook_is_shown_as_reference_without_blocking_worker(rt, tmp_path, monkeypatch):
+    """纯算法盲做回测显著亏的打法：仍然标出来供 Worker 参考，但不再用来硬拦 Worker 自己判断后的 plan。"""
     snap = {"last": 100, "timeframes": {"15m": {"structure": "range", "adx14": 13, "atr14": 1, "support": [{"price": 99}], "resistance": [{"price": 102}]}},
             "orderbook": {"spread_pct": 0.01}}
     params = dict(style="intraday", min_rr=1.2, entry_mode="limit", quant_bias="long")
-    assert not build_candidates(snap, **params)[0]["losing"] and "优先核实" in candidates_text(snap, **params)  # 没有报告：没证据不等于亏
+    assert not build_candidates(snap, **params)[0]["losing"] and "优先看" in candidates_text(snap, **params)
 
     bp = _losing_report(tmp_path, monkeypatch)
     assert "区间高抛低吸" in bp.losing("intraday") and bp.losing("swing") == set()
     rows = build_candidates(snap, **params)
-    assert rows[0]["ok"] and rows[0]["losing"]  # 仍然给出来、排序不变，只打标记
+    assert rows[0]["ok"] and rows[0]["losing"]  # 仍然给出来、排序不变，只打标记作参考
     text = candidates_text(snap, **params)
-    assert "no_edge" in text and "plan.edge" in text and "优先核实" not in text and "不是「会赚的位置」" in text
+    assert "仅作参考" in text and "不限制你的判断" in text and "优先看" in text
 
-    cfg = rt.config().model_copy(update={"styles": {BTC: "intraday"}})
-    bare = await rt.watcher._check_plan(cfg, BTC, TradePlan(**{**PLAN, "strategy": "区间高抛低吸"}))
-    assert not bare.ok and "plan.edge" in "；".join(bare.issues)
-    assert (await rt.watcher._check_plan(cfg, BTC, TradePlan(**{**PLAN, "strategy": "区间高抛低吸", "edge": "4H 刚收盘站上前高，资金费率 -0.03%"}))).ok
-    assert (await rt.watcher._check_plan(cfg, BTC, TradePlan(**{**PLAN, "strategy": "趋势回踩"}))).ok  # 这条没有回测结论，不拦
+    cfg = rt.config().model_copy(update={"styles": {BTC: "intraday"}, "stance": "balanced"})
+    far = {**PLAN, "take_profits": [61_300]}  # 均衡档净盈亏比要 1.5
+    assert (await rt.watcher._check_plan(cfg, BTC, TradePlan(**{**far, "strategy": "区间高抛低吸"}))).ok
+    active = cfg.model_copy(update={"stance": "active"})
+    assert (await rt.watcher._check_plan(active, BTC, TradePlan(**{**PLAN, "strategy": "区间高抛低吸"}))).ok
 
 
 async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked_by_origin(rt, fake, monkeypatch):
@@ -455,7 +488,7 @@ async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked
     from ouy.agent.plan import PlanCheck, plan_origin
     from ouy.models import TradeAction
 
-    cfg, st = rt.config(), rt.watcher._state(BTC)
+    cfg, st = rt.config().model_copy(update={"stance": "balanced"}), rt.watcher._state(BTC)
     st.last_px = 60_000
     real_snapshot = await rt.market.snapshot(BTC, cfg.env, ("5m", "15m", "1H", "4H"))
     frame_15m = real_snapshot["timeframes"]["15m"]
@@ -494,7 +527,7 @@ async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked
     rows = rt.watcher._set_regime(cfg, BTC, st, snap, None, None)
     new = [e for e in rt.store.algo_events("demo", BTC) if e["id"] > events[0]["id"]]
     assert any(e["algo"] == "regime" and e["text"].startswith("方向打架 → ") for e in new)
-    assert len([e for e in new if e["algo"] == "cand"]) == len({(c["strategy"], c["plan"].direction) for c in rows if c["ok"]}) > 0
+    assert len([e for e in new if e["algo"] == "cand"]) == len({(c["strategy"], c["plan"].direction) for c in rows if c["ok"] and c.get("in_regime", True)}) > 0
     assert all(e["side"] == "long" and "入场" in e["text"] for e in new if e["algo"] == "cand")
     rt.watcher._set_regime(cfg, BTC, st, snap, None, None)
     assert len(rt.store.algo_events("demo", BTC)) == len(events) + len(new)  # 没变化就不重复记
@@ -562,3 +595,26 @@ async def test_waiting_review_keeps_market_recording_without_starting_another_re
     assert watcher.strategies.metrics[BTC]["ts"] > 0
     assert state.regime["ts"] > 0
     assert state.task is None and not fake.orders
+
+
+def test_squeeze_arms_breakout_and_miss_price_prevents_instant_self_cancel():
+    from ouy.agent.plan import manage_rules, miss_price
+
+    frame = {
+        "structure": "range", "adx14": 14, "atr14": 100, "squeeze": True, "bb_width_pct": 0.9,
+        "range": {"upper": 60_200, "lower": 59_400}, "support": [{"price": 59_450}], "resistance": [{"price": 60_200}],
+    }
+    snap = {"last": 60_100, "orderbook": {"spread_pct": 0.01}, "timeframes": {"15m": frame}, "windows": {"4H": {"trend": "上涨（高点低点都在抬高）"}}}
+    rows = build_candidates(snap, style="intraday", min_rr=1.0, follow_trend=True)
+    brk = next((r for r in rows if r["strategy"] == "收敛突破" and r["plan"].direction == "long"), None)
+    assert brk and brk["ok"] and brk["check"].how == "breakout"
+    rules = manage_rules(brk["plan"], brk["check"], "intraday")
+    assert rules["lock_r"] == 0 and rules["breakeven_r"] == 1.3 and rules["trail_atr"] == 3.5 and rules["stale_minutes"] == 60
+
+    short_pb = TradePlan(
+        direction="short", strategy="趋势回踩", entry_low=1729.79, entry_high=1729.79,
+        stop_loss=1735.69, take_profits=[1718.8, 1712.0], leverage=20, entry_type="pullback", invalidation="收盘站上 1735.69",
+    )
+    cancel_lv = miss_price(short_pb, 1729.79, 1721.6)
+    assert cancel_lv < 1716.0
+

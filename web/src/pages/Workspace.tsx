@@ -698,7 +698,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               ))}
             </select>
           </label>
-          <label className="pref" title="这个 Worker 需要多少条件才出手；也决定程序核对计划时净盈亏比的下限（保守 2 / 均衡 1.5 / 积极 1.2）">
+          <label className="pref" title="这个 Worker 需要多少条件才出手；也决定程序核对计划时净盈亏比的下限（保守 2 / 均衡 1.5 / 积极 1）">
             出手
             <select value={own.stance ?? ""} onChange={(e) => saveWorker({ stance: (e.target.value || null) as Stance | null }, `${shortInst(coin)} Worker 的出手尺度已修改`)}>
               <option value="">跟全局（{STANCES.find((x) => x.id === cfg.stance)?.label}）</option>

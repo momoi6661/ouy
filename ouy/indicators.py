@@ -161,6 +161,13 @@ def summarize(candles: Sequence[Candle]) -> dict[str, object]:
     a = atr(closed)[-1]
     line, sig, hist = macd(closes)
     bb = bollinger(closes)
+    bb_width = (bb[2] - bb[0]) / bb[1] * 100 if bb and bb[1] else None
+    bb_hist = [
+        (b[2] - b[0]) / b[1] * 100
+        for end in range(max(20, len(closes) - 60), len(closes) + 1)
+        if (b := bollinger(closes[end - 20 : end])) and b[1]
+    ]
+    bb_pctile = sum(1 for w in bb_hist if w <= bb_width) / len(bb_hist) if bb_width is not None and len(bb_hist) >= 15 else None
     dmi = adx(closed)
     hs, ls = swings(closed)
     vols = [c.volume for c in closed]
@@ -191,7 +198,9 @@ def summarize(candles: Sequence[Candle]) -> dict[str, object]:
         "bb_lower": rnd(bb[0]) if bb else None,
         "bb_mid": rnd(bb[1]) if bb else None,
         "bb_upper": rnd(bb[2]) if bb else None,
-        "bb_width_pct": rnd((bb[2] - bb[0]) / bb[1] * 100) if bb and bb[1] else None,
+        "bb_width_pct": rnd(bb_width),
+        "bb_width_pctile": round(bb_pctile, 2) if bb_pctile is not None else None,
+        "squeeze": bool(bb_pctile is not None and bb_pctile <= 0.45),
         "adx14": rnd(dmi[0]) if dmi else None,
         "plus_di": rnd(dmi[1]) if dmi else None,
         "minus_di": rnd(dmi[2]) if dmi else None,

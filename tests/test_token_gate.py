@@ -144,3 +144,32 @@ async def test_shared_gateway_does_not_repeat_the_same_account_query():
     await gw.call("market_get_ticker", {"instId": "BTC-USDT-SWAP"}, env="demo")
     await gw.call("market_get_ticker", {"instId": "BTC-USDT-SWAP"}, env="demo")
     assert inner.calls.count("market_get_ticker") == 2  # 行情不缓存
+
+
+def test_mcp_oauth_patch_adds_singleflight_and_clears_401_cache():
+    from ouy.okx.runtime import _patch_oauth_singleflight
+
+    sample = (
+        "  async resolveAccessToken() {\n"
+        "    if (this.cachedAccessToken && Date.now() - this.cachedAccessTokenAt < TOKEN_CACHE_TTL_MS) {\n"
+        "      return this.cachedAccessToken;\n"
+        "    }\n"
+        "    try {\n"
+        "      const token = await execAuthToken();\n"
+        "      this.cachedAccessToken = token;\n"
+        "      this.cachedAccessTokenAt = Date.now();\n"
+        "      return token;\n"
+        "    } catch (e) {\n"
+        "      if (e instanceof NotLoggedInError) {\n"
+        "        return null;\n"
+        "      }\n"
+        "      throw e;\n"
+        "    }\n"
+        "  }\n"
+        "    if (!response.ok) {\n"
+        '      this.logResponse(response.status, rawText.length, elapsed, traceId, parsed.code ?? "-", parsed.msg);\n'
+    )
+    patched = _patch_oauth_singleflight(sample)
+    assert "this._tokenInflight" in patched and "this.cachedAccessToken = void 0;" in patched
+    assert _patch_oauth_singleflight(patched) == patched  # 幂等
+

@@ -3579,6 +3579,17 @@ select option:checked { background: #2b3340; color: #f0b90b; }
 .sg-card dt { color: var(--muted); }
 .sg-card dd { margin: 0; line-height: 1.45; }
 .sg-note { font-size: 12px; margin: 10px 0 0; }
+.eg-grid { grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }
+.eg-text { font-size: 11px; }
+.eg-row { display: contents; }
+.eg-steps { display: flex; flex-wrap: wrap; gap: 6px 4px; margin: 0; padding: 0; list-style: none; counter-reset: eg; font-size: 12px; }
+.eg-steps li { counter-increment: eg; border: 0.5px solid var(--line); border-radius: 8px; background: var(--panel-2); padding: 5px 10px; }
+.eg-steps li::before { content: counter(eg) ". "; color: var(--muted); }
+.eg-steps li + li { margin-left: 14px; position: relative; }
+.eg-steps li + li::after { content: "→"; position: absolute; left: -15px; top: 5px; color: var(--muted); }
+.eg-skip { display: grid; grid-template-columns: auto 1fr; gap: 5px 12px; margin: 0; font-size: 12px; }
+.eg-skip dt { color: var(--muted); white-space: nowrap; }
+.eg-skip dd { margin: 0; line-height: 1.5; }
 .msg .bub:empty { display: none; }
 
 /* 算法页 */

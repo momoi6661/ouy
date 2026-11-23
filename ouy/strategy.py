@@ -459,8 +459,8 @@ class StrategyEngine:
             if (side == "long") != (p["stop_loss"] < p["low"]):
                 raise Rejected("网格的止损要放在区间外：做多网格在下沿下方，做空网格在上沿上方。")
         elif kind == "manage":
-            if not (p.get("breakeven_r") or p.get("partials") or p.get("trail_pct") or p.get("max_hold_minutes") or "lock_r" in p):
-                raise Rejected("至少给一条管理规则：lock_r、breakeven_r、partials、trail_pct 或 max_hold_minutes。")
+            if not (p.get("breakeven_r") or p.get("partials") or p.get("trail_pct") or p.get("trail_atr") or p.get("stale_minutes") or p.get("max_hold_minutes") or "lock_r" in p):
+                raise Rejected("至少给一条管理规则：lock_r、breakeven_r、partials、trail_pct、trail_atr、stale_minutes 或 max_hold_minutes。")
 
     # ---------- 每个节拍 ----------
 
@@ -656,11 +656,37 @@ class StrategyEngine:
         triggers_above = long if breakout else not long
         hit = px >= p["trigger"] if triggers_above else px <= p["trigger"]
         if not hit:
+            state.pop("confirm_ticks", None)
             return "armed", ""
         if breakout and abs(px / p["trigger"] - 1) * 100 > p.get("max_chase_pct", 0.4):
             return "armed", f"价格已经冲过触发价 {abs(px / p['trigger'] - 1) * 100:.2f}%，不追，等回到触发价附近"
-        if account.position(row["inst_id"]) or any(o.inst_id == row["inst_id"] and not o.reduce_only for o in account.orders):
+        if breakout and p.get("confirm_vol"):
+            m = self.fresh_metrics(cfg.env, row["inst_id"])
+            if m and 0 <= now_ms() - m.get("fast_ts", 0) <= FAST_DATA_MS:
+                vol_1m = float(m["values"].get("vol_1m") or 0.0)
+                move_1m = float(m["values"].get("move_1m") or 0.0) * (1 if long else -1)
+                beyond_pct = (px / p["trigger"] - 1) * 100 * (1 if long else -1)
+                ticks = state["confirm_ticks"] = int(state.get("confirm_ticks") or 0) + 1
+                surging = vol_1m >= float(p["confirm_vol"]) and (move_1m > 0 or beyond_pct >= 0.08)
+                sustained = ticks >= 2 and beyond_pct >= 0.03
+                if not (surging or sustained):
+                    return "armed", f"报价刚触及突破位 {p['trigger']:g}（1m 量比 {vol_1m:.2f}），再确认一拍防无量假针"
+        if account.position(row["inst_id"]):
             return "cancelled", "已有持仓或入场委托，原入场规则不再执行"
+        open_entries = [o for o in account.orders if o.inst_id == row["inst_id"] and not o.reduce_only]
+        if open_entries:
+            plan_ids = {g["ord_id"] for g in self.trader.order_guards(cfg.env, row["inst_id"]) if g.get("plan")}
+            if breakout and all(o.filled == 0 and o.ord_id in plan_ids for o in open_entries):
+                for o in open_entries:
+                    cancelled = await self.trader.execute(
+                        TradeAction(kind="cancel_orders", inst_id=row["inst_id"], ord_id=o.ord_id, reason="顺势突破触发，自动撤掉未成交的远端回踩挂单"),
+                        cfg.env, source="guard",
+                    )
+                    if cancelled.status != "executed":
+                        return "armed", f"先撤远端回踩挂单未确认：{cancelled.message}"
+                account.orders = [o for o in account.orders if o.ord_id not in {x.ord_id for x in open_entries}]
+            else:
+                return "cancelled", "已有持仓或入场委托，原入场规则不再执行"
         action = self._entry(account, row, row["side"], p["stop_loss"], p.get("take_profit"), px)
         if p.get("scalp_plan"):
             if action.kind != "open":
@@ -915,6 +941,7 @@ class StrategyEngine:
             return "done", "这笔仓位没有止损，算不出 R，不做自动管理"
         gain = ((px - entry) if long else (entry - px)) / r
         state["peak"] = max(state.get("peak", px), px) if long else min(state.get("peak", px), px)
+        state["peak_r"] = max(float(state.get("peak_r") or 0.0), gain)
         stops = [s for s in (state.get("stop"), lot["stop_loss"]) if s]
         stop_now = (max(stops) if long else min(stops)) if stops else 0  # 保盈线、Worker 可能已经把止损移得更紧：不往回放
         note = f"现在 {gain:+.2f}R"
@@ -953,6 +980,23 @@ class StrategyEngine:
             better = trail > stop_now + r * 0.25 if long else (not stop_now or trail < stop_now - r * 0.25)
             if better and ((trail < px) if long else (trail > px)):
                 await move(trail, f"跟踪止损上移到 {trail:g}" if long else f"跟踪止损下移到 {trail:g}")
+                stop_now = trail
+        if rules.get("trail_atr") and gain >= rules.get("trail_start_r", rules.get("breakeven_r") or 1.2):
+            m = self.fresh_metrics(cfg.env, row["inst_id"])
+            tbar = str(rules.get("trail_bar") or "")
+            atr_val = float((m.get("bar_atrs") or {}).get(tbar) or (m.get("values") or {}).get("atr") or (r / 1.8))
+            if atr_val > 0:
+                trail = float(f"{(state['peak'] - float(rules['trail_atr']) * atr_val if long else state['peak'] + float(rules['trail_atr']) * atr_val):.8g}")
+                better = trail > stop_now + r * 0.2 if long else (not stop_now or trail < stop_now - r * 0.2)
+                if better and ((px - trail) * (1 if long else -1) >= r * 0.15):
+                    await move(trail, f"ATR 跟踪止损上移到 {trail:g}" if long else f"ATR 跟踪止损下移到 {trail:g}")
+                    stop_now = trail
+        if rules.get("stale_minutes") and state.get("since") and time.time() - state["since"] > float(rules["stale_minutes"]) * 60:
+            min_r = float(rules.get("stale_min_r") or 0.4)
+            if state["peak_r"] < min_r and gain < 0.15:
+                await self._order(cfg, row, TradeAction(kind="close", inst_id=row["inst_id"], lot_id=lot["id"], reason="动能证伪提前离场"),
+                                  f"{rules['stale_minutes']:g} 分钟最高未达 {min_r:g}R，快行情未起爆提前离场")
+                return "done", "动能证伪离场"
         if rules.get("max_hold_minutes") and state.get("since") and time.time() - state["since"] > rules["max_hold_minutes"] * 60 and gain < 0.5:
             await self._order(cfg, row, TradeAction(kind="close", inst_id=row["inst_id"], lot_id=lot["id"], reason="时间止损"), f"{rules['max_hold_minutes']} 分钟没走出来，时间止损离场")
             return "done", "时间止损离场"

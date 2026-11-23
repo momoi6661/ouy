@@ -158,9 +158,25 @@ async def test_worker_switches_quant_mode_and_describe_tape_explains_consecutive
         if not returns:
             return ModelResponse(parts=[ToolCallPart("set_quant_mode", {"inst_id": BTC, "mode": "range", "bias": "short", "vol_ratio": 2.0, "reason": "横盘箱体上沿受压"})])
         assert "震荡箱体" in str(returns[-1].content)
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None, "no_plan_reason": "cost"})])
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None, "no_plan_reason": "limit"})])
 
     rt = make_rt(settings, fake, FunctionModel(run))
     await rt.watcher.review(BTC, "定时复盘")
     qt = rt.watcher.status()["instruments"][BTC]["quant"]
     assert qt["mode"] == "range" and qt["bias"] == "short" and qt["vol_ratio"] == 2.0 and qt["by"] == "Worker" and "箱体" in qt["reason"]
+
+
+async def test_authorized_fast_signal_replaces_same_side_unfilled_pullback_limit(settings, fake):
+    from ouy.models import TradeAction
+
+    rt, w, st = await _armed(settings, fake, "agent", on_signal="long")
+    res = await rt.trader.submit(
+        TradeAction(kind="open", inst_id=BTC, side="long", order_type="limit", price=59_750, stop_loss=59_200, take_profit=61_000, leverage=5, risk_pct=0.4, cancel_px=60_800, reason="远端回踩"),
+        source="agent", far_ok=True,
+    )
+    assert res.status == "executed" and len(fake.orders) == 1
+    rt.store.set("order_guard:demo:BTC-USDT-SWAP", [{**g, "plan": True} for g in rt.trader.order_guards("demo", BTC)])
+
+    assert await w._fast(rt.config(), BTC, st, time.time()) is None
+    assert not fake.orders and fake.positions[BTC]["pos"] > 0 and st.fast_last["status"] == "executed"
+

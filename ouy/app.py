@@ -47,8 +47,10 @@ class Runtime:
         self.store = store or Store(settings.data_dir / "ouy.db")
         self.bus = EventBus()
         auth_lock = asyncio.Lock()
-        self.gateway: Gateway = Patient(gateway or Shared(OkxGateway(settings, auth_lock=auth_lock)))  # type: ignore[assignment]
         self.auth = auth or OkxAuth(settings, auth_lock=auth_lock)
+        self.gateway: Gateway = Patient(
+            gateway or Shared(OkxGateway(settings, auth_lock=auth_lock, on_auth_error=self.recover_okx_auth))
+        )  # type: ignore[assignment]
         self.market = Market(self.gateway)
         self.kb = KnowledgeBase(settings)
         self.trader = Trader(self.gateway, self.market, self.store, self.bus, self.config)
@@ -168,6 +170,44 @@ class Runtime:
         if previous and previous != "logged_in" and self._auth_status == "logged_in":
             await self.gateway.restart()  # 让官方组件重新读取令牌
         return status
+
+    async def recover_okx_auth(self) -> bool:
+        """遇到 401 时核实本机 OAuth 是否仍在有效期内：若本机仍 logged_in（例如旧缓存令牌刚轮换），清缓存让受信网关重取新令牌。"""
+        self._auth_cache = None
+        check = getattr(self.auth, "invalidate_cache", None) or getattr(self.auth, "status", None)
+        if not callable(check):
+            return False
+        try:
+            st = await check()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("核查欧易授权状态失败：%s", exc)
+            return False
+        ok = isinstance(st, dict) and st.get("status") == "logged_in"
+        if ok:
+            self._auth_cache = (time.time(), st)
+            inner = getattr(self.gateway, "inner", None)
+            if hasattr(inner, "_cache"):
+                inner._cache.clear()
+        return ok
+
+    async def auth_keepalive_loop(self) -> None:
+        """后台令牌保活：okx-auth 仅在 ttl <= 300s 且被受信 @okx_ai 网关调用时自动续期；
+        即使盯盘已停止，也在进入 280s 续期窗口时发起一次只读私有查询，防止闲置 1 小时后掉登录。"""
+        while True:
+            await asyncio.sleep(90)
+            try:
+                status = await self.auth_status(fresh=True)
+                ttl = status.get("ttl")
+                if status.get("status") == "logged_in" and isinstance(ttl, (int, float)) and ttl <= 280:
+                    inner = getattr(self.gateway, "inner", None)
+                    if hasattr(inner, "_cache"):
+                        inner._cache.clear()
+                    await self.gateway.call("account_get_balance", {}, env=self.config().env)
+                    self._auth_cache = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("欧易授权后台保活跳过：%s", exc)
 
     async def swap_meta(self, env: str) -> dict[str, Any]:
         """全部 U 本位永续的规格（最高杠杆、面值），缓存 1 小时。"""
@@ -355,12 +395,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         rt = runtime or Runtime(settings)
         app.state.rt = rt
         warm = asyncio.create_task(rt.kb.warmup())
+        keep_auth = asyncio.create_task(rt.auth_keepalive_loop(), name="ouy-auth-keepalive")
         if rt.store.get("agent_running"):
             try:
                 await rt.watcher.start(recover_auth=True)
             except Exception as exc:  # noqa: BLE001
                 log.warning("自动恢复盯盘失败：%s", exc)
         yield
+        keep_auth.cancel()
         warm.cancel()
         await rt.shutdown()
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type KbDocItem, type KbStats } from "../api";
 import { Markdown } from "../components/Markdown";
+import { EntryGuide } from "../components/EntryGuide";
 import { StyleGuide } from "../components/StyleGuide";
 import { Empty, toast } from "../components/ui";
 
@@ -145,6 +146,7 @@ export function Knowledge({ kb, onChanged }: { kb: KbStats; onChanged?: () => vo
       </aside>
 
       <div className="kb-main">
+        <EntryGuide />
         <StyleGuide />
         <div className="panel kb-reader">
           {doc ? (
