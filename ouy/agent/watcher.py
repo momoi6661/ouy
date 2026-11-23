@@ -36,7 +36,7 @@ from ..store import Store, now_ms
 from ..memory import Lessons
 from ..trader import MANUAL_SOURCES, PENDING_TTL_MS, Rejected, Trader
 from .core import SUBAGENTS, Deps, build_review_agent, build_adhoc_agent, build_chat_agent, build_general_agent, build_gate_agent, build_router_agent, build_sub_agent, build_trader_agent
-from .early_watch import ShiftRetest
+from .early_watch import ShiftRetest, WaveTracker
 from .signals import KIND as FAST_KIND, FastParams, describe_tape, detect, key_lines, line_status, strengths, structure_shift, trend_run, turn_state, turn_watch
 from .core import STABLE_MARK
 from .plan import TURN_BY, REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, major_direction, market_regime, miss_price, build_candidates, candidates_text, check_plan, far_target, plan_origin, manage_rules, order_params, plan_terms, safe_leverage, same_plan, trade_cost_pct
@@ -149,6 +149,7 @@ class InstState:
     opening_quote: dict[str, Any] = field(default_factory=dict)
     regime: dict[str, Any] = field(default_factory=dict)
     shift_retest: ShiftRetest = field(default_factory=ShiftRetest)
+    wave: WaveTracker = field(default_factory=WaveTracker)
     last_retest: dict[str, Any] | None = None
     last_px: float = 0.0
     prev_px: float = 0.0
@@ -217,7 +218,8 @@ def _global_risk(cfg: AgentConfig, account: AccountState) -> str:
     shorts = [p.inst_id.split("-")[0] for p in account.positions if p.side == "short"]
     text = f"【全局风险】全部持仓名义价值 {total:,.0f} USDT" + (f"，上限 {cap:,.0f}（已用 {total / cap * 100:.0f}%）" if cap else f"（权益的 {total / account.equity:.1f} 倍）" if account.equity else "")
     if account.day_pnl_pct is not None:
-        text += f"；今日盈亏 {account.day_pnl_pct:+.2f}%，当日亏损上限 {r.max_daily_loss_pct:g}%"
+        lim_text = f"当日亏损上限 {r.max_daily_loss_pct:g}%" if r.max_daily_loss_pct > 0 else "当日亏损不限"
+        text += f"；今日盈亏 {account.day_pnl_pct:+.2f}%，{lim_text}"
     for label, names in (("多", longs), ("空", shorts)):
         if len(names) >= 2:
             text += f"；{'、'.join(names)} 同时做{label}：相关的品种（加密货币之间、同一板块的股票之间）大多一起动，同方向的几笔等于叠加同一个风险，新开同方向的仓要更小"
@@ -1592,10 +1594,18 @@ class Watcher:
         tickers = await asyncio.gather(*(self.market.ticker(i, cfg.env) for i in cfg.instruments), return_exceptions=True)
         now = time.time()
         prices = {i: _f(t.get("last")) for i, t in zip(cfg.instruments, tickers) if not isinstance(t, BaseException)}
-        try:  # 挂单的撤单线、有效期：到了就撤，不等模型
+        for inst_w, px_w in prices.items():
+            if px_w > 0 and not cfg.worker(inst_w).paused:
+                st_w = self._state(inst_w)
+                m_w = self.strategies.metrics.get(inst_w) or {}
+                atr_w = (m_w.get("values") or {}).get("atr")
+                st_w.wave.update(now_ms(), px_w, atr_w)
+                if m_w.get("values") is not None:
+                    m_w["values"].update(st_w.wave.readings(px_w))
+        try:  # 挂单的撤单线、有效期及近区提前拐头追进：满足即执行，不等模型
             await self._guard_orders(cfg, account, prices)
-        except Exception as exc:  # noqa: BLE001 - 撤单出错不能拖垮盯盘循环
-            log.warning("核对挂单撤单条件失败：%s", exc)
+        except Exception as exc:  # noqa: BLE001 - 撤单/追单出错不能拖垮盯盘循环
+            log.warning("核对挂单撤单与拐点追单条件失败：%s", exc)
         retests = {}
         self._algo_check(cfg.env, prices)
         for inst, ticker in zip(cfg.instruments, tickers):
@@ -2035,6 +2045,29 @@ class Watcher:
                     self._emit(cfg.env, inst_id, "strategy", "action" if result.status == "executed" else "error", f"{what}：{result.message}", None, result.model_dump(mode="json"))
                 except Exception as exc:  # noqa: BLE001
                     self._emit(cfg.env, inst_id, "strategy", "error", f"{what}，但没做成：{str(exc)[:200]}", None)
+            # 实时拐点推止损：仓位浮盈 ≥1.2R 后，若 WaveTracker 在开仓后走出新的顺向波谷（多单）/ 波峰（空单）并重新顺势推进，自动把止损推到新拐点外侧
+            if gain >= 1.2 and not martingale and not hands_off and st.wave.dir == (1 if long else -1):
+                pivot_px = st.wave.last_trough if long else st.wave.last_peak
+                pivot_ts = st.wave.last_trough_ts if long else st.wave.last_peak_ts
+                if pivot_px > 0 and pivot_ts > lot["ts"]:
+                    pad = max(0.15 * m["r0"], pivot_px * 0.0012)
+                    cand_stop = float(f"{(pivot_px - pad if long else pivot_px + pad):.8g}")
+                    cur_sl = lot["stop_loss"] or 0.0
+                    tighter = (cand_stop > entry and cand_stop > cur_sl + 0.25 * m["r0"] and px - cand_stop >= max(0.25 * m["r0"], px * 0.0015)) if long else (
+                        cand_stop < entry and (not cur_sl or cand_stop < cur_sl - 0.25 * m["r0"]) and cand_stop - px >= max(0.25 * m["r0"], px * 0.0015)
+                    )
+                    if tighter and m.get("pivot_stop") != cand_stop:
+                        res_sl = await self.trader.execute(
+                            TradeAction(kind="set_stops", inst_id=inst_id, lot_id=lot["id"], stop_loss=cand_stop, reason=f"实时拐点跟踪：新{'波谷' if long else '波峰'} {pivot_px:g} 确认"),
+                            cfg.env, source="guard",
+                        )
+                        if res_sl.status == "executed":
+                            m["pivot_stop"] = cand_stop
+                            changed = True
+                            lot["stop_loss"] = cand_stop
+                            msg_sl = f"拐点推止损：{who}顺势走出新{'波谷' if long else '波峰'} {pivot_px:g}，止损已上移至 {cand_stop:g}"
+                            self._emit(cfg.env, inst_id, "strategy", "action", msg_sl, None, {"lot_id": lot["id"]})
+                            self._algo(cfg.env, inst_id, "lock", msg_sl, "按实时拐点收紧止损", px=px)
             if m.get("now") != round(gain, 2):
                 m["now"] = round(gain, 2)
         if changed:
@@ -2296,7 +2329,8 @@ class Watcher:
             "px": px, "vol_ratio": round(j["ratio"], 2), "chg_pct": round((last.close / last.open - 1) * 100, 3), "score_long": j["scores"]["long"], "score_short": j["scores"]["short"],
             "trend": {"long": 1, "short": -1}.get(j["trend_side"], 0), "range_pos": round((px - lo) / (hi - lo) * 100, 1) if lo and hi and hi > lo else None,
             "spread_pct": book.get("spread_pct"), "book_bias": round(book["imbalance"] * 100) if book.get("imbalance") is not None else None,
-            "atr": atr5, **{k: old[k] for k in ("sig_long", "sig_short", "move_1m", "vol_1m") if k in old},  # 快的那几项由 _fast 写，这里原样留着
+            "atr": atr5, **st.wave.readings(px),
+            **{k: old[k] for k in ("sig_long", "sig_short", "move_1m", "vol_1m") if k in old},  # 快的那几项由 _fast 写，这里原样留着
         }
         shift_now = structure_shift(m5[-120:])
         turn = turn_watch(m5[-160:], shift_now, px)
@@ -2669,22 +2703,35 @@ class Watcher:
         return cfg
 
     async def _guard_orders(self, cfg: AgentConfig, account: AccountState, prices: dict[str, float]) -> None:
-        """Agent 挂的限价单：价格没成交就先到了撤单线、或者过了有效期，程序直接撤掉这一张，再告诉 Worker。不等模型。"""
+        """Agent 挂的限价单实时监控：
+        1. 价格没成交就先到了撤单线、过了有效期、或入场前失效 → 直接撤单；
+        2. 近区提前拐头追进（解决「看对方向但限价挂太下面踏空」）：计划挂单后价格已向挂单价回踩过半（或进入 0.6×ATR / 0.38% 近区），
+           未摸到挂单价便确认止跌/受阻反向拐头（WaveTracker 确认拐向交易方向），且按现价复算净盈亏比仍达标 → 自动撤掉低位废单改现价跟进。"""
         for inst in cfg.instruments:
             guards = self.trader.order_guards(cfg.env, inst)
             if not guards:
                 continue
             open_ids = {o.ord_id for o in account.orders if o.inst_id == inst}
             px, keep = prices.get(inst), []
+            st = self._state(inst)
+            m = self.strategies.metrics.get(inst) or {}
+            atr5 = float((m.get("values") or {}).get("atr") or 0.0)
             for g in guards:
                 if g["ord_id"] not in open_ids:  # 成交了或已经撤了；刚挂出去的几秒里账户快照可能还没有它
                     if now_ms() - g["ts"] < 10_000:
                         keep.append(g)
                     continue
+                long = g["side"] == "long"
+                sign = 1 if long else -1
+                if px and px > 0:
+                    prev_best = g.get("best_px")
+                    best_px = (min(prev_best, px) if prev_best else px) if long else (max(prev_best, px) if prev_best else px)
+                    if best_px != prev_best:
+                        g = {**g, "best_px": best_px}
                 why = ""
                 if g.get("expires_ts") and now_ms() >= g["expires_ts"]:
                     why = f"挂了 {round((now_ms() - g['ts']) / 60000)} 分钟没成交，过了有效期"
-                elif g.get("cancel_px") and px and (px >= g["cancel_px"] if g["side"] == "long" else px <= g["cancel_px"]):
+                elif g.get("cancel_px") and px and (px >= g["cancel_px"] if long else px <= g["cancel_px"]):
                     why = f"没成交前价格先到了撤单线 {g['cancel_px']:g}（现价 {px:g}）"
                 elif px and g.get("cancel_before_entry"):
                     shape = {"inst_id": inst, "ts": g["ts"], "params": {"cancel_before_entry": g["cancel_before_entry"]}, "state": {}}
@@ -2693,6 +2740,58 @@ class Watcher:
                     g = {**g, "cancel_state": eval_state}
                     if invalid:
                         why = f"入场前失效：{invalid}"
+
+                # 近区提前拐头追进：只针对空仓下的 Agent 计划挂单，且当前权限允许自动开仓
+                if (not why and px and g.get("plan") and not account.position(inst)
+                        and cfg.permission_for("open", inst) == "auto" and time.time() >= g.get("retry_at", 0)):
+                    best_px = float(g.get("best_px") or px)
+                    target_px = float(g["price"])
+                    placed_px = float(g.get("placed_px") or 0.0)
+                    gap_left = (best_px - target_px) * sign  # >0 表示差一点没摸到挂单价
+                    total_gap = (placed_px - target_px) * sign if placed_px > 0 else 0.0
+                    near_band = max(0.6 * atr5, target_px * 0.0038)
+                    came_close = 0 < gap_left <= near_band or (total_gap > 0 and 0 < gap_left <= total_gap * 0.55)
+                    rebound_pct = (px - best_px) * sign / best_px * 100 if best_px > 0 else 0.0
+                    wave_confirmed = st.wave.dir == sign and st.wave.turned_ts >= g["ts"] and rebound_pct >= WaveTracker.threshold_pct(px, atr5)
+                    terms = g.get("terms") or {}
+                    tps = terms.get("targets") or ([g["cancel_px"]] if g.get("cancel_px") else [])
+                    stop_loss = float(g.get("stop_loss") or 0.0)
+                    if came_close and wave_confirmed and stop_loss > 0 and tps:
+                        # 若新踩出的真实波谷/波峰比原止损更紧且留够安全距离，顺手把止损锚定到真实拐点外侧
+                        pivot_pad = max(0.5 * atr5, best_px * 0.0025)
+                        pivot_stop = float(f"{(best_px - sign * pivot_pad):.8g}")
+                        use_stop = pivot_stop if (pivot_stop - stop_loss) * sign > 0 and (px - pivot_stop) * sign > pivot_pad else stop_loss
+                        catch_plan = TradePlan(
+                            direction=g["side"], strategy=g.get("strategy") or "趋势回踩",
+                            entry_low=px, entry_high=px, stop_loss=use_stop, take_profits=list(tps),
+                            leverage=int(terms.get("leverage") or min(cfg.risk.max_leverage, 20)),
+                            risk_pct=terms.get("risk"), margin_usdt=terms.get("margin"),
+                            entry_type="now", invalidation=f"跌破拐点 {best_px:g}" if long else f"站上拐点 {best_px:g}",
+                        )
+                        chk = await self._check_plan(cfg, inst, catch_plan)
+                        if chk.ok:
+                            cancelled = await self.trader.execute(
+                                TradeAction(kind="cancel_orders", inst_id=inst, ord_id=g["ord_id"], reason=f"回踩至 {best_px:g} 提前拐头，撤低位单追进"),
+                                cfg.env, source="guard",
+                            )
+                            if cancelled.status == "executed" and await self._cancel_state(cfg, inst, g["ord_id"]) == "canceled":
+                                self._finish_plan_cancel(cfg, inst, g["ord_id"])
+                                for m_row in self.store.strategies(cfg.env, inst):
+                                    if m_row["kind"] == "manage" and m_row["params"].get("lot_id") == g.get("lot_id"):
+                                        self.strategies.cancel(m_row["id"], "原低位挂单已改为拐点现价追进")
+                                entered = await self._enter_now(
+                                    cfg, inst, catch_plan, chk,
+                                    f"回踩在 {best_px:g} 提前止跌拐头（+{rebound_pct:.2f}%），撤掉 {target_px:g} 挂单改现价追进（{chk.numbers()}）",
+                                    "拐点追单",
+                                )
+                                account.orders = [o for o in account.orders if o.ord_id != g["ord_id"]]
+                                msg = f"原限价{'买' if long else '卖'}单 @ {target_px:g} 回踩最低到 {best_px:g} 已提前拐头（{rebound_pct:+.2f}%），程序已自动撤旧改现价追进：{entered.message}"
+                                self._algo(cfg.env, inst, "rule", msg[:300], "近区拐头自动撤旧追进", g["side"], px)
+                                self.store.set(f"inbox:{cfg.env}:{inst}", [*self.inbox(cfg.env, inst), {"who": "拐点监控器", "text": msg, "ts": now_ms()}][-10:])
+                                continue
+                            keep.append({**g, "retry_at": time.time() + 30})
+                            continue
+
                 if not why or cfg.permission_for("cancel_orders", inst) == "off" or time.time() < g.get("retry_at", 0):
                     keep.append(g)
                     continue
@@ -3384,7 +3483,8 @@ class Watcher:
                     self.scores.tag(cfg.env, inst_id, plan.direction, plan.strategy, "计划挂限价单", ttl_minutes=(action.expires_minutes or 60) + 2, origin=self._origin(inst_id, plan, check, "计划"))
                     key = f"order_guard:{cfg.env}:{inst_id}"
                     terms = plan_terms(plan, style)
-                    self.store.set(key, [{**g, "plan": True, "stop_loss": plan.stop_loss, "terms": terms, "cancel_before_entry": terms.get("cancel_before_entry")} if g["ord_id"] == str(result.detail.get("ordId")) else g for g in self.trader.order_guards(cfg.env, inst_id)])
+                    placed_px = self._state(inst_id).last_px or 0.0
+                    self.store.set(key, [{**g, "plan": True, "placed_px": placed_px, "strategy": plan.strategy, "stop_loss": plan.stop_loss, "terms": terms, "cancel_before_entry": terms.get("cancel_before_entry")} if g["ord_id"] == str(result.detail.get("ordId")) else g for g in self.trader.order_guards(cfg.env, inst_id)])
                     if result.detail.get("lot_id"):
                         try:  # 成交之后的管理先布置好：挂单没成交时它只是等着
                             self.strategies.deploy(cfg, inst_id, "manage", "", {**manage_rules(plan, check, style), "lot_id": result.detail["lot_id"], "plan": True}, note="照计划挂单成交后的管理", by="计划")
@@ -3724,7 +3824,8 @@ class Watcher:
             f"距离：挂着等的入场区间离现价最好不超过 {cfg.limit_dist_for(cfg.style_for(inst_id)):g}%（你自己用 open_position 挂限价单时超过这个距离会被系统拒绝）。",
             f"【运行设置】{'模拟盘' if cfg.env == 'demo' else '实盘'}；{_permissions_text(cfg, inst_id)}；保证金模式 {cfg.margin_mode}；"
             f"最高杠杆 {r.max_leverage}x；单仓风险上限 {r.risk_per_trade_pct:g}% 权益；最多加仓 {r.max_adds} 次；"
-            f"{'允许' if r.allow_averaging_down else '禁止'}亏损加仓；当日亏损上限 {r.max_daily_loss_pct:g}%",
+            f"{'允许' if r.allow_averaging_down else '禁止'}亏损加仓；"
+            + (f"当日亏损上限 {r.max_daily_loss_pct:g}%" if r.max_daily_loss_pct > 0 else "当日亏损不限"),
             f"【叫醒原因】{reason}",
             f"【现在时间】{time.strftime('%Y-%m-%d %H:%M:%S')}（本地时间）",
             _trend_text(cfg.style_for(inst_id), snapshot, self.strategies.fresh_metrics(cfg.env, inst_id).get("shift")),
@@ -3750,6 +3851,10 @@ class Watcher:
                          + json.dumps({"quote": opening, "sampled_minutes": minutes}, ensure_ascii=False))
         if rec_snap:
             lines.append(f"【算法读数（程序持续采样）】{rec_snap}")
+        wave_text = self._state(inst_id).wave.summary(self._state(inst_id).last_px)
+        if wave_text:
+            lines.append(f"【盘中实时拐点与波幅（WaveTracker 秒级记录）】{wave_text}。"
+                         "注：若你挂的回踩限价单稍偏低，价格回踩进入近区未触单便提前拐头，程序会自动撤旧改现价追进；持仓浮盈 ≥1.2R 后走出新波谷/波峰，程序也会自动把止损推到新拐点外侧。")
         turn = metrics.get("shift")
         state = turn_state(turn, metrics.get("turn"), self._state(inst_id).last_retest)
         if state and state["stage"] == "early":

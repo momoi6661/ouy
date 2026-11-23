@@ -49,6 +49,7 @@ DATA = {
     "trend": "1 小时方向", "range_pos": "在区间里的位置%", "spread_pct": "点差%", "book_bias": "盘口买卖偏向",
     "turn_stage": "转折苗头",
     "sig_long": "快判做多分数", "sig_short": "快判做空分数", "move_1m": "最近一根 1 分钟涨跌幅%", "vol_1m": "1 分钟量比",
+    "wave_dir": "实时拐点走向", "wave_move_pct": "实时拐点幅度%", "retrace_pct": "占前段回撤比%",
 }
 DATA_HELP = {
     "shift_failure": "1=向上突破后失守，-1=向下突破后收回，0=尚未失守或已恢复；无近期结构或无有效报价时未知",
@@ -59,6 +60,9 @@ DATA_HELP = {
     "turn_stage": "看涨转折走到第几关为正、看跌为负：1 扫流动性，2 加动能背离，3 结构反转确认；0 = 没有",
     "sig_long": "快判现在给做多几分（0 = 没有信号；1 只有形态，带量 +1，顺大方向 +1）", "sig_short": "快判现在给做空几分",
     "move_1m": "最近一根收盘的 1 分钟 K 线从开盘到收盘的涨跌幅（%，每几秒更新）", "vol_1m": "最近一根收盘的 1 分钟 K 线的量 ÷ 前 20 根平均",
+    "wave_dir": "盘中实时拐点方向：1=从最近波谷向上拐头推进，-1=从最近波峰向下拐头回落，0=未分向",
+    "wave_move_pct": "当前这波从最近确认拐点走出的实时幅度（%，涨正跌负）",
+    "retrace_pct": "当前这波幅度占上一段完整波幅的百分比（用于识别回调到位拐头）",
 }
 RECORDER_MAX_CONDS = 4
 
@@ -720,7 +724,20 @@ class StrategyEngine:
         if when == "price_touch":
             previous = state.get("previous_px", px)
             state["previous_px"] = px
-            return previous < level <= px or previous > level >= px
+            if previous < level <= px or previous > level >= px:
+                return True
+            # Agent 划的观察/进场线：价格逼近到 0.22% 以内未触线便提前拐头弹开 ≥0.22% 时，按近线拐头触发，不再因差一点点踏空
+            if row["params"].get("observation") and level > 0:
+                start_side = state.setdefault("start_above", previous >= level)
+                gap_pct = abs(px - level) / level * 100
+                best_gap = state.get("closest_gap_pct", 999.0)
+                if (px >= level) == start_side and gap_pct < best_gap:
+                    state["closest_gap_pct"] = gap_pct
+                    state["closest_px"] = px
+                elif best_gap <= 0.22 and gap_pct - best_gap >= 0.22:
+                    state["near_turn"] = state.get("closest_px", px)
+                    return True
+            return False
         if when in ("close_above", "close_below"):
             if time.time() - state.get("checked" + key, 0) >= 15:  # K 线 15 秒查一次就够
                 state["checked" + key] = time.time()

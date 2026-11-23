@@ -200,11 +200,12 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   const saveLoss = (key: "risk_per_trade_pct" | "max_daily_loss_pct" | "emergency_exit_loss_pct", raw: string, label: string, max: number, reset: (v: string) => void) => {
     const value = Math.round(Number(raw) * 10) / 10;
     const old = cfg.risk[key];
-    if (!(value > 0) || value > max) return void (toast(`${label}要填 0 到 ${max} 之间的百分比`, "error"), reset(String(old)));
+    const allowZero = key === "max_daily_loss_pct";
+    if (!(allowZero ? value >= 0 : value > 0) || value > max) return void (toast(`${label}要填 ${allowZero ? "0（不限）" : "大于 0"} 到 ${max} 之间的百分比`, "error"), reset(String(old)));
     if (value === old) return;
-    // 调大就是放宽，能亏的钱变多：让你自己再确认一次
-    if (value > old && !window.confirm(`${label}从 ${old}% 放宽到 ${value}%？${cfg.env === "live" ? "现在是实盘，" : ""}放宽后 Agent 每次能亏的钱会变多。`)) return void reset(String(old));
-    saveCfg({ risk: { ...cfg.risk, [key]: value } }, `${label}已改成 ${value}%`);
+    const looser = (allowZero && value === 0 && old > 0) || (!allowZero || old > 0 ? value > old : false);
+    if (looser && !window.confirm(`${label}从 ${old || "不限"}${old ? "%" : ""} 改为 ${value ? `${value}%` : "不限"}？${cfg.env === "live" ? "现在是实盘，" : ""}放宽后可承受亏损上限会提高。`)) return void reset(String(old));
+    saveCfg({ risk: { ...cfg.risk, [key]: value } }, value ? `${label}已改成 ${value}%` : `${label}已设为不限`);
   };
   useEffect(() => {
     setLevMin(String(cfg.pref_leverage_min ?? 0));
@@ -342,9 +343,9 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             每笔最多亏
             <input type="number" min={0.1} max={10} step={0.1} value={lossTrade} onChange={(e) => setLossTrade(e.target.value)} onBlur={() => saveLoss("risk_per_trade_pct", lossTrade, "每笔最多亏", 10, setLossTrade)} />%
           </label>
-          <label className="pref" title="当天亏损到账户权益的这个比例后，Agent 不再开新仓，只许减仓和平仓">
+          <label className="pref" title="当天亏损到账户权益的这个比例后，Agent 不再开新仓；填 0 = 不限">
             当天最多亏
-            <input type="number" min={0.5} max={50} step={0.5} value={lossDay} onChange={(e) => setLossDay(e.target.value)} onBlur={() => saveLoss("max_daily_loss_pct", lossDay, "当天最多亏", 50, setLossDay)} />%
+            <input type="number" min={0} max={100} step={0.5} value={lossDay} onChange={(e) => setLossDay(e.target.value)} onBlur={() => saveLoss("max_daily_loss_pct", lossDay, "当天最多亏", 100, setLossDay)} />%
           </label>
           <label className="pref" title="单笔仓的浮亏到账户权益的这个比例时，不等 Agent 判断，立即市价平仓">
             单笔浮亏强平

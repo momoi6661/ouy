@@ -171,3 +171,61 @@ async def test_a_run_wakes_the_worker_once_per_step_and_is_recorded(rt, fake, mo
     assert len([e for e in rt.store.algo_events("demo", BTC) if e["algo"] == "run"]) == 2
     assert len([n for n in w.inbox("demo", BTC) if n.get("market_key") == "run"]) == 1
     assert w.ALGOS["run"] == "连续走线" and w.ALGO_LAYER["run"] == "read"
+
+
+def test_wave_tracker_records_pivots_direction_and_amplitude():
+    from ouy.agent.early_watch import WaveTracker
+
+    wt = WaveTracker()
+    assert not wt.update(1000, 100.0, atr5=0.5)
+    assert not wt.update(2000, 100.1, atr5=0.5)
+    assert wt.update(3000, 100.5, atr5=0.5)  # 向上拐头推进
+    assert wt.dir == 1 and wt.last_trough == 100.0
+    wt.update(4000, 102.0, atr5=0.5)  # 波峰拉到 102
+    assert wt.update(5000, 101.6, atr5=0.5)  # 从 102 回落超过阈值：确认波峰 102，转为向下回踩
+    assert wt.dir == -1 and wt.last_peak == 102.0 and wt.prev_pct == pytest.approx(2.0, abs=0.01)
+    wt.update(6000, 101.0, atr5=0.5)  # 回踩到 101.0
+    assert wt.update(7000, 101.35, atr5=0.5)  # 从 101.0 止跌向上拐头！
+    r = wt.readings(101.4)
+    assert wt.dir == 1 and wt.last_trough == 101.0 and r["wave_dir"] == 1 and r["wave_move_pct"] > 0.35
+    assert "波谷 101" in wt.summary(101.4)
+
+
+async def test_pullback_limit_catches_up_on_early_turn_and_position_trails_new_pivot(settings, fake):
+    from ouy.models import TradeAction
+    from .test_agent_and_api import REPORT
+    from .test_plan import PULLBACK, reporting
+
+    # 1. 当日亏损默认 0 = 不限：即使日初权益高，也不会设 halted
+    rt = make_rt(settings, fake, reporting({**REPORT, "plan": PULLBACK}))
+    rt.store.set(f"day:demo:{time.strftime('%Y-%m-%d')}", fake.cash * 3)
+    acct0 = await rt.trader.account("demo")
+    assert rt.config().risk.max_daily_loss_pct == 0 and not acct0.halted
+
+    # 2. SOL 场景：现价 60000 时挂 59700 回踩多单，价格回踩到 59800（过半）后提前止跌拐头弹回 59950 → 自动撤掉 59700 改现价追进
+    st = rt.watcher._state(BTC)
+    st.last_px = 60_000
+    await rt.watcher.review(BTC, "定时复盘")
+    assert len(fake.orders) == 1 and float(fake.orders[0]["px"]) == 59_700 and BTC not in fake.positions
+
+    t0 = int(time.time() * 1000) + 1000
+    for dt, px in ((0, 60_000), (1000, 59_800), (2000, 59_950)):
+        st.wave.update(t0 + dt, px, atr5=80.0)
+        fake.set_price(BTC, px)
+        st.last_px = px
+        await rt.watcher._guard_orders(rt.config(), await rt.trader.account("demo"), {BTC: px})
+
+    assert not fake.orders and fake.positions[BTC]["pos"] > 0
+    assert any("提前止跌拐头" in n["text"] or "提前拐头" in n["text"] for n in rt.watcher.inbox("demo", BTC))
+
+    # 3. 持仓浮盈 ≥1.2R 后走出新的更高波谷 60400 并向上推进到 60800 → 自动把止损推到新波谷 60400 外侧
+    rt.trader._lot_touch.clear()
+    await rt.trader.account("demo")
+    t1 = int(time.time() * 1000) + 5000
+    for dt, px in ((0, 60_650), (1000, 60_400), (2000, 60_800)):
+        st.wave.update(t1 + dt, px, atr5=80.0)
+        fake.set_price(BTC, px)
+        st.last_px = px
+        await rt.watcher._watch_lots(rt.config(), BTC, st, time.time())
+    new_sl = rt.trader.lots("demo", BTC)[0]["stop_loss"]
+    assert 60_200 < new_sl < 60_400

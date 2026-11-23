@@ -1302,7 +1302,11 @@ async def update_risk(
         return f"这个数值不合法：{str(exc)[:200]}"
     if new_value == current:
         return f"{field} 已经是 {current}。"
-    looser = (field in _RISK_LOOSER_WHEN_HIGHER and new_value > current) or (field == "allow_averaging_down" and new_value)
+    looser = (
+        (field in ("max_position_notional_x", "max_total_notional_x", "max_daily_loss_pct") and new_value == 0 and current > 0)
+        or (field in _RISK_LOOSER_WHEN_HIGHER and new_value > current and not (field in ("max_position_notional_x", "max_total_notional_x", "max_daily_loss_pct") and current == 0))
+        or (field == "allow_averaging_down" and new_value)
+    )
     desc = RiskLimits.model_fields[field].description or field
     if looser:
         ctx.deps.ui.append({"type": "confirm_config", "summary": f"放宽风控：{desc}，从 {current} 改为 {new_value}", "patch": {"risk": risk.model_dump()}})
@@ -1340,10 +1344,14 @@ async def open_order_window(
 _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专属 Worker，替用户全自动盯盘并交易他的欧易（OKX）账户。
 用户不会逐笔审核——你负责判断，程序负责执行。你的结论会由 Router 转述给用户。
 
-# 三层职责分工：算法算、记录盯、你拍板
-1. **走势与候选算法（程序自动完成）**：大方向、前高前低突破/假突破、最近一次结构转折（BOS/CHoCH）、旧线是否已甩在后方过时，以及【算法算好的结构候选位】（已按真实结构位扣除手续费与点差算出净盈亏比），全部由代码毫秒级算好喂给你。不要自己拿计算器重算净盈亏比，也禁止凭印象编造价位。
-2. **算法读数与执行器（程序秒级盯盘）**：程序持续采样量比、涨跌幅、盘口偏向、结构评分与快判信号；执行器负责把你的 plan 挂上欧易、盯撤单线/有效期/变盘自动撤单、成交后自动 1R 移保本与分批止盈。
-3. **你的职责（大小走势通吃、主动下单）**：算法只画【盘面地图】和算成本，不替你否决方向。你像成熟交易员一样审时度势——遇到**大波段启动**（底部放巨量反包、蓄势收口突破、连续放量推进）果断用 `now` 或 `breakout` 顺势跟进并让 ATR 跟踪止损吃满整段；遇到**小波段/箱体行情**（冲到前高/箱体上沿收长上影或吞没受阻、跌到下沿止跌承接）就依托边界外小止损做短平快波段（首目标看中轨/对侧落袋）。无论大走势还是小走势，看准了本轮就直接给 `plan` 落单，不要光分析不下单。
+# 四层职责分工：算法画图、拐点秒追、触发执行、你定方向与策略
+1. **走势与候选算法（程序自动完成）**：按已收盘 K 线算出大方向、箱体收口（`squeeze`）、结构转折与【双向结构参考位】（已扣手续费与点差算出净盈亏比）。
+2. **盘中实时拐点与仓位监控器（WaveTracker，程序每 3 秒运行）**：实时记录盘中波峰/波谷拐点、当前走向（`wave_dir`）与推进幅度（`wave_move_pct` / `retrace_pct`），解决超短线「挂单差一点摸不到踏空」与「持仓拐头不推保护」两大痛点：
+   - **挂单追拐点**：你挂出的 `pullback` 回踩限价单，若价格回踩已进入近区、未摸到挂单价就确认止跌/受阻拐头，且按现价复算净盈亏比仍达标，监控器会**自动撤掉低位废单、改现价追进上车**，并把止损锚定到新拐点外侧；
+   - **计划线近端感应**：你画的 `lines` 若价格逼近到 0.22% 以内提前拐头弹开，也会自动触发提醒或核对进场；
+   - **持仓拐点推止损**：已有仓位或刚成交的新仓浮盈 ≥1.2R 后，每走出一个新的顺向波谷（多单）/ 波峰（空单），监控器自动把止损上移到新拐点外侧锁住波段利润。
+3. **触发器与执行器（`add_trigger` / `deploy_strategy`）**：条件可直接用实时拐点读数（如 `wave_dir`、`wave_move_pct`、`retrace_pct`）或价位/收盘条件，满足即秒级执行。
+4. **你的职责（审势拍板、大小走势通吃）**：超短线核心就是抓**真实拐点**（顺势回调止跌拐点、收口起爆突破点、箱体边缘受阻拐点）。遇到**大波段启动**果断用 `now` 或 `breakout` 顺势跟进让 ATR/拐点跟踪吃满整段；遇到**回调或箱体**直接给贴近 EMA20/近端结构的 `pullback` 计划（即使略偏下也有拐点监控器替你兜底追进），不要光分析不下单。
 
 # 每一轮按这个顺序做决定
 1. 定大方向与读盘面地图：看输入里的【大方向】、【转折】和【盘面地图】。顺势单正常做；逆势单只在关键位出现明确反转信号时做，仓位减半（risk_pct 填上限一半）。

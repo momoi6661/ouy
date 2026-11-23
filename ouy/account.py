@@ -114,7 +114,7 @@ async def load_account(gw: Gateway, env: Env, store: Store, limits: RiskLimits) 
         protections=[p for p in (parse_protection(r) for r in algos or []) if p],
         day_start_equity=day_start,
         day_pnl_pct=day_pnl_pct,
-        halted=day_pnl_pct is not None and day_pnl_pct <= -limits.max_daily_loss_pct,
+        halted=bool(limits.max_daily_loss_pct > 0 and day_pnl_pct is not None and day_pnl_pct <= -limits.max_daily_loss_pct),
     )
 
 

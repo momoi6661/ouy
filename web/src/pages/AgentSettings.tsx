@@ -242,8 +242,8 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
               <Num value={cfg.risk.risk_per_trade_pct} onChange={(v) => risk({ risk_per_trade_pct: n(v, 1) })} min={0.1} max={10} step={0.1} suffix="%" />
             </label>
             <label className="field">
-              <span>当日亏损上限</span>
-              <Num value={cfg.risk.max_daily_loss_pct} onChange={(v) => risk({ max_daily_loss_pct: n(v, 5) })} min={0.5} max={50} step={0.5} suffix="%" />
+              <span>当日亏损上限（0 = 不限）</span>
+              <Num value={cfg.risk.max_daily_loss_pct} onChange={(v) => risk({ max_daily_loss_pct: n(v, 0) })} min={0} max={100} step={0.5} suffix="%" />
             </label>
             <label className="field">
               <span>紧急平仓线（单仓浮亏占权益）</span>

@@ -167,7 +167,7 @@ class RiskLimits(BaseModel):
     max_total_notional_x: float = Field(0, ge=0, le=1000, description="全部持仓名义价值 ≤ 权益 × 该倍数；0 = 不限（默认）")
     max_adds: int = Field(2, ge=0, le=10, description="同一持仓最多加仓次数")
     allow_averaging_down: bool = Field(False, description="是否允许亏损时加仓（摊平）。默认只允许浮盈加仓")
-    max_daily_loss_pct: float = Field(5.0, gt=0, le=50, description="当日亏损达到权益该比例后只许减仓/平仓")
+    max_daily_loss_pct: float = Field(0.0, ge=0, le=100, description="当日亏损达到权益该比例后只许减仓/平仓；0 = 不限（默认关闭）")
     emergency_exit_loss_pct: float = Field(2.5, gt=0, le=50, description="单个持仓浮亏达到权益该比例时不等 Agent，立即市价平仓")
 
 
