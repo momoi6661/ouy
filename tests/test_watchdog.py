@@ -10,6 +10,61 @@ from pydantic_ai.models.function import FunctionModel
 from .test_agent_and_api import BTC, make_rt
 
 
+def test_market_candidates_are_coalesced_and_wait_for_review_cooldown(rt):
+    w, cfg = rt.watcher, rt.config()
+    st = w._state(BTC)
+    clock = time.time()
+    st.last_review_ts, st.next_due_ts = clock, clock + 300
+    w.interject(BTC, "过时行情", "走势记录器", market_key="candidate")
+    w.interject(BTC, "最新合格候选", "走势记录器", market_key="candidate")
+    notes = w.inbox(cfg.env, BTC)
+    assert len(notes) == 1 and notes[0]["text"] == "最新合格候选"
+    st.has_market_mail = True
+    assert w._trigger(cfg, st, None, clock + 1) is None
+    assert w._trigger(cfg, st, None, clock + cfg.min_review_seconds + 1) == "新行情候选待复核"
+    st.has_mail = True
+    assert w._trigger(cfg, st, None, clock + 1) == "信箱里有新的留言要处理"
+
+
+async def test_transient_authorization_failure_samples_market_and_resumes(rt, fake, monkeypatch):
+    w = rt.watcher
+    rt.save_config(rt.config().model_copy(update={"instruments": [BTC]}))
+    clock = time.time()
+    attempts = []
+    real_account = rt.trader.account
+    real_sleep = asyncio.sleep
+
+    async def account(env=None):
+        attempts.append(clock)
+        if len(attempts) == 1:
+            from ouy.okx.gateway import OkxError
+
+            raise OkxError("No credentials found.", code="ConfigError")
+        w.running = False
+        return await real_account(env)
+
+    async def advance(seconds):
+        nonlocal clock
+        clock += seconds
+        await real_sleep(0)
+
+    async def review(*args):
+        return None
+
+    monkeypatch.setattr(rt.trader, "account", account)
+    monkeypatch.setattr("ouy.agent.watcher.time.time", lambda: clock)
+    monkeypatch.setattr(w, "_review_task", review)
+    with monkeypatch.context() as patch:
+        patch.setattr("ouy.agent.watcher.asyncio.sleep", advance)
+        w.running = True
+        await w._loop()
+    assert attempts[1] - attempts[0] >= 10
+    assert fake.called("market_get_ticker") and not fake.called("swap_place_order")
+    assert fake.called("market_get_candles")
+    assert not w.last_error and not w._auth_retry_at
+    assert any("账户读取已恢复" in row["title"] for row in rt.store.journal("demo"))
+
+
 @pytest.mark.parametrize("wake", ["always", "event"])
 async def test_failure_backoff_blocks_automatic_wakes_but_keeps_rules_running(rt, fake, monkeypatch, wake):
     w = rt.watcher
@@ -41,14 +96,15 @@ async def test_failure_backoff_blocks_automatic_wakes_but_keeps_rules_running(rt
     assert len(calls) == 1
 
 
-async def test_continuous_mode_respects_the_workers_next_check(rt, fake, monkeypatch):
+async def test_scheduled_look_waits_for_the_bar_close_in_continuous_mode(rt, fake, monkeypatch):
     w = rt.watcher
     cfg = rt.config().model_copy(update={"instruments": [BTC], "wake": "always", "intel_minutes": 0})
     rt.save_config(cfg)
     st = w._state(BTC)
-    clock = time.time()
-    st.last_review_ts, st.last_review_px = clock - 60, fake.prices[BTC]
-    st.next_due_ts = clock + 120
+    clock = 1_800_000_000.0 + 60  # 整小时过 1 分钟
+    st.last_review_ts, st.last_review_px, st.had_position = clock, fake.prices[BTC], False
+    st.next_due_ts = w._next_look(cfg, BTC, st, clock)
+    assert st.next_due_ts == 1_800_000_000 + 3600 + 10  # 日内空仓：下一根 1 小时 K 线收盘后 10 秒
     calls = []
 
     async def review(*args):
@@ -61,12 +117,92 @@ async def test_continuous_mode_respects_the_workers_next_check(rt, fake, monkeyp
     monkeypatch.setattr(w, "_review_task", review)
     monkeypatch.setattr(w, "_algo_tick", algo)
     monkeypatch.setattr("ouy.agent.watcher.time.time", lambda: clock)
-    await w._tick(cfg)
-    assert st.task is None and calls == []
-    clock += 121
+    for clock in (clock + 300, clock + 1800, 1_800_000_000 + 3600 + 5):  # 收盘之前怎么轮询都不叫醒
+        await w._tick(cfg)
+        assert st.task is None and calls == []
+    clock = 1_800_000_000 + 3600 + 11
     await w._tick(cfg)
     await st.task
-    assert len(calls) == 1 and calls[0][2] is False
+    assert len(calls) == 1 and calls[0][1] == "定时复盘" and calls[0][2] is False
+
+
+def test_next_look_follows_style_position_and_skips_a_close_that_is_too_near(rt):
+    w, st, hour = rt.watcher, rt.watcher._state(BTC), 1_800_000_000
+    cfg = rt.config().model_copy(update={"style": "scalp"})
+    st.had_position = False
+    assert w._next_look(cfg, BTC, st, hour + 60) == hour + 900 + 10  # 超短线空仓：15 分钟一次
+    assert w._next_look(cfg, BTC, st, hour + 800) == hour + 1800 + 10  # 离收盘不到三分之一根：顺延一根
+    st.had_position = True
+    assert w._next_look(cfg, BTC, st, hour + 60) == hour + 300 + 10  # 有仓：每根结构周期 K 线
+    st.had_position = False
+    assert w._next_look(cfg.model_copy(update={"style": "swing"}), BTC, st, hour + 60) == hour // 14_400 * 14_400 + 14_400 + 10
+
+
+async def test_market_events_are_capped_per_hour_and_carried_into_the_next_look(rt, fake, monkeypatch):
+    w = rt.watcher
+    cfg = rt.config().model_copy(update={"instruments": [BTC], "wake": "always", "intel_minutes": 0, "max_event_wakes": 2})
+    rt.save_config(cfg)
+    st = w._state(BTC)
+    clock = 1_800_000_000.0 + 60
+    st.last_review_ts, st.last_review_px, st.had_position = clock - 600, fake.prices[BTC], False
+    st.next_due_ts = clock + 3000
+    calls = []
+
+    async def review(inst, reason, gate=False):
+        calls.append(reason)
+        st.last_review_ts, st.reviewing = clock, False
+        st.pending_wakes, st.pending_hard = [], False
+        rt.store.delete(f"inbox:demo:{BTC}")
+
+    async def algo(*args):
+        pass
+
+    monkeypatch.setattr(w, "_review_task", review)
+    monkeypatch.setattr(w, "_algo_tick", algo)
+    monkeypatch.setattr("ouy.agent.watcher.time.time", lambda: clock)
+
+    async def event(text):
+        nonlocal clock
+        clock += 120
+        w.interject(BTC, text, "走势记录器", market_key="run")
+        await w._tick(cfg)
+        if st.task:
+            await st.task
+            st.task = None
+
+    await event("第一段")
+    await event("第二段")
+    assert calls == ["新行情候选待复核"] * 2
+    await event("第三段")
+    await event("第四段")
+    assert len(calls) == 2 and st.budget_hold  # 超过上限：不叫醒，事件留在信箱里
+    skips = [a for a in rt.store.activity("demo", inst_id=BTC) if a["kind"] == "skip"]
+    assert len(skips) == 1 and "上限 2" in skips[0]["text"]  # 只提示一次，不是每个节拍都记
+    assert [n["text"] for n in w.inbox("demo", BTC)] == ["第四段"]
+    w.interject(BTC, "把止损挪一下")  # 用户留言不受上限约束
+    clock += 1
+    await w._tick(cfg)
+    await st.task
+    st.task = None
+    assert "信箱里有新的留言" in calls[-1] and "新行情候选待复核" in calls[-1] and len(calls) == 3  # 攒着的事件跟着一起送
+    await event("第五段")
+    assert len(calls) == 3
+    clock = st.next_due_ts + 1  # 到了定时看盘的时间：攒着的事件一起送
+    await w._tick(cfg)
+    await st.task
+    assert len(calls) == 4 and not st.budget_hold
+
+
+def test_wake_only_lines_wait_for_the_cooldown_but_executed_rules_do_not(rt):
+    w, cfg = rt.watcher, rt.config()
+    st = w._state(BTC)
+    clock = time.time()
+    st.last_review_ts, st.next_due_ts = clock, clock + 300
+    st.has_line_mail = True
+    assert w._trigger(cfg, st, None, clock + 1) is None
+    assert w._trigger(cfg, st, None, clock + cfg.min_review_seconds + 1) == "你划的线到了，回报在信箱里"
+    st.has_mail = True
+    assert w._trigger(cfg, st, None, clock + 1) == "信箱里有新的留言要处理"
 
 
 async def test_model_failure_restores_unread_events(settings, fake):

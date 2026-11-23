@@ -46,8 +46,9 @@ class Runtime:
         self.settings = settings
         self.store = store or Store(settings.data_dir / "ouy.db")
         self.bus = EventBus()
-        self.gateway: Gateway = Patient(gateway or Shared(OkxGateway(settings)))  # type: ignore[assignment]
-        self.auth = auth or OkxAuth(settings)
+        auth_lock = asyncio.Lock()
+        self.gateway: Gateway = Patient(gateway or Shared(OkxGateway(settings, auth_lock=auth_lock)))  # type: ignore[assignment]
+        self.auth = auth or OkxAuth(settings, auth_lock=auth_lock)
         self.market = Market(self.gateway)
         self.kb = KnowledgeBase(settings)
         self.trader = Trader(self.gateway, self.market, self.store, self.bus, self.config)
@@ -135,8 +136,6 @@ class Runtime:
         for inst in list(self.watcher.states):
             if inst not in new.instruments:
                 st = self.watcher.states.pop(inst)
-                if st.observe_task:
-                    st.observe_task.cancel()
                 if st.task and not st.task.done():
                     st.task.cancel()
         self.bus.publish("agent", self.watcher.status())
@@ -152,13 +151,13 @@ class Runtime:
         """欧易登录状态。查一次要起官方命令行（一两秒）：页面每次刷新都会问，所以 fresh=False 时 15 秒内直接用上次的结果。"""
         cached = getattr(self, "_auth_cache", None)
         # 已经登录时不用查得那么勤：每查一次都要起一个官方授权进程，和取令牌的进程挤在一起
-        if not fresh and cached and time.time() - cached[0] < (60 if cached[1].get("status") == "logged_in" else 15):
+        if cached and time.time() - cached[0] < (60 if cached[1].get("status") == "logged_in" else (0 if fresh else 15)):
             return cached[1]
         status = await self.auth.status()
         self._auth_cache = (time.time(), status)
-        if self._auth_status and status["status"] != self._auth_status:
+        previous, self._auth_status = self._auth_status, status["status"]
+        if previous and previous != "logged_in" and self._auth_status == "logged_in":
             await self.gateway.restart()  # 让官方组件重新读取令牌
-        self._auth_status = status["status"]
         return status
 
     async def swap_meta(self, env: str) -> dict[str, Any]:
@@ -199,6 +198,20 @@ class RecorderIn(BaseModel):
     conds: list[CondIn] = Field(..., min_length=1, max_length=4)
     note: str = Field("", max_length=200)
     cooldown_minutes: int = Field(15, ge=1, le=1440)
+
+
+class LineIn(BaseModel):
+    """用户自己划的一条触发线：到了什么条件 → 做什么。"""
+    inst_id: str = Field(..., max_length=40)
+    when: Literal["price_touch", "close_above", "close_below"] = "price_touch"
+    level: float = Field(..., gt=0)
+    bar: Literal["5m", "15m", "1H"] = "15m"
+    do: Literal["wake", "cancel_orders", "close", "open"] = "wake"
+    side: Literal["long", "short"] | None = None
+    stop_loss: float | None = Field(None, gt=0)
+    take_profit: float | None = Field(None, gt=0)
+    note: str = Field("", max_length=200)
+    valid_minutes: int = Field(720, ge=5, le=10080)
 
 
 class RecorderEdit(BaseModel):
@@ -334,8 +347,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         warm = asyncio.create_task(rt.kb.warmup())
         if rt.store.get("agent_running"):
             try:
-                if (await rt.auth_status())["status"] == "logged_in":
-                    await rt.watcher.start()
+                await rt.watcher.start(recover_auth=True)
             except Exception as exc:  # noqa: BLE001
                 log.warning("自动恢复盯盘失败：%s", exc)
         yield
@@ -444,6 +456,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     async def login(request: Request):
         rt = rt_of(request)
         result = await rt.auth.login()
+        rt._auth_cache = None
         rt._auth_status = result.get("status", "pending")
         return result
 
@@ -459,6 +472,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         await rt.auth.logout()
         await rt.gateway.restart()
         rt._auth_status = "not_logged_in"
+        rt._auth_cache = None
         return {"ok": True}
 
     # ---------- 行情 ----------
@@ -909,6 +923,27 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         try:
             params = {**recorder_params([c.model_dump() for c in body.conds]), "do": "wake", "wake_note": body.note or "用户设的记录器到了，按现在的行情判断要不要做", "cooldown_minutes": body.cooldown_minutes}
             row = rt.watcher.strategies.deploy(rt.config(), body.inst_id.upper(), "trigger", "", params, source="user", note=body.note)
+        except Rejected as exc:
+            raise HTTPException(400, str(exc)) from exc
+        rt.bus.publish("agent", rt.watcher.status())
+        return row
+
+    @app.post("/api/lines")
+    async def line_add(request: Request, body: LineIn):
+        """用户划一条触发线：价格到了、或者 K 线收盘越过这个价位时，叫醒 Worker、撤掉这个币的挂单、平掉这个币的仓位，
+        或者按写好的止损止盈市价进场。只执行一次，照样过权限和硬性风控。"""
+        rt = rt_of(request)
+        opening = body.do == "open"
+        if not opening and (body.side or body.stop_loss or body.take_profit):
+            raise HTTPException(400, "方向、止损、止盈只在「到了就开仓」时填。")
+        params = {
+            "when": body.when, "level": body.level, "bar": body.bar if body.when != "price_touch" else None,
+            "do": "open_market" if opening else body.do, "expires_minutes": body.valid_minutes,
+            "stop_loss": body.stop_loss, "take_profit": body.take_profit,
+            "wake_note": (body.note or "你划的线到了，按现在的行情判断要不要做") if body.do == "wake" else None,
+        }
+        try:
+            row = rt.watcher.strategies.deploy(rt.config(), body.inst_id.upper(), "trigger", (body.side or "") if opening else "", params, source="user", note=body.note)
         except Rejected as exc:
             raise HTTPException(400, str(exc)) from exc
         rt.bus.publish("agent", rt.watcher.status())

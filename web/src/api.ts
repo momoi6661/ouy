@@ -105,7 +105,7 @@ export interface AgentConfig {
   instruments: string[];
   margin_mode: "cross" | "isolated";
   tick_seconds: number;
-  review_seconds: number;
+  max_event_wakes: number;
   min_review_seconds: number;
   /** 记录器算多空分数用的标准 */
   setup_min_score: number;
@@ -304,8 +304,8 @@ export interface Report {
   no_plan_reason?: "" | "cost" | "objection" | "limit" | "no_edge";
   /** 程序照计划做了什么：executed 已进场 / armed 已布置等触发 / kept 沿用上一轮 / skipped 没通过核对 / pending 等你同意 / cancelled 已撤 / failed */
   plan_order?: { status: string; text: string; strategy_id?: number; pending_id?: number; ord_id?: string } | null;
-  watch_levels: { price: number; note: string }[];
-  next_check_seconds: number;
+  /** 计划线：到了由程序执行。wake 叫醒 Worker / cancel 撤掉入场 / enter 按现价进场 */
+  lines?: { price: number; note: string; when?: "price_touch" | "close_above" | "close_below"; bar?: string | null; do?: "wake" | "cancel" | "enter"; side?: "long" | "short" | null; stop_loss?: number | null; take_profit?: number | null }[];
   ts: number;
   price: number;
   reason: string;
@@ -890,6 +890,8 @@ export const api = {
     post<{ id: number }>(`/api/lots/${id}/profit-guard`, rules),
   strategyAct: (id: number, verb: "approve" | "cancel") => post<Strategy>(`/api/strategies/${id}/${verb}`),
   editStrategy: (id: number, patch: { conds?: RecorderCond[]; level?: number; cooldown_minutes?: number; off?: boolean }) => post<Strategy>(`/api/strategies/${id}/edit`, patch),
+  addLine: (body: { inst_id: string; when: "price_touch" | "close_above" | "close_below"; level: number; bar?: string; do: "wake" | "cancel_orders" | "close" | "open"; side?: "long" | "short"; stop_loss?: number; take_profit?: number; note?: string }) =>
+    post<Strategy>("/api/lines", body),
   addRecorder: (body: { inst_id: string; conds: RecorderCond[]; note: string; cooldown_minutes: number }) => post<Strategy>("/api/recorders", body),
   interject: (inst: string, message: string) => post<{ delivered: boolean; message: string }>("/api/agent/interject", { inst_id: inst, message }),
   standby: (inst: string, on: boolean) => post<AgentStatus>("/api/agent/standby", { inst_id: inst, on }),

@@ -364,7 +364,7 @@ class Trader:
             return ""
         return (
             f"限价 {action.price:g} 离现价 {last:g} 有 {dist:.2f}%，超过了{STYLE_LABEL.get(style, style)}允许的 {limit:g}%，这样的单很可能一直成交不了。"
-            "方向成立就改用市价单（order_type=market）现在进场，止损按现价重新放在结构位之外；否则把价格挂到允许的距离以内，或者这次不下单、把这个价位写进 watch_levels。"
+            "方向成立就改用市价单（order_type=market）现在进场，止损按现价重新放在结构位之外；否则把价格挂到允许的距离以内，或者这次不下单、把这个价位写成一条计划线（lines）。"
         )
 
     async def approve(self, pending_id: int) -> ActionResult:
@@ -510,7 +510,9 @@ class Trader:
         if action.kind == "set_stops":
             if not pos:
                 raise Rejected(f"{action.inst_id} 没有持仓，没法设置止盈止损。")
-            risk.check_stop_update(pos, action.stop_loss, action.take_profit, account=account, inst=inst, limits=cfg.risk, last_px=last)
+            old = await self._protections(pos, env) if action.stop_loss is not None else []
+            risk.check_stop_update(pos, action.stop_loss, action.take_profit, account=account, inst=inst, limits=cfg.risk, last_px=last,
+                                   current_stop=self._covered_stop(pos, old, last))
         elif action.kind == "set_leverage":
             self._check_leverage(action, inst)
         return None
@@ -753,6 +755,17 @@ class Trader:
             and r.get("side") == ("sell" if pos.side == "long" else "buy")
         ]
 
+    @staticmethod
+    def _covered_stop(pos: Position, protections: list[dict[str, Any]], last: float) -> float | None:
+        stops = [row for row in protections if _f(row.get("slTriggerPx")) > 0]
+        if len(stops) != 1:
+            return None
+        row = stops[0]
+        if _f(row.get("closeFraction")) != 1 and abs(_f(row.get("sz")) - pos.contracts) > 1e-9:
+            return None
+        stop = _f(row["slTriggerPx"])
+        return stop if (0 < stop < last if pos.side == "long" else 0 < last < stop) else None
+
     async def _amend_protection(self, inst_id: str, old: dict[str, Any], sl: str | None, tp: str | None, env: Env) -> dict[str, Any]:
         oid = old.get("algoId")
         if not oid:
@@ -761,16 +774,19 @@ class Trader:
         for leg, price in (("Sl", sl), ("Tp", tp)):
             key = leg.lower()
             if price is not None and _f(price) != _f(old.get(key + "TriggerPx")):
-                args.update({f"new{leg}TriggerPx": price, f"new{leg}OrdPx": old.get(key + "OrdPx") or "-1"})
+                args.update({
+                    f"new{leg}TriggerPx": price,
+                    f"new{leg}OrdPx": old.get(key + "OrdPx") or "-1",
+                    f"new{leg}TriggerPxType": old.get(key + "TriggerPxType") or "last",
+                })
         if len(args) > 2:
             rows = await self._call("swap_amend_algo_order", args, env)
             if not any(r.get("algoId") == oid and str(r.get("sCode")) == "0" for r in rows or []):
                 raise Rejected(f"保护单 {oid} 修改回执未核实，请先核对，不重挂。")
         return {"algo_id": oid, "stop_loss": sl or old.get("slTriggerPx"), "take_profit": tp or old.get("tpTriggerPx")}
 
-    async def _replace_stops(self, pos: Position, account: AccountState, sl: str | None, tp: str | None, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
+    async def _replace_stops(self, pos: Position, old: list[dict[str, Any]], sl: str | None, tp: str | None, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
         """已有整仓保护时原位修改；不能为换价先撤掉保护。"""
-        old = await self._protections(pos, env)
         if preflight:
             preflight()
         whole = [r for r in old if _f(r.get("closeFraction")) == 1 or not _f(r.get("sz"))]
@@ -821,10 +837,13 @@ class Trader:
         lot = self._lot(action, env)
         if lot and len([l for l in self.store.lots(env, action.inst_id) if l["status"] == "open"]) > 1:
             return await self._set_lot_stops(lot, pos, action, inst, last, env, preflight=preflight)
-        risk.check_stop_update(pos, action.stop_loss, action.take_profit, account=account, inst=inst, limits=self.get_config().risk, last_px=last)
         sl = round_price(action.stop_loss, inst.tick_sz) if action.stop_loss else None
         tp = round_price(action.take_profit, inst.tick_sz) if action.take_profit else None
-        applied = await self._replace_stops(pos, account, sl, tp, env, preflight=preflight)
+        old = await self._protections(pos, env)
+        risk.check_stop_update(pos, float(sl) if sl is not None else None, float(tp) if tp is not None else None,
+                               account=account, inst=inst, limits=self.get_config().risk, last_px=last,
+                               current_stop=self._covered_stop(pos, old, last))
+        applied = await self._replace_stops(pos, old, sl, tp, env, preflight=preflight)
         for row in self.store.lots(env, action.inst_id):
             if row["status"] == "open":
                 self.store.update_lot(row["id"], stop_loss=_f(applied["stop_loss"]) or None, take_profit=_f(applied["take_profit"]) or None, algo_id="")

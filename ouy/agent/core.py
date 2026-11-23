@@ -65,6 +65,7 @@ class Deps:
     trace: list[list[dict[str, Any]]] = field(default_factory=list)  # Router 派出去的每个 Worker 任务的工具调用记录
     ui: list[dict[str, Any]] = field(default_factory=list)  # 要界面执行的动作（切换图表、打开下单窗、确认卡片）
     plan_check: Any = None  # 复盘专用：结论交出来之前，程序核对一遍「空仓有没有给计划 / 计划过不过得了核对」，有问题退回去改
+    lines_check: Any = None  # 复盘专用：核对计划线（空仓时上下都要有、进场线过不过得了核对）；退回过一次之后把过不了的进场线改成只叫醒
     nudged: bool = False  # 这一轮的结论已经被退回过一次（只退一次，第二次原样收下）
     set_quant: Any = None  # Worker 专用：切换这个币的量化算法档位与方向锁
 
@@ -576,7 +577,7 @@ async def add_trigger(
     """写一条触发器：「条件 → 确定动作」。条件满足时程序直接执行这个动作（挂单、开仓、平仓、减仓、移止损、撤单），不再叫醒你思考。
     注意：常规单笔开仓计划直接填在结论的 plan 里即可（程序会自动在欧易挂真实限价单并布置 1R 保本与分批止盈），不需要再重复写触发器！
     触发器专门用于 plan 表达不了的条件动作（例如「15m 收盘站上某价才挂单」「持仓浮盈回吐 40% 平仓」「数据指标达标开仓」）。
-    到价观察写进 watch_levels。若判断必须等指定周期收盘，用 close_above / close_below + do=wake 布置一次性提醒，wake_note 写明届时核对什么。
+    到价或收盘越线之后进场、撤单、叫醒你，直接写进结论的 lines（计划线），不用在这里写。
     条件 when（+ level）：
     - price_above / price_below：价格 ≥ / ≤ level。
     - close_above / close_below：bar 周期的 K 线收盘在 level 上方 / 下方（要填 bar；只认写下之后才收盘的 K 线）。
@@ -617,7 +618,7 @@ async def add_trigger(
             "[不用写复核触发器] 盯盘复盘时不要用 add_trigger(do=task / wake) 推迟决定："
             "等价格回踩进场直接写进本轮结论的 plan（entry_type='pullback'，程序会在欧易直接挂出真实限价单）；"
             "到条件要直接执行的动作选 open_limit / open_market / close / reduce / set_stops / cancel_orders；"
-            "到价观察放进 watch_levels。需要收盘后判断可用 close_above / close_below + do=wake 一次性提醒。"
+            "到价或收盘越线后要叫醒你、进场、撤单的，写进结论的 lines（计划线）。"
         )
     if ctx.tool_call_approved:  # 之前挂起等用户同意，现在同意了
         row = engine.store.get_strategy((ctx.tool_call_metadata or {}).get("strategy_id") or 0)
@@ -1026,7 +1027,7 @@ async def ask_subagent(ctx: RunContext[Deps], inst_id: str, role: Literal["intel
     """派你小组里的一个子代理去做事，等它回来再继续。子代理都不能下单。
     role=intel 情报（资金费率、持仓量、新闻、情绪）；role=smart 聪明钱（顶级交易员在这个币上的多空和持仓）；
     role=risk 风险复核（下单前把你打算做的单——方向、入场、止损、杠杆、保证金——写进 task，让它复核）。
-    子代理不会自己定时更新，也不是每次复盘都要派：只有准备做的单比较大或杠杆高、行情看不清、或者逆势补仓之前才派。
+    inst_id 是要研究的品种，报告交回给你自己的任务。遇到大盘背景、消息或风险需要分别调查时，可分派后综合。
     用户在设置里关掉的子代理不能派（输入里的【你能派的子代理】是当前可用的）。"""
     if ctx.deps.sub is None:
         return "[不可用] 现在不能派子代理。"
@@ -1040,6 +1041,7 @@ async def ask_subagent(ctx: RunContext[Deps], inst_id: str, role: Literal["intel
 async def spawn_subagent(ctx: RunContext[Deps], inst_id: str, name: str, task: str, keep: bool = False) -> str:
     """临时开一个子代理替你去查一件事，等它把结果交回来再继续。它是你现场写出来的：name 是你给它起的名字（比如「关键位核对」「ETF 资金流」），
     task 里把要它做什么、看哪些数据、最后要回答什么写清楚——它看不到你的上下文，只看得到 task。
+    inst_id 是研究对象，例如你负责 SOL 时可以派它去查 BTC，它仍归你管理，只向你交回结果。需要转交时按用户明确交代处理。
     它只有只读工具（行情、K 线、盘口、资金费率、持仓量、新闻，接口支持时还能联网搜索），不能下单、不能改任何东西。
     可以在同一步里同时开几个，让它们并行去查不同的事。不要为了查一个你自己调一次工具就能拿到的数字去开子代理；
     适合用在：要同时核对好几件事、要搜外部消息、要把一个大问题拆开分别查、或者想要一个不受你现有看法影响的第二意见。
@@ -1055,7 +1057,7 @@ async def spawn_subagent(ctx: RunContext[Deps], inst_id: str, name: str, task: s
 
 @toolset.tool
 async def close_subagent(ctx: RunContext[Deps], inst_id: str, name: str) -> str:
-    """关掉一个你之前留着（keep=true）的子代理：它从团队图上消失，记得的东西也一起丢掉。留着的子代理用不上了就关，不要堆着。"""
+    """按名字关掉一个你之前留着（keep=true）的子代理。inst_id 填你负责的品种。"""
     if ctx.deps.close_sub is None:
         return "[不可用] 现在不能关子代理。"
     return str(ctx.deps.close_sub(inst_id.strip().upper(), name.strip()[:20]))
@@ -1204,7 +1206,7 @@ async def set_worker(
     quant_mode: Literal["auto", "trend", "range", "breakout", "quiet"] | None = None,
     quant_bias: Literal["both", "long", "short"] | None = None,
 ) -> str:
-    """单独设置某个品种的 Worker：唤醒方式（event 有事才唤醒 / always 一直唤醒）、用哪个模型（空字符串表示恢复默认）、思考强度、暂停或恢复、
+    """单独设置某个品种的 Worker：定时看盘时怎么办（event 没变化就跳过 / always 每次都看）、用哪个模型（空字符串表示恢复默认）、思考强度、暂停或恢复、
     出手尺度 stance（cautious 保守 / balanced 均衡 / active 积极）、入场方式 entry_mode（market 市价优先 / limit 挂单优先 / auto 它自己定）、
     量化算法档位 quant_mode（auto 自动 / trend 顺势回踩 / range 震荡箱体 / breakout 收敛突破 / quiet 静默防守）及方向锁 quant_bias（both / long / short）。
     stance / entry_mode 传 global 表示这个 Worker 不再单独设、跟全局走。只改传了的那几项。这个币的交易风格用 set_trading_style 改。"""
@@ -1553,8 +1555,7 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
   他同意或拒绝之后结果会原样回到你手上，你从那里接着做（成交了就管理仓位，被拒绝了就调整计划）。
 - 工具拒绝时记录原因，不能把限价改成市价追单；提交结果不明先核对订单号、成交和持仓，不盲目重试。
 - 查不到的信息（新闻、财经日历、持仓量历史）当作「没有已知的反对信号」，不构成不开仓的理由。
-- 已定动作交给 add_trigger 执行。若还需要判断某周期收盘后的结构，可设置一次性 close_above / close_below + do=wake，填写 bar、有效期和复核要点，先检查是否已有相同提醒。
-  watch_levels 只留给确实没法事先定下动作的位置。
+- 到价或收盘越线之后要做的事写进结论的 lines（计划线），程序到了直接执行。lines 表达不了的条件（按算法读数、按持仓或时间、减仓、移止损）才用 add_trigger。
 - remember 只记新的东西（这个币的脾气、用户的要求、这笔做对做错了什么）；工作记忆里已经有的，不要换个说法再记一遍。
 - 你是这个币小组的组长，手下有不能下单的子代理，用 ask_subagent 派它们：intel（情报）、smart（聪明钱）、risk（下单前风险复核）。
   它们不会自己定时更新，平常你自己看盘面就够了；单子比较大或杠杆高、行情看不清、或者逆势补仓之前再派。
@@ -1567,16 +1568,22 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
 - no_plan_reason：空仓又不给 plan 时必填。
   有通过预检的候选、当前无入场委托或规则时，优先复核能否备单。若方向、成本和时机都认可，唯一缺的是回到入场价，就交 pullback plan 挂单等待；还缺结构确认就写清触发条件；不采用时说明具体候选和否决依据。
 - on_signal：快判信号的事先授权，见「快判」一节；拿不准就留 verify。
-- watch_levels：最多 6 个需要你到时再判断的关键价位，note 里写到这里要判断什么。价格到了只会叫醒你，不会自动做任何事。
-  空仓等结构确认时，从当前风格的结构周期（超短线 5m、日内 15m、波段 1H）选最近能改变决定的真实高低点或突破回踩位，写清到价后还要看哪根收盘、什么表现成立或失效。有明确价位就划线，没有结构依据就说明等什么。触线后逐项核对上轮条件：满足且现价仍可执行就给 plan，缺确认就写明缺哪一步，已经失效就撤掉旧线。
-- next_check_seconds：行情平静时可以长一些，持仓中或接近关键位时短一些（60~180）。
+- lines（计划线）：每轮必交，这是你两次看盘之间唯一留下的预案。最多 8 条，每条 = 一个真实的结构位 + 怎么算到了（when）+ 到了做什么（do）。
+  空仓时现价上方至少一条、下方至少一条，缺了程序会退回：往上走到哪里你要做什么、往下走到哪里你要做什么，都要事先定好，不能只押一个方向。
+  do=enter：到了程序按现价进场（填 side、stop_loss、take_profit、strategy）。只在「到了这里我不用再看一眼就愿意做」时用；进场前程序照样核对扣费后的盈亏比和风控，过不了会改成叫醒你。
+  一条进场线成交后，其余进场线和挂着的入场单自动作废，不会两边都成交。
+  do=cancel：到了说明原计划失效，程序撤掉还没成交的入场挂单和入场策略。do=wake：到了叫醒你来看（拿不准、还要看收盘表现的位置）。
+  when=price_touch 是报价碰到；要等收盘确认用 close_above / close_below 和 bar（默认当前风格的结构周期）。
+  上一轮的线还合适就照原样再写一遍（价位和动作不变就不会被重设）；到过一次的线在有效期内不会再触发，要再用就换一个价位。
+- 定时看盘由程序按 K 线收盘安排（空仓：超短线每 15 分钟、日内每小时、波段每 4 小时一次；有仓：每根结构周期 K 线一次），你不用也不能要求「过一会儿再看」。
+  两次看盘之间只有事件会叫醒你：计划线和触发器到了、转折、连续走线、成交和持仓变化。
 """
 
 _CHAT = """你是用户的加密货币永续合约交易助手，也是一名纪律严明的交易员。用户正在盯盘页面上直接和你说话，
 让你帮他分析行情、给出交易方案、操作他的欧易（OKX）账户。消息开头会告诉你他正在看哪个品种。
 
 怎么回答：
-- 用中文，像人说话一样简洁直接，先给结论再给理由。不要用 summary / plan / watch_levels 这类分段标题，不要输出 JSON。
+- 用中文，像人说话一样简洁直接，先给结论再给理由。不要用 summary / plan / lines 这类分段标题，不要输出 JSON。
 - 所有价格和账户数字必须来自工具返回的真实数据，禁止编造。拿不到数据就如实说。
 - 知识库是你的交易手册，拿不准时用 search_knowledge 查了再答。
 
@@ -1629,12 +1636,16 @@ def build_trader_agent(model: Model | str, kb: KnowledgeBase, limit: Any = None)
         """结论必须落到一个决定上：空仓时要么给出过得了核对的 plan（程序会照着下单），要么选一个不出手的原因。
         有问题就把具体的数字退回去让它改；只退一次，免得一轮复盘卡死在这里。"""
         deps = ctx.deps
-        if ctx.partial_output or not isinstance(out, CycleReport) or deps.plan_check is None or deps.nudged:
+        if ctx.partial_output or not isinstance(out, CycleReport):
             return out
-        problem = await deps.plan_check(out, deps)
-        if problem:
+        problems = []
+        if deps.lines_check is not None and (problem := await deps.lines_check(out, deps)):
+            problems.append(problem)
+        if deps.plan_check is not None and not deps.nudged and (problem := await deps.plan_check(out, deps)):
+            problems.append(problem)
+        if problems and not deps.nudged:
             deps.nudged = True
-            raise ModelRetry(problem)
+            raise ModelRetry("\n\n".join(problems))
         return out
 
     return agent

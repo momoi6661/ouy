@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from ..config import Settings
-from .runtime import child_env, find_bin
+from .runtime import child_env, mcp_command
 
 log = logging.getLogger("ouy.okx")
 
@@ -34,9 +35,9 @@ class OkxError(RuntimeError):
     @property
     def needs_login(self) -> bool:
         text = str(self).lower()
-        return self.code in ("AUTH_MISSING", "ConfigError", "AuthenticationError") or any(
-            key in text for key in ("no credentials", "not logged in", "auth login", "401")
-        )
+        return self.code in ("401", "AUTH_MISSING", "ConfigError", "AuthenticationError") or any(
+            key in text for key in ("no credentials", "not logged in", "auth login")
+        ) or re.search(r"\b(?:http(?: status)?|status(?: code)?)\s*[:=]?\s*401\b", text) is not None
 
 
 @dataclass(frozen=True)
@@ -264,10 +265,11 @@ class _Server:
     async def _run(self) -> None:
         assert self._ready is not None
         try:
+            command, args = mcp_command()
             params = StdioServerParameters(
-                command=find_bin("okx-trade-mcp"),
+                command=command,
                 # 官方组件默认把每一次调用（含返回的全部行情）写进 ~/.okx/logs，一天能写 1 GB：只留失败的那几条，排查掉登录、报错时用得上
-                args=["--modules", "all", f"--{self.env}", "--site", self.settings.okx_site, "--log-level", "error"],
+                args=[*args, "--modules", "all", f"--{self.env}", "--site", self.settings.okx_site, "--log-level", "error"],
                 env=child_env(self.settings),
             )
             async with AsyncExitStack() as stack:
@@ -302,13 +304,13 @@ class _Server:
 
 
 class OkxGateway:
-    def __init__(self, settings: Settings, *, timeout: float = 30):
+    def __init__(self, settings: Settings, *, timeout: float = 30, auth_lock: asyncio.Lock | None = None):
         self.settings = settings
         self.timeout = timeout
         self._servers: dict[str, _Server] = {}
         self._locks: dict[str, asyncio.Lock] = {"demo": asyncio.Lock(), "live": asyncio.Lock()}
         self._tools: list[ToolInfo] | None = None
-        fetch = asyncio.Lock()  # 模拟盘、实盘两个子进程各有自己的令牌缓存，但取令牌这一步两边也不能撞在一起
+        fetch = auth_lock or asyncio.Lock()
         self._gates: dict[str, TokenGate] = {"demo": TokenGate(lock=fetch), "live": TokenGate(lock=fetch)}
 
     async def _server(self, env: Env) -> _Server:

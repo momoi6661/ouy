@@ -197,14 +197,17 @@ def size_entry(
     )
 
 
-def check_stop_update(pos: Position, stop_loss: float | None, take_profit: float | None, *, account: AccountState, inst: Instrument, limits: RiskLimits, last_px: float) -> None:
-    """移动止损止盈：不能设在现价错误的一侧，也不能把止损放宽到超出风险上限。"""
+def check_stop_update(pos: Position, stop_loss: float | None, take_profit: float | None, *, account: AccountState, inst: Instrument, limits: RiskLimits, last_px: float, current_stop: float | None = None) -> None:
+    """同方向改保护：超过预算时允许维持或降低已核实的整仓风险。"""
     check_stop_side(pos.side, last_px, stop_loss, take_profit, what="现价")
     if stop_loss is not None and account.equity > 0:
         risk = position_risk(pos, stop_loss, inst.ct_val)
         budget = account.equity * limits.risk_per_trade_pct / 100
-        if risk > budget * 1.1:
+        current_risk = position_risk(pos, current_stop, inst.ct_val) if current_stop is not None else None
+        if risk > budget * 1.1 and (current_risk is None or risk > current_risk):
+            current = f"当前风险 {current_risk:.4g} USDT，" if current_risk is not None else ""
             raise Rejected(
-                f"止损放到 {stop_loss:g} 的话整仓风险 {risk:.2f} USDT，超过上限 {budget:.2f} USDT。"
-                "止损只能收紧不能放宽；想给更多空间请先减仓。"
+                f"{current}止损设到 {stop_loss:g} 后整仓风险为 {risk:.4g} USDT，"
+                f"超过按账户权益 {limits.risk_per_trade_pct:g}% 计算的单仓预算 {budget:.4g} USDT。"
+                "请收紧止损或减仓。"
             )

@@ -101,7 +101,7 @@ async def test_open_attaches_stop_and_sets_leverage(rt, fake):
 async def test_stop_can_tighten_but_not_loosen(rt, fake):
     await rt.trader.submit(open_action(), source="agent")
     loose = await rt.trader.submit(TradeAction(kind="set_stops", inst_id=BTC, stop_loss=58_000), source="agent")
-    assert loose.status == "rejected" and "只能收紧" in loose.message
+    assert loose.status == "rejected" and "单仓预算" in loose.message
     fake.set_price(BTC, 60_800)
     tight = await rt.trader.submit(TradeAction(kind="set_stops", inst_id=BTC, stop_loss=60_050, take_profit=63_000), source="agent")
     assert tight.status == "executed", tight.message
@@ -109,15 +109,34 @@ async def test_stop_can_tighten_but_not_loosen(rt, fake):
     assert fake.algos[0]["slTriggerPx"] == "60050" and fake.algos[0]["closeFraction"] == "1" and fake.algos[0]["ordType"] == "oco"
     # 第二次修改：已经有整仓保护单，不能再挂一张（51088），只应改原单止盈。
     original = fake.algos[0]["algoId"]
+    fake.algos[0]["tpTriggerPxType"] = "mark"
     writes = len(fake.called("swap_place_algo_order")), len(fake.called("swap_cancel_algo_orders"))
     changed = await rt.trader.submit(TradeAction(kind="set_stops", inst_id=BTC, take_profit=64_000), source="agent")
     assert changed.status == "executed" and fake.algos[0]["algoId"] == original
     assert fake.algos[0]["tpTriggerPx"] == "64000" and fake.algos[0]["slTriggerPx"] == "60050"
     assert "newSlTriggerPx" not in fake.called("swap_amend_algo_order")[-1]
+    assert fake.called("swap_amend_algo_order")[-1]["newTpTriggerPxType"] == "mark"
     fake.fail["swap_amend_algo_order"] = "price rejected"
     failed = await rt.trader.submit(TradeAction(kind="set_stops", inst_id=BTC, take_profit=65_000), source="agent")
     assert not failed.ok and fake.algos[0]["tpTriggerPx"] == "64000"
     assert writes == (len(fake.called("swap_place_algo_order")), len(fake.called("swap_cancel_algo_orders")))
+
+
+async def test_stop_can_reduce_risk_even_when_position_remains_above_budget(rt, fake):
+    entry = await rt.trader.submit(open_action(), source="user")
+    assert entry.status == "executed"
+    fake.cash = 1000
+    too_loose = TradeAction(kind="set_stops", inst_id=BTC, stop_loss=59_350)
+    improved = TradeAction(kind="set_stops", inst_id=BTC, stop_loss=59_650)
+    denied = await rt.trader.submit(too_loose, source="user")
+    assert denied.status == "rejected" and "当前风险" in denied.message
+    await rt.trader._dry_run(improved, "demo")
+    accepted = await rt.trader.submit(improved, source="user")
+    assert accepted.status == "executed", accepted.message
+    assert fake.algos[0]["slTriggerPx"] == "59650"
+    again = await rt.trader.submit(TradeAction(kind="set_stops", inst_id=BTC, stop_loss=59_700), source="user")
+    assert again.status == "executed", again.message
+    assert fake.called("swap_amend_algo_order")[-1]["newSlTriggerPxType"] == "last"
 
 
 async def test_pyramid_add_then_reduce_then_close(rt, fake):

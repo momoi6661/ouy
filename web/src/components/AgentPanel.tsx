@@ -189,13 +189,19 @@ export function AgentPanel({ inst, agent, config, pending, account = null, onCha
               )}
               <PlanExecution inst={inst} report={report} account={account} onChanged={onChanged} />
 
-              {report.watch_levels.length > 0 && (
+              {(report.lines ?? []).length > 0 && (
                 <div className="levels">
-                  <h4>盯盘价位（到价立刻叫醒 Agent）</h4>
-                  {report.watch_levels.map((l, i) => (
+                  <h4>计划线（到了程序直接执行）</h4>
+                  {[...(report.lines ?? [])].sort((x, y) => y.price - x.price).map((l, i) => (
                     <div key={i} className="level">
                       <b>{fmtPx(l.price)}</b>
-                      <span>{l.note}</span>
+                      <span>
+                        <em>
+                          {l.when === "close_above" ? `${l.bar ?? ""} 收盘站上 → ` : l.when === "close_below" ? `${l.bar ?? ""} 收盘跌破 → ` : "到价 → "}
+                          {l.do === "enter" ? `${l.side === "long" ? "做多" : "做空"}（止损 ${fmtPx(l.stop_loss ?? 0)}，止盈 ${fmtPx(l.take_profit ?? 0)}）` : l.do === "cancel" ? "撤掉入场挂单" : "叫醒 Worker"}
+                        </em>
+                        {" "}{l.note}
+                      </span>
                     </div>
                   ))}
                 </div>

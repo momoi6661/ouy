@@ -389,8 +389,8 @@ class StrategyEngine:
                 raise Rejected(f"{KINDS[kind]['label']}缺少参数：{'、'.join(missing)}")
 
         if kind == "trigger":
-            if p.get("observation") and (p.get("when"), p.get("do")) != ("price_touch", "wake"):
-                raise Rejected("观察线只支持碰价时叫醒 Worker。")
+            if p.get("observation") and (p.get("do") != "wake" or p.get("when") not in ("price_touch", "close_above", "close_below")):
+                raise Rejected("观察线支持触价或确认收盘越线时叫醒 Worker。")
             need("when", "do")
             if p["do"] not in TRIGGER_DO:
                 raise Rejected(f"触发器的操作只能是 {' / '.join(TRIGGER_DO)}。")
@@ -771,6 +771,7 @@ class StrategyEngine:
                 self.on_task(cfg.env, inst, row["id"], cond, p["task"], p["do"] == "router_task")
             again = [(i, level) for i, (when, level, _) in enumerate(trigger_conds(p)) if when == "every_minutes"]
             if not again and not repeat:
+                state["runs"], state["last_run"] = state.get("runs", 0) + 1, now_ms()
                 return "done", f"{cond} 已满足，{what}"
             for i, level in again:  # 反复执行的：排下一次
                 state[f"next{i}"] = now_ms() + level * 60_000

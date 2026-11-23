@@ -27,7 +27,7 @@ export function levelsOf(e: JournalEntry): PastLevel[] {
       add(plan.stop_loss, "sl", "当时止损");
       (plan.take_profits ?? []).forEach((tp: number, i: number) => add(tp, "tp", `当时止盈${i + 1}`));
     }
-    for (const l of e.body?.watch_levels ?? []) add(l.price, "watch", "当时盯盘位");
+    for (const l of e.body?.lines ?? e.body?.watch_levels ?? []) add(l.price, "watch", "当时的计划线");  // watch_levels 是改名前的旧记录
     if (out.length) add(e.body?.price, "price", "当时价格");
   } else if (e.kind === "action") {
     const a = e.body?.action ?? {};

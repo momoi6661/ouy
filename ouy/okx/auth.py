@@ -56,34 +56,41 @@ def _last_json(text: str) -> dict[str, Any] | None:
 
 
 class OkxAuth:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, *, auth_lock: asyncio.Lock | None = None):
         self.settings = settings
         self._lock = asyncio.Lock()
         self._status_lock = asyncio.Lock()
+        self._auth_lock = auth_lock or asyncio.Lock()
         self._cached: dict[str, Any] | None = None
         self._cached_at = 0.0
         self.last_error = ""
 
     async def _run(self, *args: str, timeout: float = 60, binary: str | None = None) -> tuple[int, str, str]:
-        proc = await asyncio.create_subprocess_exec(
-            binary or find_bin("okx"),
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_env(self.settings),
-        )
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout)
-        except asyncio.TimeoutError as exc:
-            proc.kill()
-            raise OkxAuthError("欧易授权组件响应超时，请检查网络或代理设置。") from exc
+        async with self._auth_lock:
+            proc = await asyncio.create_subprocess_exec(
+                binary or find_bin("okx"),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=child_env(self.settings),
+            )
+            try:
+                out, err = await asyncio.wait_for(proc.communicate(), timeout)
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise OkxAuthError("欧易授权组件响应超时，请检查网络或代理设置。") from exc
         return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
     async def status(self) -> dict[str, Any]:
         """当前授权状态。等待授权期间每次查询都会向欧易确认一次，所以这里排队并限速。"""
         async with self._status_lock:
             before = self._cached
-            if before and before["status"] == "pending" and time.monotonic() - self._cached_at < POLL_INTERVAL:
+            ttl = 60 if before and before["status"] == "logged_in" else POLL_INTERVAL
+            if before and time.monotonic() - self._cached_at < ttl:
                 return before
             binary = _auth_binary()
             if binary:

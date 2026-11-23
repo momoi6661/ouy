@@ -127,9 +127,9 @@ export function WorkersPanel({ agent, config, account, inst, onSelect, onChanged
                     title="这个 Worker 的唤醒方式"
                     onChange={(e) => save(id, { wake: (e.target.value || null) as Wake | null }, "唤醒方式已修改")}
                   >
-                    <option value="">跟随全局（{config.wake === "always" ? "一直唤醒" : "有事才唤醒"}）</option>
-                    <option value="event">有事才唤醒</option>
-                    <option value="always">一直唤醒</option>
+                    <option value="">跟随全局（{config.wake === "always" ? "定时都看" : "没变化就跳过"}）</option>
+                    <option value="event">没变化就跳过</option>
+                    <option value="always">定时都看</option>
                   </select>
                 </div>
                 <div className="wk-ctl">

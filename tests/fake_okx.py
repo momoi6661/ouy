@@ -228,8 +228,12 @@ class FakeOkx:
     def _swap_amend_algo_order(self, args: dict) -> list:
         row = next(a for a in self.algos if a["algoId"] == args["algoId"] and a["instId"] == args["instId"])
         for key in ("Sl", "Tp"):
+            if f"new{key}TriggerPx" in args and args.get(f"new{key}TriggerPxType") not in ("last", "mark", "index"):
+                raise OkxError(f"Parameter new{key}TriggerPxType error", tool="swap_amend_algo_order", code="51000")
+        for key in ("Sl", "Tp"):
             if f"new{key}TriggerPx" in args:
                 row[key.lower() + "TriggerPx"] = args[f"new{key}TriggerPx"]
+                row[key.lower() + "TriggerPxType"] = args[f"new{key}TriggerPxType"]
         return [{"algoId": row["algoId"], "sCode": "0"}]
 
     def _swap_cancel_order(self, args: dict) -> list:

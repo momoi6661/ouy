@@ -76,6 +76,46 @@ def test_only_private_tools_need_the_token():
     assert not needs_token("market_get_candles")
 
 
+def test_login_error_is_distinct_from_unrelated_error_codes():
+    from ouy.okx.gateway import OkxError
+
+    assert OkxError("HTTP 401 Unauthorized").needs_login
+    assert OkxError("No credentials found.", code="ConfigError").needs_login
+    assert not OkxError("Exchange error 50401, reference 40123").needs_login
+
+
+async def test_authorization_cli_and_gateway_share_the_refresh_lock(settings, monkeypatch):
+    from ouy.okx.auth import OkxAuth
+
+    lock = asyncio.Lock()
+    gate = TokenGate(lock=lock)
+    auth = OkxAuth(settings, auth_lock=lock)
+    entered, release, cli_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def fetch():
+        entered.set()
+        await release.wait()
+        return SimpleNamespace(is_error=False)
+
+    async def spawn(*args, **kwargs):
+        cli_started.set()
+
+        async def communicate():
+            return b"{}", b""
+
+        return SimpleNamespace(communicate=communicate, returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    tool = asyncio.create_task(gate.run(fetch))
+    await entered.wait()
+    status = asyncio.create_task(auth._run("status", binary="test-auth"))
+    await asyncio.sleep(0)
+    assert not cli_started.is_set()
+    release.set()
+    await asyncio.gather(tool, status)
+    assert cli_started.is_set()
+
+
 async def test_shared_gateway_does_not_repeat_the_same_account_query():
     """同样的账户查询：正在路上的共用一个结果，短时间内的用缓存；下过单之后缓存作废。"""
     from ouy.okx.gateway import Shared

@@ -27,23 +27,52 @@ def add(rt, **p):
     return rt.watcher.strategies.deploy(rt.config(), BTC, "trigger", side, p, note="测试")
 
 
-async def test_observation_rules_at_same_price_have_separate_delivery_and_state(rt, fake):
+async def test_observation_lines_are_kept_across_reviews_and_fire_once(rt, fake):
     watcher = rt.watcher
-    watcher._state(BTC).report = {"ts": 123, "price": 60_000, "watch_levels": [
-        {"price": 60_100, "note": "first"}, {"price": 60_100, "note": "second"},
+    st = watcher._state(BTC)
+
+    def lines():
+        return {r["strategy_id"]: r for r in watcher.rules("demo", BTC) if r["type"] == "watch" and r["status"] == "waiting"}
+
+    st.report = {"ts": 1, "price": 60_000, "lines": [
+        {"price": 60_100, "note": "first"}, {"price": 60_100, "note": "same line again"}, {"price": 59_500, "note": "下沿"},
     ]}
     watcher._sync_observation_rules(rt.config(), BTC)
+    first = lines()
+    assert sorted(r["level"] for r in first.values()) == [59_500, 60_100]  # 同价位同条件只算一条线
+    assert all(r["mode"] == r["action"] == "wake" and not r["repeat"] for r in first.values())
+
+    # 下一轮：一条线措辞变了、价位只挪了一点点（当同一条），一条没再划，另划了一条新的
+    st.report = {"ts": 2, "price": 60_000, "lines": [{"price": 60_110, "note": "还是前高"}, {"price": 61_000, "note": "新线"}]}
+    watcher._sync_observation_rules(rt.config(), BTC)
+    second = lines()
+    kept = next(i for i, r in first.items() if r["level"] == 60_100)
+    assert kept in second and second[kept]["level"] == 60_100 and second[kept]["note"] == "还是前高"
+    assert sorted(r["level"] for r in second.values()) == [60_100, 61_000]
+    gone = next(i for i, r in first.items() if r["level"] == 59_500)
+    assert rt.store.get_strategy(gone)["status"] == "cancelled"
+
     await tick(rt, fake, 60_100)
-    notes = [e["text"] for e in watcher.inbox("demo", BTC)]
-    rules = [r for r in watcher.rules("demo", BTC) if r["type"] == "watch"]
-    assert len(rules) == 2 and all(r["runs"] == 1 for r in rules)
-    assert all(r["mode"] == r["action"] == "wake" for r in rules)
+    notes = watcher.inbox("demo", BTC)
+    assert len(notes) == 1 and notes[0].get("soft") and "还是前高" in notes[0]["text"]  # 叫醒时带的是最新的说明
+    assert rt.store.get_strategy(kept)["status"] == "done"
+    await tick(rt, fake, 60_000)
+    await tick(rt, fake, 60_100)
+    assert len(watcher.inbox("demo", BTC)) == 1  # 到过一次就结束，不反复叫
+
+    # 到过的线在有效期内不重设；价位真的变了才是一条新线
+    st.report = {"ts": 3, "price": 60_100, "lines": [{"price": 60_100, "note": "再看一次"}, {"price": 61_000, "note": "新线"}]}
+    watcher._sync_observation_rules(rt.config(), BTC)
+    assert sorted(r["level"] for r in lines().values()) == [61_000]
+    st.report = {"ts": 4, "price": 60_100, "lines": [{"price": 60_400, "note": "换了位置"}]}
+    watcher._sync_observation_rules(rt.config(), BTC)
+    assert sorted(r["level"] for r in lines().values()) == [60_400]
+
     wake_trigger = add(rt, when="price_above", level=60_300, do="wake")
     rule = next(r for r in watcher.rules("demo", BTC) if r["strategy_id"] == wake_trigger["id"])
     assert rule["type"] == "trigger" and rule["action"] == "wake"
     with pytest.raises(Rejected, match="观察线"):
         add(rt, when="price_touch", level=60_300, observation=True, do="open_market", side="long", stop_loss=59_900)
-    assert any("first" in note for note in notes) and any("second" in note for note in notes)
     assert not fake.positions and not fake.orders
 
 
@@ -65,6 +94,38 @@ async def test_cancel_during_condition_evaluation_takes_precedence(rt, fake, mon
     await task
     assert rt.store.get_strategy(rule["id"])["status"] == "cancelled"
     assert not rt.watcher.inbox("demo", BTC)
+
+
+async def test_worker_close_observation_wakes_once_on_future_confirmed_bar(rt, fake, monkeypatch):
+    watcher = rt.watcher
+    st = watcher._state(BTC)
+    st.report = {"ts": 123, "price": 60_000, "lines": [
+        {"price": 59_900, "note": "日内结构转弱", "when": "close_below"},
+    ]}
+    watcher._sync_observation_rules(rt.config(), BTC)
+    rule, = rt.store.strategies("demo", BTC)
+    opened = rule["ts"] - 60_000
+    clock = rule["ts"] + 850_000
+    bars = [Candle(opened, 60_000, 60_020, 59_700, 59_800, 1, False)]
+
+    async def candles(*args):
+        return bars
+
+    monkeypatch.setattr(rt.market, "candles", candles)
+    monkeypatch.setattr("ouy.strategy.now_ms", lambda: clock)
+    await tick(rt, fake, 59_800)
+    assert not watcher.inbox("demo", BTC)
+    bars[0] = Candle(opened, 60_000, 60_020, 59_700, 59_800, 1, True)
+    clock += 16_000
+    monkeypatch.setattr("ouy.strategy.time.time", lambda: clock / 1000)
+    await tick(rt, fake, 59_800)
+    assert "日内结构转弱" in watcher.inbox("demo", BTC)[0]["text"]
+    assert rt.store.get_strategy(rule["id"])["status"] == "done"
+    assert rt.store.get_strategy(rule["id"])["state"]["runs"] == 1
+    st.report["ts"] += 1
+    watcher._sync_observation_rules(rt.config(), BTC)
+    assert not rt.store.strategies("demo", BTC)
+    assert not fake.called("swap_place_order")
 
 
 async def test_strategy_approval_requires_current_environment_and_unexpired_rule(rt, monkeypatch):
@@ -490,3 +551,35 @@ async def test_user_adds_edits_and_switches_off_a_recorder(settings, fake):
         assert (await client.post("/api/recorders", json={"inst_id": BTC, "conds": [{"data": "没有这项", "op": "above", "level": 1}]})).status_code == 400
         rule = next(x for x in (await client.get("/api/agent/status")).json()["instruments"][BTC]["rules"] if x["strategy_id"] == row["id"])
         assert rule["recorder"] and rule["off"] and rule["conds"][0]["level"] == 0.2 and rule["by"] == "你"
+
+
+async def test_user_can_draw_a_line_that_wakes_cancels_closes_or_opens(rt, fake):
+    """用户自己划的触发线：一句「到了什么 → 做什么」，不带观察线标记（Worker 重新划线时不会把它撤掉），只执行一次。"""
+    import httpx
+
+    from ouy.app import create_app
+
+    watcher, app = rt.watcher, create_app(rt)
+    async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver") as client:
+        async def line(**body):
+            return await client.post("/api/lines", json={"inst_id": BTC, **body})
+
+        wake = (await line(when="price_touch", level=60_200, do="wake", note="前高")).json()
+        assert wake["status"] == "armed" and wake["params"]["by"] == "你" and not wake["params"].get("observation")
+        opened = (await line(when="price_touch", level=60_300, do="open", side="long", stop_loss=59_900, take_profit=61_000)).json()
+        assert opened["params"]["do"] == "open_market" and opened["side"] == "long"
+        assert (await line(when="close_below", level=59_000, bar="15m", do="cancel_orders")).json()["params"]["bar"] == "15m"
+        bad = await line(when="price_touch", level=60_300, do="open", side="long", stop_loss=60_900)
+        assert bad.status_code == 400 and "止损放错边" in bad.json()["detail"]
+        assert (await line(when="price_touch", level=60_300, do="open", stop_loss=59_900)).status_code == 400  # 开仓要给方向
+        assert (await line(when="price_touch", level=60_300, do="close", stop_loss=59_900)).status_code == 400
+
+        watcher._state(BTC).report = {"ts": 9, "price": 60_000, "lines": []}
+        watcher._sync_observation_rules(rt.config(), BTC)  # Worker 这一轮一条线都没划：用户的线不受影响
+        assert rt.store.get_strategy(wake["id"])["status"] == "armed"
+        await tick(rt, fake, 60_000)
+        await tick(rt, fake, 60_200)
+        assert rt.store.get_strategy(wake["id"])["status"] == "done" and not fake.positions
+        assert any(n.get("soft") and "前高" in n["text"] for n in watcher.inbox("demo", BTC))
+        await tick(rt, fake, 60_300)
+        assert rt.store.get_strategy(opened["id"])["status"] == "done" and fake.positions

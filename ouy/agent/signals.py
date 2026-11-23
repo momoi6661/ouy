@@ -424,3 +424,32 @@ def turn_state(shift: dict[str, Any] | None, radar: dict[str, Any] | None, retes
     return {"stage": stage, "label": TURN_STAGES[stage], "side": shift["side"], "kind": shift["kind"], "ts": (mine or shift)["ts"], "level": shift["level"],
             "origin": shift.get("origin"), "bars_ago": shift.get("bars_ago"), "text": text, "confirmed": shift,
             **({"entry": swept["entry"], "stop": swept["stop"], "status": swept["status"]} if swept else {})}
+
+
+RUN_BARS = 3  # 至少连着几根
+RUN_ATR = 3.0  # 每走出这么多倍平均波幅算一档
+
+
+def trend_run(bars: Sequence[Candle]) -> dict[str, Any] | None:
+    """连续走线：最近几根已收盘 K 线的收盘价一根接一根朝同一个方向走，而且合起来走出了平时好几根的幅度。
+
+    只说明「正在连着走」，不说明接下来往哪走。step 是走到第几档（每 RUN_ATR 倍平均波幅一档），同一段走线每升一档才算一次新事件。"""
+    closed = [c for c in bars if c.confirmed]
+    if len(closed) < 14 + RUN_BARS + 2:
+        return None
+    sign = (closed[-1].close > closed[-2].close) - (closed[-1].close < closed[-2].close)
+    if not sign:
+        return None
+    start = len(closed) - 1
+    while start > 0 and (closed[start].close - closed[start - 1].close) * sign > 0:
+        start -= 1
+    count = len(closed) - 1 - start
+    base = atr_series(closed[: start + 1])[-1] if start >= 14 else None  # 用这段走线之前的波动做基准，不让它自己把基准抬高
+    if count < RUN_BARS or not base:
+        return None
+    origin, last = closed[start].close, closed[-1].close
+    size = abs(last - origin) / base
+    if size < RUN_ATR:
+        return None
+    return {"side": "long" if sign > 0 else "short", "bars": count, "origin": origin, "to": last, "pct": (last / origin - 1) * 100,
+            "atr_x": size, "step": int(size / RUN_ATR), "ts": closed[start].ts, "bar_ts": closed[-1].ts}

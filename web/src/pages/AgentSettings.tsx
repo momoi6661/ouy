@@ -345,8 +345,8 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
           <label className="field">
             <span>Worker 的唤醒方式（默认值）</span>
             <select value={cfg.wake} onChange={(e) => patch({ wake: e.target.value as Wake })}>
-              <option value="event">有事才唤醒（省 token）</option>
-              <option value="always">一直唤醒（按固定间隔持续复盘）</option>
+              <option value="event">定时看盘时没变化就跳过（省 token）</option>
+              <option value="always">每次定时看盘都看（K 线收盘时）</option>
             </select>
           </label>
           <label className="check">
@@ -432,8 +432,8 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
               <Num value={cfg.tick_seconds} onChange={(v) => patch({ tick_seconds: n(v, 3) })} min={1} max={60} step={1} suffix="秒" />
             </label>
             <label className="field">
-              <span>例行复盘最长间隔</span>
-              <Num value={cfg.review_seconds} onChange={(v) => patch({ review_seconds: n(v, 300) })} min={60} max={3600} step={30} suffix="秒" />
+              <span title="触发线、转折、连续走线、新候选、价格波动、快判这些行情事件，每个品种每小时最多叫醒 Worker 几次；超过的先记着，并到下一次看盘。持仓变化、仓位告警、你的留言不受限制">行情事件每小时最多叫醒</span>
+              <Num value={cfg.max_event_wakes} onChange={(v) => patch({ max_event_wakes: n(v, 6) })} min={1} max={60} step={1} suffix="次" />
             </label>
             <label className="field">
               <span>两次复盘最短间隔</span>

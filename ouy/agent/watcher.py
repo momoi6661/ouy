@@ -11,6 +11,7 @@ import time
 from contextlib import asynccontextmanager
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Callable
 
 from pydantic_ai import Agent, BinaryContent
@@ -28,15 +29,15 @@ from ..indicators import BAR_MINUTES, ROW_BLOCK, day_profile, value_area
 from ..market import Market, _f, session_anchor, us_stock_session
 from ..backtest_plans import evidence, losing
 from ..scoreboard import Scoreboard
-from ..models import ENTRY_MODES, FAST_MODES, GIVEBACK, LOCK_R, QUANT_MODES, TREND_FRAMES, TREND_RULE, AccountState, AgentConfig, CycleReport, Position, TradeAction, STANCES, STYLES
-from ..strategy import DATA_STALE_MS, FAST_DATA_MS, KINDS as STRATEGY_KINDS, StrategyEngine, describe as describe_strategy, label_of, rule_parts
+from ..models import ENTRY_MODES, FAST_MODES, GIVEBACK, LOCK_R, QUANT_MODES, TREND_FRAMES, TREND_RULE, AccountState, AgentConfig, CycleReport, Position, TradeAction, TradePlan, STANCES, STYLES
+from ..strategy import DATA_STALE_MS, FAST_DATA_MS, KINDS as STRATEGY_KINDS, StrategyEngine, describe as describe_strategy, describe_when, label_of, rule_parts
 from ..okx.gateway import Gateway, OkxError
 from ..store import Store, now_ms
 from ..memory import Lessons
 from ..trader import MANUAL_SOURCES, PENDING_TTL_MS, Rejected, Trader
 from .core import SUBAGENTS, Deps, build_review_agent, build_adhoc_agent, build_chat_agent, build_general_agent, build_gate_agent, build_router_agent, build_sub_agent, build_trader_agent
-from .early_watch import QuoteWatch, ShiftRetest, WatchAdvice
-from .signals import KIND as FAST_KIND, FastParams, describe_tape, detect, key_lines, line_status, strengths, structure_shift, turn_state, turn_watch
+from .early_watch import ShiftRetest
+from .signals import KIND as FAST_KIND, FastParams, describe_tape, detect, key_lines, line_status, strengths, structure_shift, trend_run, turn_state, turn_watch
 from .core import STABLE_MARK
 from .plan import REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, major_direction, market_regime, build_candidates, candidates_text, check_plan, far_target, plan_origin, manage_rules, order_params, plan_terms, safe_leverage, same_plan, trade_cost_pct
 
@@ -149,10 +150,6 @@ class InstState:
     regime: dict[str, Any] = field(default_factory=dict)
     shift_retest: ShiftRetest = field(default_factory=ShiftRetest)
     last_retest: dict[str, Any] | None = None
-    quote_watch: QuoteWatch = field(default_factory=QuoteWatch)
-    observe_task: asyncio.Task[None] | None = field(default=None, repr=False)
-    observe_price: float | None = None
-    pending_observation: tuple[float, str] | None = None
     last_px: float = 0.0
     prev_px: float = 0.0
     last_review_ts: float = 0.0
@@ -160,6 +157,14 @@ class InstState:
     next_due_ts: float = 0.0
     retry_after_ts: float = 0.0
     pending_wakes: list[str] = field(default_factory=list)
+    pending_hard: bool = False  # 等着送的叫醒原因里有没有不受每小时上限约束的（持仓变化、仓位告警、用户留言）
+    event_wakes: deque[float] = field(default_factory=deque)  # 最近一小时被行情事件叫醒的时刻
+    budget_hold: bool = False  # 这一小时的事件叫醒次数用完了，正攒着等下一次
+    run_seen: tuple[int, int] = (0, 0)  # 上次报过的连续走线：（从哪根开始，走到第几档）
+    run_last: dict[str, Any] = field(default_factory=dict)  # 最近一次连续走线：{ts, text}，给界面看
+    has_line_mail: bool = False  # 信箱里有没有「只叫醒」的触发线回报
+    algo_clock: tuple[str, str, int] | None = None
+    algo_poll_after: int = 0
     error_work_id: int | None = None
     had_position: bool | None = None
     reviewing: bool = False
@@ -179,6 +184,7 @@ class InstState:
     stale_order: str = ""  # Agent 的挂单太久没成交时的说明
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)  # 这个币的 Worker 一次只做一件事，别的排队
     has_mail: bool = False  # 信箱里有没有还没读的留言
+    has_market_mail: bool = False
     lot_alert: str = ""  # 有一笔仓的盈利在回吐（或浮亏在扩大），等着送到 Worker 手上
     # 超短线的行情推送：程序记着每根 5 分钟 K 线和关键线，有变化就送到 Worker 手上
     feed_bar_ts: int = 0
@@ -251,7 +257,7 @@ def quiet_reason(st: InstState, wake_move_pct: float) -> str:
     move = abs(st.last_px / st.last_review_px - 1) * 100
     if move >= wake_move_pct / 2:
         return ""
-    levels = [float(l.get("price") or 0) for l in report.get("watch_levels") or []]
+    levels = [float(l.get("price") or 0) for l in report.get("lines") or []]
     plan = report.get("plan") or {}
     levels += [float(plan.get(k) or 0) for k in ("entry_low", "entry_high")]
     gaps = [abs(st.last_px / p - 1) * 100 for p in levels if p > 0]
@@ -561,6 +567,11 @@ KB_HOLD_SECONDS = 1800  # 同一种行情状态查到的知识库条目最多沿
 BTC = "BTC-USDT-SWAP"
 BTC_ALERT_PCT = 0.8  # BTC 在 BTC_WINDOW 秒内波动超过这个百分比，就叫醒 Agent 检查所有持仓
 BTC_WINDOW = 900
+LOOK_DELAY = 10  # 定时看盘比 K 线收盘晚这么多秒：等交易所把刚收的那根确认下来
+SAME_LINE_PCT = 0.05  # Worker 重新划的线和已有的线相差不到这个百分比，就当是同一条，原样保留
+LINE_WAKE = "你划的线到了，回报在信箱里"
+# 这些是行情事件：等最短间隔、受每小时叫醒上限约束。其余（首次、持仓变化、用户留言、挂单超时、仓位告警）马上叫醒
+EVENT_WAKES = ("定时复盘", "距上次复盘价格", "新行情候选待复核", LINE_WAKE)
 
 
 class Watcher:
@@ -598,6 +609,7 @@ class Watcher:
         self._spawn_times: dict[str, list[int]] = {}  # 每个归属最近 10 分钟开过几次子代理
         self.general: dict[str, Any] = {"busy": False, "task": "", "summary": "", "ts": 0}  # 通用 Worker：不绑定某个币
         self.last_error = ""
+        self._auth_retry_at = 0.0
         self._task: asyncio.Task[None] | None = None
         self._models: dict[str, Model | str] = {}
         self._manual_warned: dict[str, float] = {}
@@ -802,7 +814,7 @@ class Watcher:
         )
         return f"已通知 {name} Worker 来看这笔仓位：它会核对止损并布置后续管理。"
 
-    def interject(self, inst_id: str, text: str, who: str = "用户") -> dict[str, Any]:
+    def interject(self, inst_id: str, text: str, who: str = "用户", *, market_key: str = "") -> dict[str, Any]:
         """对一个 Worker 插话。它正在思考：插进这一轮，下一步就读到。它空闲：放进信箱，下次被唤醒时先读（盯盘开着会马上唤醒它）。"""
         cfg = self.get_config()
         st = self._state(inst_id)
@@ -814,7 +826,16 @@ class Watcher:
                 return {"delivered": True, "message": f"{inst_id} 的 Worker 正在思考，这句话已经插进去，它下一步就会读到。"}
             except Exception:  # noqa: BLE001 - 这一轮刚好结束了：改放信箱
                 pass
-        self.store.set(f"inbox:{cfg.env}:{inst_id}", [*self.inbox(cfg.env, inst_id), {"who": who, "text": text, "ts": now_ms()}][-10:])
+        notes = self.inbox(cfg.env, inst_id)
+        note = {"who": who, "text": text, "ts": now_ms()}
+        if market_key:
+            notes = [n for n in notes if n.get("market_key") != market_key]
+            note["market_key"] = market_key
+            # 行情简报让位给用户留言和成交、风控等回报。
+            notes = [note, *notes]
+        else:
+            notes = [*notes, note]
+        self.store.set(f"inbox:{cfg.env}:{inst_id}", notes[-10:])
         self._emit(cfg.env, inst_id, "worker", "interject", f"{who}留言（Worker 空闲，被唤醒时先读）：{text}", None, {"who": who, "delivered": False})
         tail = "盯盘开着，马上唤醒它处理。" if self.running else "盯盘没开，它下次被唤醒时先读。"
         return {"delivered": False, "message": f"{inst_id} 的 Worker 现在空闲，留言已放进它的信箱。{tail}"}
@@ -849,6 +870,12 @@ class Watcher:
             if agent == "strategy" and kind == "done" and (data or {}).get("strategy_id"):
                 self.bus.publish("chat", {})
             if agent == "strategy" and (data or {}).get("notify_worker"):
+                fired = self.store.get_strategy(data["strategy_id"]) or {}
+                if fired.get("status") == "done" and (fired.get("params") or {}).get("line"):  # 带动作的计划线到了：程序先照着做，做完再告诉 Worker
+                    job = asyncio.get_running_loop().create_task(self._line_fired(env, inst_id, fired), name=f"line-{fired['id']}")
+                    self._trigger_jobs.add(job)
+                    job.add_done_callback(self._trigger_jobs.discard)
+                    return
                 self._algo(env, inst_id, "rule", text, "程序已按规则处理，并通知 Worker")
                 feedback = f"策略 #{data['strategy_id']} 的执行回报（不是新的交易指令）：{text}"
                 if data.get("recorder"):  # 记录器到了：顺带告诉它现在的线和挂着的东西还合不合适
@@ -861,7 +888,10 @@ class Watcher:
                         return
                     except Exception:
                         pass
-                self.store.set(f"inbox:{env}:{inst_id}", [*self.inbox(env, inst_id), {"who": "策略执行器", "text": feedback, "ts": now_ms()}][-10:])
+                # 只叫醒的触发线到了：算行情事件（等最短间隔、受每小时上限约束）；程序真的下了单、撤了单的回报照旧马上送
+                rule = self.store.get_strategy(data["strategy_id"]) or {}
+                soft = rule.get("kind") == "trigger" and rule["params"].get("do") == "wake"
+                self.store.set(f"inbox:{env}:{inst_id}", [*self.inbox(env, inst_id), {"who": "策略执行器", "text": feedback, "ts": now_ms(), **({"soft": True} if soft else {})}][-10:])
         except Exception as exc:  # noqa: BLE001 - 活动流写不进去不能影响交易
             log.warning("活动流记录失败：%s", exc)
 
@@ -928,7 +958,7 @@ class Watcher:
         job.add_done_callback(self._trigger_jobs.discard)
 
     def rules(self, env: str, inst_id: str) -> list[dict[str, Any]]:
-        """这个币上所有「等什么 → 做什么」排成一张清单：触发器和到价策略、挂单的撤单条件、交代的停止条件、只叫醒 Worker 的观察线。
+        """这个币上所有「等什么 → 做什么」排成一张清单：触发器和到价策略、挂单的撤单条件、交代的停止条件、Worker 每轮划的计划线。
         mode：auto 条件到了程序直接执行；wake 只叫醒 Worker；worker 由 Worker 自己对照。"""
         st, out = self._state(inst_id), []
         status = {"proposed": "proposed", "armed": "waiting", "active": "running"}
@@ -942,9 +972,13 @@ class Watcher:
             task = row["kind"] == "trigger" and p["do"] in ("task", "router_task")
             wake = (row["kind"] == "trigger" and p["do"] == "wake") or (row["kind"] == "profit_guard" and p["on_trigger"] == "notify")
             action = p["do"] if row["kind"] == "trigger" else "wake" if wake else row["kind"]
+            if line := p.get("line"):  # 带动作的计划线：到了程序直接做
+                wake, action = False, "open_market" if line["do"] == "enter" else "cancel_orders"
+                do = (f"市价{'做多' if line['side'] == 'long' else '做空'}，止损 {line['stop_loss']:g}，止盈 {line['take_profit']:g}（进场前按现价再核对一次）"
+                      if line["do"] == "enter" else "撤掉还没成交的入场挂单和入场策略")
             level = p.get("level") if row["kind"] == "trigger" and p["when"].startswith(("price", "close")) else p.get("trigger")
             out.append({
-                "id": f"s{row['id']}", "type": "watch" if observation else row["kind"], "label": "观察线" if observation else label_of(row), "when": when, "do": do,
+                "id": f"s{row['id']}", "type": "watch" if observation else row["kind"], "label": "计划线" if observation else label_of(row), "when": when, "do": do,
                 "action": action, "mode": "task" if task else "wake" if wake else "auto",
                 "status": status.get(row["status"], row["status"]), "by": p.get("by") or "Worker", "ts": row["ts"], "updated_ts": row["updated_ts"], "note": row["note"],
                 "level": level, "strategy_id": row["id"], "expires_ts": p.get("expires_ts"),
@@ -983,25 +1017,27 @@ class Watcher:
             if self.get_config().sub_enabled(role)
         ]
 
-    async def intel(self, inst_id: str, question: str = "", role: str = "intel", by: str = "") -> dict[str, Any]:
+    async def intel(self, inst_id: str, question: str = "", role: str = "intel", by: str = "", *, owner_inst_id: str = "", parent_work_id: int | None = None) -> dict[str, Any]:
         """这个币的一个子代理去做一次事，简报存进共享记忆，交易 Worker 下次被唤醒时会读到。by 是谁派的（留空 = 定时或用户）。"""
         if role not in SUBAGENTS:
             raise RuntimeError(f"没有这个子代理：{role}")
         cfg = self.get_config()
         if not cfg.sub_enabled(role):
             raise RuntimeError(f"「{SUBAGENTS[role]['label']}」子代理已经在设置里关掉了，不用它，按你手上已有的信息判断。")
-        st = self._state(inst_id)
+        owner = owner_inst_id or inst_id
+        st = self._state(owner)
         label = SUBAGENTS[role]["label"]
         st.sub_running.add(role)
         if role == "intel":
             st.intel_running, st.intel_ts = True, time.time()
         task = question or f"更新{label}简报"
-        work_id = self.store.add_work(cfg.env, inst_id, role, (f"{by} 派的：" if by else "") + task, "running", model=cfg.intel_model or cfg.worker_model)
-        self.bus.publish("work", {"inst_id": inst_id})
+        work_id = self.store.add_work(cfg.env, owner, role, (f"{by} 派的：" if by else "") + task, "running", model=cfg.intel_model or cfg.worker_model)
+        link = {"by": by, "subject_inst_id": inst_id, "parent_work_id": parent_work_id}
+        self.bus.publish("work", {"inst_id": owner})
         self.bus.publish("agent", self.status())
         try:
-            deps = Deps(trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, emit=self._emitter(cfg.env, inst_id, role, work_id))
-            self._emit(cfg.env, inst_id, role, "wake", (f"{by} 派来的任务：" if by else "") + task, work_id, {"by": by})
+            deps = Deps(trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, emit=self._emitter(cfg.env, owner, role, work_id))
+            self._emit(cfg.env, owner, role, "wake", (f"{by} 派来的任务：" if by else "") + task, work_id, link)
             prompt = f"品种：{inst_id}（币种 {inst_id.split('-')[0]}）。" + (f"\n任务：{question}" if question else f"\n任务：更新这个币的{label}简报。")
             if role == "risk":
                 account = await self.trader.account(cfg.env)
@@ -1013,19 +1049,20 @@ class Watcher:
                     + f"\n【风控上限】单仓风险 {cfg.risk.risk_per_trade_pct:g}%，杠杆上限 {cfg.risk.max_leverage}x。"
                 )
             result = await asyncio.wait_for(self._sub_agent(cfg, role).run(prompt, deps=deps, usage_limits=UsageLimits(request_limit=14), model_settings=_effort(cfg.sub_effort, f"ouy-sub-{role}")), REVIEW_TIMEOUT)
-            brief = {**result.output.model_dump(), "ts": now_ms(), "question": question, "role": role, "by": by}
-            self.store.set(self._brief_key(cfg.env, inst_id, role), brief)
+            brief = {**result.output.model_dump(), "ts": now_ms(), "question": question, "role": role, **link}
+            if owner == inst_id:
+                self.store.set(self._brief_key(cfg.env, inst_id, role), brief)
             self.store.update_work(work_id, "done", brief["summary"])
-            self._emit(cfg.env, inst_id, role, "done", brief["summary"], work_id, {"bias": brief.get("bias"), "points": brief.get("points")})
+            self._emit(cfg.env, owner, role, "done", brief["summary"], work_id, {**link, "bias": brief.get("bias"), "points": brief.get("points")})
             return brief
         except BaseException as exc:
-            self._failed_work(cfg.env, inst_id, role, work_id, exc)
+            self._failed_work(cfg.env, owner, role, work_id, exc, link)
             raise
         finally:
             st.sub_running.discard(role)
             if role == "intel":
                 st.intel_running = False
-            self.bus.publish("work", {"inst_id": inst_id})
+            self.bus.publish("work", {"inst_id": owner})
             self.bus.publish("agent", self.status())
 
     def _set_worker(self, inst_id: str, **changes: Any) -> AgentConfig:
@@ -1056,7 +1093,7 @@ class Watcher:
         cfg = self.get_config()
         goal = self.goal(cfg.env, inst_id)
         if not goal or goal["status"] != "active" or not goal.get("stop_when"):
-            return "[不能停] 用户和 Router 都没有交代过停止条件。没机会就继续观望，把要等的情况写成触发器（add_trigger），需要你到时再判断的价位写进 watch_levels。"
+            return "[不能停] 用户和 Router 都没有交代过停止条件。没机会就继续观望，把要等的情况写成触发器（add_trigger），到了要进场、撤单或再判断的价位都写成计划线（lines）。"
         if (await self.trader.account(cfg.env)).position(inst_id):
             return "[不能停] 这个币还有持仓，先管好仓位。"
         self._park(cfg, inst_id, f"交代的停止条件「{goal['stop_when']}」已达到：{evidence}")
@@ -1097,9 +1134,10 @@ class Watcher:
                 rows.remove(row)
                 self._sub_hist.pop((owner, row["name"]), None)
 
-    def _close_sub(self, inst_id: str, name: str, by: str = "") -> str:
+    def _close_sub(self, inst_id: str, name: str, by: str = "", *, owner_inst_id: str = "") -> str:
         """开它的 Agent 觉得不需要了，自己把留着的子代理关掉：从图上消失，它记得的东西也一起丢掉。"""
         cfg = self.get_config()
+        inst_id = owner_inst_id or inst_id
         rows, owner = self._sub_rows(inst_id, by)
         row = next((r for r in rows if r["name"] == name), None)
         if row is None:
@@ -1112,14 +1150,15 @@ class Watcher:
         self.bus.publish("agent", self.status())
         return f"已关掉子代理「{name}」。"
 
-    async def _spawn(self, inst_id: str, name: str, task: str, by: str = "", keep: bool = False) -> dict[str, Any]:
+    async def _spawn(self, inst_id: str, name: str, task: str, by: str = "", keep: bool = False, *, owner_inst_id: str = "", parent_work_id: int | None = None) -> dict[str, Any]:
         """临时开一个子代理：任务是开它的 Agent 现场写的，只读工具，做完把结果交回去。
         keep=False（默认）：一次性的，交回结果就结束、从图上消失。
         keep=True：留着——它记得自己查过什么，之后用同一个名字再交任务就是接着问它；不需要了由开它的 Agent 自己关（或者空闲太久自动关）。"""
         cfg = self.get_config()
         self._expire_subs()
-        rows, owner = self._sub_rows(inst_id, by)
-        by = by or f"{inst_id.split('-')[0]} Worker"
+        work_inst = owner_inst_id or inst_id
+        rows, owner = self._sub_rows(work_inst, by)
+        by = by or f"{work_inst.split('-')[0]} Worker"
         row = next((r for r in rows if r["name"] == name), None)
         if row is not None and row["running"]:
             raise RuntimeError(f"子代理「{name}」还在干活，等它交回结果再给它新任务，或者换个名字另开一个。")
@@ -1133,20 +1172,21 @@ class Watcher:
         if len(times) >= ADHOC_PER_10MIN:
             raise RuntimeError(f"10 分钟内已经开过 {ADHOC_PER_10MIN} 次子代理了，先用手上已有的结果判断。")
         times.append(now_ms())
-        work_id = self.store.add_work(cfg.env, inst_id, "adhoc", f"{by} {'接着问' if resumed else '开的'}子代理「{name}」：{task}", "running", model=cfg.intel_model or cfg.worker_model)
+        work_id = self.store.add_work(cfg.env, work_inst, "adhoc", f"{by} {'接着问' if resumed else '开的'}子代理「{name}」：{task}", "running", model=cfg.intel_model or cfg.worker_model)
+        link = {"name": name, "by": by, "keep": keep, "subject_inst_id": inst_id, "parent_work_id": parent_work_id}
         if row is None:
             row = {"id": work_id, "name": name, "task": task, "running": True, "summary": "", "bias": "", "ts": now_ms(), "keep": keep}
             rows.append(row)
         else:
             row.update(id=work_id, task=task, running=True, ts=now_ms())
-        self._emit(cfg.env, inst_id, "adhoc", "wake", f"{by} {'接着问' if resumed else '开的'}子代理「{name}」：{task}", work_id, {"name": name, "by": by, "keep": keep})
+        self._emit(cfg.env, work_inst, "adhoc", "wake", f"{by} {'接着问' if resumed else '开的'}子代理「{name}」：{task}", work_id, link)
         self.bus.publish("agent", self.status())
         try:
             model_name = cfg.intel_model or cfg.worker_model
             key = f"adhoc:{model_name}|{cfg.max_parallel}|{cfg.web_search}"
             if key not in self._task_agents:
                 self._task_agents[key] = build_adhoc_agent(self._model(model_name), self._limiter(cfg, "subagents"), web=cfg.web_search)  # type: ignore[assignment]
-            deps = Deps(trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, emit=self._emitter(cfg.env, inst_id, "adhoc", work_id))
+            deps = Deps(trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, emit=self._emitter(cfg.env, work_inst, "adhoc", work_id))
             about = f"品种：{inst_id}（币种 {inst_id.split('-')[0]}），" if inst_id else "这个任务不针对某一个币，"
             prompt = f"{about}现在是{'模拟盘' if cfg.env == 'demo' else '实盘'}。\n{'接着上面的工作，新任务' if resumed else '任务'}：{task}"
             result = await asyncio.wait_for(
@@ -1164,17 +1204,17 @@ class Watcher:
             else:
                 rows.remove(row)  # 一次性的：交回结果就从图上消失
             self.store.update_work(work_id, "done", brief["summary"])
-            self._emit(cfg.env, inst_id, "adhoc", "done", brief["summary"], work_id, {"name": name, "bias": brief.get("bias"), "points": brief.get("points"), "keep": keep})
+            self._emit(cfg.env, work_inst, "adhoc", "done", brief["summary"], work_id, {**link, "bias": brief.get("bias"), "points": brief.get("points")})
             return brief
         except BaseException as exc:
             if resumed:
                 row.update(running=False, summary=f"没查成：{str(exc)[:160] or type(exc).__name__}")
             elif row in rows:
                 rows.remove(row)
-            self._failed_work(cfg.env, inst_id, "adhoc", work_id, exc, {"name": name})
+            self._failed_work(cfg.env, work_inst, "adhoc", work_id, exc, link)
             raise
         finally:
-            self.bus.publish("work", {"inst_id": inst_id})
+            self.bus.publish("work", {"inst_id": work_inst})
             self.bus.publish("agent", self.status())
 
     def _lessons_text(self, env: str, inst_id: str) -> str:
@@ -1317,8 +1357,9 @@ class Watcher:
             self.bus.publish("work", {"inst_id": ""})
             self.bus.publish("agent", self.status())
 
-    async def _sub_from_worker(self, inst_id: str, role: str, task: str) -> dict[str, Any]:
-        return await self.intel(inst_id, task, role, by=f"{inst_id.split('-')[0]} Worker")
+    async def _sub_from_worker(self, inst_id: str, role: str, task: str, *, owner_inst_id: str, parent_work_id: int) -> dict[str, Any]:
+        return await self.intel(inst_id, task, role, by=f"{owner_inst_id.split('-')[0]} Worker",
+                                owner_inst_id=owner_inst_id, parent_work_id=parent_work_id)
 
     async def _intel_task(self, inst_id: str) -> None:
         try:
@@ -1349,13 +1390,15 @@ class Watcher:
         """给 Worker 看的工作记忆：说的是同一件事的只留最新一条，最多 keep 条——同一句话反复出现会让它越想越缩手。"""
         return "；".join(n["note"] for n in distinct_notes(self.memory(env, inst_id))[-keep:])
 
-    async def start(self) -> None:
+    async def start(self, *, recover_auth: bool = False) -> None:
         if self.running:
             return
         self._model(self.get_config().worker_model)  # 模型没配好就在这里报错，别等到半夜才发现
-        await self.trader.account()  # 没授权也在这里报错
+        if not recover_auth:
+            await self.trader.account()
         self.running = True
         self.last_error = ""
+        self._auth_retry_at = 0.0
         self._beat = time.time()
         self._task = asyncio.create_task(self._loop(), name="ouy-watcher")
         self._watchdog_task = asyncio.create_task(self._watch_loop(), name="ouy-watchdog")
@@ -1367,8 +1410,7 @@ class Watcher:
         self.running = False
         tasks = [self._task, self._watchdog_task, self._patrol_task, self._maintenance_task]
         for st in self.states.values():
-            tasks.extend([st.observe_task, st.task])
-            st.quote_watch, st.observe_price, st.pending_observation = QuoteWatch(), None, None
+            tasks.append(st.task)
             st.reviewing = False
         tasks = [t for t in tasks if t and t is not asyncio.current_task() and not t.done()]
         for task in tasks:
@@ -1435,6 +1477,7 @@ class Watcher:
                         "narrative": (self.strategies.metrics.get(inst) or {}).get("narrative") or "",
                     },
                     "wake": cfg.wake_for(inst),
+                    "event_wakes": sum(now - t < 3600 for t in st.event_wakes), "event_wakes_max": cfg.max_event_wakes,
                     "model": cfg.model_for(inst),
                     "paused": cfg.worker(inst).paused,
                     "standby": cfg.worker(inst).standby,
@@ -1475,29 +1518,56 @@ class Watcher:
 
     async def _loop(self) -> None:
         failures = 0
+        auth_failures = 0
         while self.running:
             cfg = self.get_config()
             self._beat = time.time()
             try:
-                await self._tick(cfg)
-                failures = 0
-                self.last_error = ""
+                if time.time() < self._auth_retry_at:
+                    await self._market_only(cfg)
+                else:
+                    await self._tick(cfg)
+                    if auth_failures:
+                        self._note("system", "欧易账户读取已恢复，已继续检查订单、持仓和触发器")
+                    failures = auth_failures = 0
+                    self._auth_retry_at = 0.0
+                    self.last_error = ""
             except asyncio.CancelledError:
                 raise
             except OkxError as exc:
                 failures += 1
                 self.last_error = str(exc)
                 if exc.needs_login:
-                    await self.stop("欧易授权已失效，请重新登录欧易")
-                    return
-                if failures in (3, 30):
+                    auth_failures += 1
+                    self._auth_retry_at = time.time() + min(60, 10 * 2 ** min(auth_failures - 1, 3))
+                    self.last_error = f"欧易账户授权暂不可用，正在复查。{exc}"
+                    if auth_failures in (1, 3):
+                        self._note("alert", "欧易账户授权暂不可用，已暂停自动交易并继续采行情",
+                                   {"message": str(exc), "times": auth_failures})
+                    self.bus.publish("agent", self.status())
+                elif failures in (3, 30):
                     self._note("alert", "盯盘读取欧易数据连续失败", {"message": str(exc), "times": failures})
+                await self._market_only(cfg)
             except Exception as exc:  # noqa: BLE001 - 盯盘循环不能因为一次意外就死掉
                 failures += 1
                 self.last_error = str(exc)
                 log.exception("盯盘循环异常")
             # 币多了每一拍的请求也多：拉长间隔，免得被欧易限流（每个币至少留 0.75 秒）
             await asyncio.sleep(max(cfg.tick_seconds, len(cfg.instruments) * 0.75))
+
+    async def _market_only(self, cfg: AgentConfig) -> None:
+        tickers = await asyncio.gather(*(self.market.ticker(inst, cfg.env) for inst in cfg.instruments), return_exceptions=True)
+        for inst, ticker in zip(cfg.instruments, tickers):
+            if not isinstance(ticker, dict) or not (price := _f(ticker.get("last"))):
+                continue
+            st = self._state(inst)
+            st.prev_px, st.last_px = st.last_px or price, price
+            self.bus.publish("tick", {"inst_id": inst, "last": price, "ts": int(_f(ticker.get("ts"))) or now_ms()})
+            try:
+                await self._record(cfg, inst, st, time.time())
+                await self._algo_tick(cfg, inst, st, notify=False)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("账户不可用时行情采样失败 %s: %s", inst, exc)
 
     async def _tick(self, cfg: AgentConfig) -> None:
         account = await self.trader.account(cfg.env)
@@ -1585,13 +1655,17 @@ class Watcher:
                 st.intel_running, st.intel_ts = True, now
                 asyncio.create_task(self._intel_task(inst_id), name=f"intel-{inst_id}")
             st.stale_order = self._stale_order(cfg, inst_id, account)
-            st.has_mail = bool(self.inbox(cfg.env, inst_id))
+            notes = self.inbox(cfg.env, inst_id)
+            st.has_mail = any(not note.get("market_key") and not note.get("soft") for note in notes)
+            st.has_line_mail = any(note.get("soft") for note in notes)
+            st.has_market_mail = any(note.get("market_key") for note in notes)
             # 待命（空仓时）：不做首次 / 定时 / 波动复盘，只留触发线、入场区间、留言、持仓变化、挂单超时这些硬事件
             standby = cfg.worker(inst_id).standby and pos is None
             if standby and not st.last_review_ts:
                 st.last_review_ts, st.last_review_px = now - cfg.min_review_seconds, st.last_px
             reason = self._trigger(cfg, st, pos, now)
-            if standby and reason and (reason == "定时复盘" or reason.startswith("距上次复盘价格")):
+            hard = bool(reason) and not reason.startswith(EVENT_WAKES)  # 首次、持仓变化、用户留言、挂单超时：不受每小时上限约束
+            if standby and reason and (reason in ("定时复盘", "新行情候选待复核") or reason.startswith("距上次复盘价格")):
                 reason = None
             try:
                 await self._watch_lots(cfg, inst_id, st, now)
@@ -1601,8 +1675,8 @@ class Watcher:
                 if st.reviewing or st.run is not None:
                     if self._steer(cfg, inst_id, st.lot_alert, "盯盘系统"):
                         st.lot_alert = ""
-                elif not reason or reason == "定时复盘" or reason.startswith("距上次复盘价格"):
-                    reason, st.lot_alert = st.lot_alert, ""
+                elif not hard:
+                    reason, st.lot_alert, hard = st.lot_alert, "", True
             try:
                 turned = await self._shift_watch(cfg, inst_id, st)
             except Exception as exc:  # noqa: BLE001
@@ -1630,67 +1704,29 @@ class Watcher:
             # 软事件（价格波动、定时）先过 Router 的第二级过滤；硬事件（首次、持仓变化、触及价位、进入入场区间、BTC 异动）直接唤醒
             if (not reason and btc_alert and inst_id != BTC and self._asset.get(inst_id, "crypto") == "crypto"
                     and account.position(inst_id) and now - st.last_review_ts >= cfg.min_review_seconds):
-                reason = f"{btc_alert}，这个品种有持仓，检查要不要跟着处理"
-            if cfg.env == "demo" and st.report:
-                self._sample_observation(cfg, inst_id, st, _f(ticker.get("ts")) / 1000, now, bool(reason))
+                reason, hard = f"{btc_alert}，这个品种有持仓，检查要不要跟着处理", True
             if reason and reason != "定时复盘" and not reason.startswith("距上次复盘价格"):
                 if reason not in st.pending_wakes:
                     st.pending_wakes = [*st.pending_wakes, reason][-10:]
+                st.pending_hard = st.pending_hard or hard
             reason = "；".join(st.pending_wakes) or reason
             if reason and not st.reviewing and now >= st.retry_after_ts:
+                # 行情事件每小时最多叫醒 max_event_wakes 次：超过的留在待办里，并到下一次（定时看盘或硬事件）一起送，不丢也不重复叫
+                if not (hard or st.pending_hard) and reason != "定时复盘" and now < st.next_due_ts:
+                    while st.event_wakes and now - st.event_wakes[0] >= 3600:
+                        st.event_wakes.popleft()
+                    if len(st.event_wakes) >= cfg.max_event_wakes:
+                        if not st.budget_hold:
+                            st.budget_hold = True
+                            self._emit(cfg.env, inst_id, "router", "skip", f"这一小时已经被行情事件叫醒 {len(st.event_wakes)} 次（上限 {cfg.max_event_wakes}），先记着，并到下一次看盘：{reason}")
+                        continue
+                    st.event_wakes.append(now)
+                st.budget_hold = False
                 st.reviewing = True
                 st.review_started = 0.0
                 soft = reason == "定时复盘" or reason.startswith("距上次复盘价格")
                 gate = soft and cfg.slow_path and cfg.wake_for(inst_id) == "event" and account.position(inst_id) is None
                 st.task = asyncio.create_task(self._review_task(inst_id, reason, gate), name=f"review-{inst_id}")
-
-    def _sample_observation(self, cfg: AgentConfig, inst: str, st: InstState, ts: float, now: float, normal_wake: bool) -> None:
-        if not (now - 15 <= ts <= now + 2):
-            return
-        report = st.report or {}
-        levels = {v["price"] for v in report.get("watch_levels", [])}
-        plan = report.get("plan") or {}
-        levels.update(p for p in (plan.get("entry_low"), plan.get("entry_high"), st.observe_price) if p)
-        signal = st.quote_watch.sample(ts, st.last_px, levels, cfg.wake_move_pct)
-        if signal:
-            st.pending_observation = (ts, signal)
-            self._note("system", f"{inst} 模拟盘预警：{signal}", inst_id=inst)
-        if not st.pending_observation:
-            return
-        if now - st.pending_observation[0] > 15:
-            st.pending_observation = None
-            return
-        if normal_wake or st.reviewing or st.lock.locked() or now < st.retry_after_ts:
-            return
-        if st.observe_task and not st.observe_task.done():
-            return
-        event_ts, signal = st.pending_observation
-        st.pending_observation = None
-        st.observe_task = asyncio.create_task(self._observe_only(cfg, inst, st, report, signal, event_ts))
-
-    async def _observe_only(self, cfg: AgentConfig, inst: str, st: InstState, report: dict[str, Any], signal: str, ts: float) -> None:
-        """只读推演，既拿不到交易工具，也不改普通复盘的计划、时钟、审批和止损。"""
-        try:
-            worker = Agent(
-                self._model(cfg.model_for(inst)), output_type=WatchAdvice, retries=0,
-                max_concurrency=self._limiter(cfg, "workers"),
-                instructions="你是这个币的 Worker，现在只重估观察位。报价不等于收盘确认。结构依据不足就保持原观察位；不要建议立即交易。",
-            )
-            prompt = json.dumps({
-                "品种": inst, "预警": signal, "最近采样(时间、报价)": list(st.quote_watch.samples),
-                "上次复盘": {k: report.get(k) for k in ("summary", "watch_levels", "plan", "ts")},
-            }, ensure_ascii=False)
-            result = await asyncio.wait_for(worker.run(prompt, model_settings=_effort(cfg.trigger_effort_for(inst), "ouy-observe"),
-                                                       usage_limits=UsageLimits(request_limit=1)), 12)
-            if (self.get_config().env != "demo" or self.states.get(inst) is not st or st.report is not report
-                    or self.get_config().worker(inst).paused or time.time() - ts > 15 or st.reviewing):
-                return
-            advice = result.output
-            if advice.observe_price:
-                st.observe_price = advice.observe_price
-            self._note("system", f"{inst} 只读重估：{advice.reason}", {"observe_price": st.observe_price}, inst_id=inst)
-        except Exception as exc:  # 预警失败不能影响盯盘或现有保护单
-            log.warning("模拟盘观察位重估失败 %s：%s", inst, type(exc).__name__)
 
     async def _watch_btc(self, cfg: AgentConfig, tickers: dict[str, Any], now: float) -> str | None:
         """不管盯盘列表里有没有 BTC，都时刻看着它：BTC 短时间大幅波动时返回一句提醒，用来叫醒有持仓的品种。"""
@@ -1719,7 +1755,7 @@ class Watcher:
         self._note("system", alert + "，正在检查所有持仓", {"move_pct": round(move, 3)})
         return alert
 
-    ALGOS = {"regime": "行情判断", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发器 / 记录器"}
+    ALGOS = {"regime": "行情判断", "run": "连续走线", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发线 / 记录器"}
 
     def _algo(self, env: str, inst: str, algo: str, text: str, effect: str, side: str = "", px: float = 0.0, atr: float | None = None) -> None:
         """记一条算法事件：哪个算法在什么价位算出了什么、触发了什么。带方向的会在 15 分钟和 1 小时后核对价格有没有照它说的走。"""
@@ -1732,14 +1768,14 @@ class Watcher:
 
     # 每个算法归哪一层：同一层里的几个算法看的是同一类事情，页面按层摆，免得看起来像几套各说各的
     ALGO_LAYERS = {
-        "read": "看行情 · 只记录，不叫醒也不下单",
+        "read": "看行情 · 不下单；连续走线会叫醒 Worker 核对计划，其余只记录",
         "turn": "找转折 · 一个算法分三个阶段（苗头 → 确认 → 盘中失守 / 收回），不下单",
         "entry": "给入场位 · 候选只是参考；快判和触发器按你的设置才会下单",
         "hold": "管持仓 · 只移止损和叫醒 Worker，不开仓",
     }
     # 以前分开记的「结构转折」「盘中转折位」现在都算「转折」这一个算法的不同阶段；库里的旧记录读出来时归过去
     ALGO_MERGED = {"shift": "turn", "retest": "turn"}
-    ALGO_LAYER = {"tape": "read", "open": "read", "regime": "read", "turn": "turn",
+    ALGO_LAYER = {"tape": "read", "open": "read", "regime": "read", "run": "read", "turn": "turn",
                   "cand": "entry", "fast": "entry", "rule": "entry", "lock": "hold"}
 
     def _algo_check(self, env: str, prices: dict[str, float]) -> None:
@@ -1806,6 +1842,8 @@ class Watcher:
                 "每个报价对照开盘价，只记录"),
             row("regime", "行情判断", watching and bool(st.regime), st.regime.get("ts"),
                 f"{st.regime.get('label', '')}：{st.regime.get('why', '')}" if st.regime else "等下一根结构周期 K 线", "程序自己按结构周期算，决定给 Worker 哪几类入场候选"),
+            row("run", "连续走线", watching and bool(st.regime), st.run_last.get("ts"), st.run_last.get("text") or "还没有：结构周期 K 线没有连着三根以上朝一个方向走出三倍平均波幅",
+                "同一段走线每多走出一档叫醒 Worker 一次，让它核对计划和触发线；不下单"),
             row("turn", "转折", watching and fresh, turn_ts, turn_text if fresh else off,
                 ("苗头只写进 Worker 的输入；确认时撤掉过时挂单并叫醒 Worker；" if self._shift_actions_on(cfg, inst) else "确认转折时，有生效入场计划就叫醒 Worker 复核；")
                 + "确认后盘中第一次失守再叫醒一次，之后的来回只记录"),
@@ -1813,7 +1851,7 @@ class Watcher:
             row("fast", "快判", watching and fast_on, (st.fast_last or {}).get("ts"),
                 f"{st.fast_last['text']} → {st.fast_last.get('result') or st.fast_last['status']}" if st.fast_last else "还没有信号",
                 fast_does if fast_on else "已关闭，或这个风格不看 1 分钟"),
-            row("rule", "触发器 / 记录器", watching and bool(rules), max((r["ts"] for r in rules), default=0),
+            row("rule", "触发线 / 记录器", watching and bool(rules), max((r["ts"] for r in rules), default=0),
                 f"{len(rules)} 条在等条件" if rules else "没有在等的规则", "条件满足时程序直接执行预设操作"),
             row("lock", "持仓轨迹 / 保盈线", watching and bool(tracks), max((t.get("peak_ts", 0) for t in tracks.values()), default=0),
                 "；".join(f"#{k} " + self.track_text(v) for k, v in tracks.items()) or "没有持仓",
@@ -1989,7 +2027,7 @@ class Watcher:
         return f"挂单已经 {int(max(ages))} 分钟没成交（上限 {limit} 分钟）：改用市价进场或撤单，不要原价重挂"
 
     def _stale_lines(self, cfg: AgentConfig, inst_id: str, st: InstState, px: float) -> str:
-        """Worker 现在的限价挂单、触发器、计划入场位、观察线离现价多远；结合结构转折（shift）和波动率可达性标出过时的线。"""
+        """Worker 现在的限价挂单、触发器、计划入场位、计划线离现价多远；结合结构转折（shift）和波动率可达性标出过时的线。"""
         if not px or px <= 0:
             return ""
 
@@ -2025,11 +2063,11 @@ class Watcher:
                 px, mid, plan.get("direction") or "long", shift, atr, spec["plan_minutes"], spec["bar_minutes"]
             ) or ("离现价太远" if plan.get("stop_loss") and abs(px - mid) >= 2.5 * abs(mid - plan["stop_loss"]) else "")
             rows.append(f"上次计划入场 {plan['entry_low']:g}~{plan['entry_high']:g}（中间价 {far(mid)}）" + (f"【过时：{stale}】" if stale else ""))
-        for w in (st.report or {}).get("watch_levels") or []:
+        for w in (st.report or {}).get("lines") or []:
             if w.get("price"):
-                rows.append(f"观察线 {far(w['price'])}" + ("【过时：离现价太远】" if abs(w["price"] / px - 1) * 100 >= max(spec["limit_dist_pct"] * 2, 1.5) else ""))
+                rows.append(f"计划线 {far(w['price'])}" + ("【过时：离现价太远】" if abs(w["price"] / px - 1) * 100 >= max(spec["limit_dist_pct"] * 2, 1.5) else ""))
         if not rows:
-            return "你现在没有等着的入场触发器、计划和观察线：空仓时直接给出 plan（程序会在欧易挂真实限价单），需要观察的价位写进 watch_levels。"
+            return "你现在没有等着的入场触发器、计划和计划线：空仓时直接给出 plan（程序会在欧易挂真实限价单），并把现价上下的计划线（lines）划出来。"
         tail = "标了【过时】的不要再沿用：本轮直接按最新结构给出新的 plan（程序会自动撤旧挂新），触发器用 edit_trigger / cancel_strategy 清理。" if any("过时" in r for r in rows) else ""
         return "你的线离现价：" + "；".join(rows) + "。" + tail
 
@@ -2092,22 +2130,44 @@ class Watcher:
                            "回测扣费后亏：只给 Worker 参考，它要写出额外依据才能用" if c["losing"] else "给 Worker 当候选，不下单", c["side"])
         return rows
 
-    async def _algo_tick(self, cfg: AgentConfig, inst_id: str, st: InstState, pos: Position | None = None) -> None:
+    async def _algo_tick(self, cfg: AgentConfig, inst_id: str, st: InstState, pos: Position | None = None, *, notify: bool = True) -> None:
         """算法自己的时钟：每走完一根结构周期 K 线重算一次行情判断和候选位，不等 Worker 复盘、不花模型调用。
         首次出现的可复核候选合并送入 Worker。"""
-        spec = STYLES[cfg.style_for(inst_id)]
+        style = cfg.style_for(inst_id)
+        spec = STYLES[style]
         step = spec["bar_minutes"] * 60_000
-        if cfg.worker(inst_id).paused or not st.last_px or now_ms() // step == (st.regime or {}).get("ts", 0) // step:
+        clock = now_ms()
+        expected = clock // step * step - step
+        scope = (cfg.env, style)
+        if cfg.worker(inst_id).paused or not st.last_px or st.algo_clock == (*scope, expected) or clock < st.algo_poll_after:
             return
+        st.algo_poll_after = clock + 5_000
         snapshot = await self.market.snapshot(inst_id, cfg.env, tuple(spec["bars"]))
-        if not snapshot.get("last"):
+        frame = (snapshot.get("timeframes") or {}).get(spec["struct_bar"]) or {}
+        closed = frame.get("last_closed_open_ts_ms")
+        if not snapshot.get("last") or not isinstance(closed, int) or closed > expected:
+            return
+        if st.algo_clock and st.algo_clock[:2] == scope and closed <= st.algo_clock[2]:
             return
         previous = {(c["strategy"], c["side"]) for c in st.regime.get("candidates", []) if c["ok"] and not c["losing"]}
         self._set_regime(cfg, inst_id, st, snapshot, pos, self.strategies.fresh_metrics(cfg.env, inst_id).get("shift"))
+        st.algo_clock = (*scope, closed)
         fresh = [c for c in st.regime["candidates"] if c["ok"] and not c["losing"] and (c["strategy"], c["side"]) not in previous]
-        if fresh and not cfg.worker(inst_id).standby:
+        if notify and closed == expected and fresh and not cfg.worker(inst_id).standby:
             levels = "、".join(f"{c['strategy']} {c['side']} @ {c['entry']:g}（止损 {c['stop']:g}）" for c in fresh)
-            self.interject(inst_id, f"{spec['struct_bar']} 新合格候选：{levels}。核对现价和已有委托；认可且只差到价就准备挂单，还缺确认则写明等待条件。", "走势记录器")
+            self.interject(inst_id, f"{spec['struct_bar']} 新合格候选：{levels}。核对现价和已有委托；认可且只差到价就准备挂单，还缺确认则写明等待条件。",
+                           "走势记录器", market_key="candidate")
+        run = trend_run(await self.market.candles(inst_id, spec["struct_bar"], 60, cfg.env))
+        if run and run["bar_ts"] == closed and (run["ts"] != st.run_seen[0] or run["step"] > st.run_seen[1]):
+            st.run_seen = (run["ts"], run["step"])  # 同一段走线每多走出一档才再报一次
+            text = (f"连续走线：{spec['struct_bar']} 连续 {run['bars']} 根收{'高' if run['side'] == 'long' else '低'}，从 {run['origin']:g} 走到 {run['to']:g}"
+                    f"（{run['pct']:+.2f}%，{run['atr_x']:.1f} 倍平均波幅）")
+            st.run_last = {"ts": now_ms(), "text": text}
+            wake = notify and closed == expected and not cfg.worker(inst_id).standby
+            self._algo(cfg.env, inst_id, "run", text, "叫醒 Worker 核对计划和触发线" if wake else "只记录", run["side"], run["to"])
+            if wake:
+                self.interject(inst_id, f"{text}。只说明正在连着走，不说明接下来往哪走（回测里走出这种线之后继续同向的不到一半），不要因此追单。"
+                               "核对：计划的方向和入场位还成立吗，挂着的单和触发线有没有被甩在后面，持仓的止损要不要跟。", "走势记录器", market_key="run")
         self.bus.publish("agent", self.status())
 
     async def _record(self, cfg: AgentConfig, inst_id: str, st: InstState, now: float, pos: Position | None = None) -> None:
@@ -2316,6 +2376,100 @@ class Watcher:
             return None
         return ask
 
+    async def _line_fired(self, env: str, inst_id: str, rule: dict[str, Any]) -> None:
+        """带动作的计划线到了。撤单线：撤掉还没成交的入场。进场线：按这一刻的现价重新核对成本、盈亏比和风控，过了就进场，
+        并把其余进场线和挂着的入场单作废（一边成交，另一边不再成交）；过不了就只叫醒 Worker。做完把结果放进它的信箱。"""
+        cfg, p = self.get_config(), rule["params"]
+        act, where = p["line"], f"计划线 #{rule['id']}（{describe_when(p)}）到了"
+
+        def tell(text: str, soft: bool) -> None:
+            note = {"who": "计划线", "text": f"{where}：{text}", "ts": now_ms(), **({"soft": True} if soft else {})}
+            self.store.set(f"inbox:{env}:{inst_id}", [*self.inbox(env, inst_id), note][-10:])
+            self._algo(env, inst_id, "rule", f"{where}：{text}"[:300], "程序已执行，并告诉 Worker" if not soft else "没有执行，叫醒 Worker", act.get("side") or "")
+            self._emit(env, inst_id, "strategy", "action" if not soft else "wake", f"{where}：{text}", None, {"line": rule["id"]})
+
+        try:
+            if cfg.env != env or inst_id not in cfg.instruments:
+                return
+            async with self._state(inst_id).lock:
+                skip, mine = await self._plan_state(cfg, inst_id, [])
+                if act["do"] == "cancel":
+                    for r in mine:
+                        await self._drop_plan(cfg, inst_id, r, f"{where}，原计划失效")
+                    tell(("已撤掉 " + "、".join(self._tag(r) for r in mine)) if mine else "没有在等的入场需要撤", soft=not mine)
+                    return
+                if skip:
+                    tell(f"没有进场：{skip}", soft=True)
+                    return
+                if not cfg.auto_arm_plan:
+                    tell("计划自动执行已关闭，没有进场", soft=True)
+                    return
+                px = self._state(inst_id).last_px or p["level"]
+                pref = cfg.leverage_pref()
+                plan = TradePlan(
+                    direction=act["side"], entry_low=min(px, p["level"]), entry_high=max(px, p["level"]), stop_loss=act["stop_loss"], take_profits=[act["take_profit"]],
+                    leverage=pref[1] if pref else min(cfg.risk.max_leverage, 20), entry_type="now", strategy=act.get("strategy") or "", edge=act.get("edge") or "",
+                    invalidation=p.get("wake_note") or "计划线进场",
+                )
+                check = await self._check_plan(cfg, inst_id, plan)
+                if not check.ok:
+                    tell("没有进场，按现价核对没通过：" + "；".join(check.issues)[:300], soft=True)
+                    return
+                for r in mine:  # 一边成交，另一边作废：先撤掉挂着的入场，再进
+                    await self._drop_plan(cfg, inst_id, r, f"{where}，改按这条线进场")
+                result = await self._enter_now(cfg, inst_id, plan, check, f"计划线 #{rule['id']}：{(p.get('wake_note') or '')[:80]}（{check.numbers()}）", "计划线")
+                if result.status == "pending" and result.pending_id:
+                    self._emit(env, inst_id, "strategy", "ask", "计划线进场等你确认", None, {"pending_id": result.pending_id, "title": result.message, "tool": "open_position"})
+                if result.status in ("executed", "pending"):
+                    for row in self.store.strategies(env, inst_id):
+                        if row["id"] != rule["id"] and row["params"].get("observation") and (row["params"].get("line") or {}).get("do") == "enter":
+                            self.strategies.cancel(row["id"], f"另一条进场线 #{rule['id']} 已经进场，这条作废")
+                tell(result.message, soft=result.status not in ("executed", "pending"))
+        except Exception as exc:  # noqa: BLE001 - 没做成要让 Worker 知道，不能悄悄丢掉
+            log.warning("计划线 #%s 没执行成：%s", rule["id"], exc)
+            tell(f"没有执行成：{_fail_text(exc)[1]}", soft=True)
+
+    async def _lines_gate(self, cfg: AgentConfig, inst_id: str, report: CycleReport, deps: Deps) -> str | None:
+        """结论交出来之前核对计划线：空仓时现价上方、下方各至少一条；进场线按「到了那个价位再进」预检一遍。
+        第一次有问题退回去改；已经退回过一次就不再退：过不了预检的进场线改成只叫醒，其余原样收下。核对本身出错不拦。"""
+        try:
+            st = self._state(inst_id)
+            px = st.last_px
+            worker = self.get_config().worker(inst_id)
+            issues = []
+            if px and not worker.standby and not worker.paused and not (await self.trader.account(cfg.env)).position(inst_id):
+                above, below = sum(l.price > px for l in report.lines), sum(l.price < px for l in report.lines)
+                if not above or not below:
+                    issues.append(
+                        f"计划线不全：现在空仓，现价 {px:g} 上方有 {above} 条、下方有 {below} 条，两边各至少要一条。"
+                        "往上走到哪个结构位你要做什么、往下走到哪个结构位你要做什么，都划出来（do=enter 进场 / cancel 撤单 / wake 叫你来看），不能只押一个方向")
+            pref = cfg.leverage_pref()
+            for line in report.lines:
+                if line.do != "enter":
+                    continue
+                why = ""
+                if not cfg.auto_arm_plan:
+                    why = "计划自动执行已关闭"
+                else:
+                    probe = TradePlan(
+                        direction=line.side, entry_low=line.price, entry_high=line.price, stop_loss=line.stop_loss, take_profits=[line.take_profit],
+                        leverage=pref[1] if pref else min(cfg.risk.max_leverage, 20), strategy=line.strategy, edge=line.edge, invalidation=line.note,
+                        entry_type="pullback" if (line.price < px) == (line.side == "long") else "breakout",
+                    ) if px else None
+                    check = await self._check_plan(cfg, inst_id, probe) if probe else None
+                    if check is not None and not check.ok:
+                        why = "；".join(check.issues)[:240]
+                if not why:
+                    continue
+                if deps.nudged:
+                    line.do, line.note = "wake", f"{line.note}（原想到了就进场，没通过核对：{why[:120]}；到了只叫醒）"[:400]
+                else:
+                    issues.append(f"{line.price:g} 这条进场线没通过核对：{why}。改好价位，或者把它改成 do=wake")
+            return "；\n".join(issues) if issues and not deps.nudged else None
+        except Exception as exc:  # noqa: BLE001 - 核对用的行情 / 账户拿不到：不拦这一轮
+            log.warning("核对计划线失败 %s: %s", inst_id, exc)
+            return None
+
     def _sync_observation_rules(self, cfg: AgentConfig, inst_id: str) -> None:
         st = self._state(inst_id)
         if not st.report or inst_id not in cfg.instruments:
@@ -2324,28 +2478,62 @@ class Watcher:
         key = f"watch_sync:{cfg.env}:{inst_id}"
         if self.store.get(key) == stamp:
             return
+        spec = STYLES[cfg.style_for(inst_id)]
         wanted = {}
-        for level in st.report.get("watch_levels") or []:
-            minutes = level.get("valid_minutes") or STYLES[cfg.style_for(inst_id)]["plan_minutes"]
-            wanted[(level["price"], level.get("note", ""))] = minutes
+        for level in st.report.get("lines") or []:
+            when = level.get("when", "price_touch")
+            bar = (level.get("bar") or spec["struct_bar"]) if when != "price_touch" else ""
+            do = level.get("do") or "wake"
+            act = {"do": "enter", **{k: level.get(k) for k in ("side", "stop_loss", "take_profit", "strategy", "edge")}} if do == "enter" else {"do": do}
+            wanted[(level["price"], when, bar)] = (level.get("note", ""), level.get("valid_minutes") or spec["plan_minutes"], act)
+
+        def near(a: float | None, b: float | None) -> bool:
+            return a == b or bool(a and b and abs(a / b - 1) * 100 <= SAME_LINE_PCT)
+
+        def same(p: dict[str, Any]) -> tuple[float, str, str] | None:
+            """Worker 这一轮划的线里，和这条已有的线是同一条的那个：条件、动作一样，价位几乎没动。"""
+            mine = p.get("line") or {"do": "wake"}
+            for line, (_, _, act) in wanted.items():
+                if (line[1:] == (p["when"], p.get("bar") or "") and near(line[0], p["level"]) and act["do"] == mine["do"] and act.get("side") == mine.get("side")
+                        and near(act.get("stop_loss"), mine.get("stop_loss")) and near(act.get("take_profit"), mine.get("take_profit"))):
+                    return line
+            return None
+
+        # 允许重新划线，但只换真的变了的：价位和动作没动的线原样留着（措辞变了只更新说明），不再每轮全撤重设，否则线永远等不到价格
         for row in self.store.strategies(cfg.env, inst_id):
             p = row["params"]
             if not p.get("observation"):
                 continue
-            line = (p["level"], p.get("wake_note", ""))
-            if wanted.get(line) == p["expires_minutes"] and p["expires_ts"] > now_ms():
+            line = same(p) if p["expires_ts"] > now_ms() else None
+            if line is None:
+                self.strategies.cancel(row["id"], "Worker 这一轮没有再划这条线")
+                continue
+            note = wanted.pop(line)[0]
+            if note and note != p.get("wake_note"):  # 只换说明：等待状态和生效时间都不动
+                self.store._exec("UPDATE strategies SET params=?, note=? WHERE id=?", (json.dumps({**p, "wake_note": note}, ensure_ascii=False), note[:500], row["id"]))
+        # 已经到过一次、还没过期的线不再重设：同一件事只做一次。Worker 还想再用，就换一个价位
+        for row in self.store.strategies(cfg.env, inst_id, live=False):
+            p = row["params"]
+            if row["status"] == "done" and p.get("observation") and p["expires_ts"] > now_ms() and (line := same(p)) is not None:
                 del wanted[line]
-            else:
-                self.strategies.cancel(row["id"], "复盘更新了观察线")
-        for (price, note), minutes in wanted.items():
+        for (price, when, bar), (note, minutes, act) in wanted.items():
+            # 计划线统一存成「到了通知盯盘程序」的线：进场、撤单由 _line_fired 接手（要过核对、要处理另一边），不是执行器直接下单
             row = self.strategies.deploy(cfg, inst_id, "trigger", "", {
-                "when": "price_touch", "level": price, "do": "wake", "wake_note": note,
-                "repeat": True, "cooldown_minutes": cfg.min_review_seconds / 60,
-                "observation": True, "expires_minutes": minutes,
+                "when": when, "level": price, "bar": bar, "do": "wake", "wake_note": note,
+                "observation": True, "expires_minutes": minutes, **({"line": act} if act["do"] != "wake" else {}),
             }, note=note, by="Worker")
-            if px := st.last_px or st.report.get("price"):
+            if when == "price_touch" and (px := st.last_px or st.report.get("price")):
                 self.store.update_strategy(row["id"], state={"previous_px": px})
         self.store.set(key, stamp)
+
+    @staticmethod
+    def _next_look(cfg: AgentConfig, inst_id: str, st: InstState, now: float) -> float:
+        """下次定时看盘的时间：对齐到下一根 K 线收盘（空仓按风格的 look_minutes，有仓按结构周期），不按秒数轮询。
+        离收盘太近（不到三分之一根）就顺延一根，免得刚看完又看。"""
+        spec = STYLES[cfg.style_for(inst_id)]
+        step = (spec["bar_minutes"] if st.had_position else spec["look_minutes"]) * 60
+        due = (now // step + 1) * step + LOOK_DELAY
+        return due if due - now >= max(step / 3, cfg.min_review_seconds) else due + step
 
     def _trigger(self, cfg: AgentConfig, st: InstState, pos: Position | None, now: float) -> str | None:
         has_pos = pos is not None
@@ -2362,6 +2550,10 @@ class Watcher:
             return None
         if st.stale_order and now - st.last_review_ts >= max(cfg.min_review_seconds, 120):
             return st.stale_order
+        if st.has_line_mail:
+            return LINE_WAKE
+        if st.has_market_mail:
+            return "新行情候选待复核"
         if st.last_review_px:
             move = (st.last_px / st.last_review_px - 1) * 100
             if abs(move) >= cfg.wake_move_pct:
@@ -2468,6 +2660,8 @@ class Watcher:
 
     async def _health(self, cfg: AgentConfig) -> list[dict[str, Any]]:
         """Watchdog 的巡检：把整个团队和账户过一遍，每发现一个问题记一条 {key, level, inst_id, text}。"""
+        if self._auth_retry_at:
+            return [{"key": "okx", "level": "bad", "inst_id": "", "text": self.last_error[:160]}]
         try:
             account = await self.trader.account(cfg.env)
         except Exception as exc:  # noqa: BLE001
@@ -2559,6 +2753,8 @@ class Watcher:
                 log.warning("Watchdog 恢复巡检失败：%s", why)
             if beats % 4 == 1:
                 for attr, job, timeout in (("_patrol_task", self._patrol, 45), ("_maintenance_task", self._maintenance, 900)):
+                    if self._auth_retry_at and attr == "_maintenance_task":
+                        continue
                     task = getattr(self, attr)
                     if task and not task.done():
                         continue
@@ -2617,7 +2813,7 @@ class Watcher:
         prompt = (
             f"品种 {inst_id}，事件：{reason}。现价 {st.last_px:g}，上次复盘在 {ago} 分钟前，当时价格 {last.get('price')}。\n"
             f"上次结论：{last.get('summary')}\n上次计划：{json.dumps(last.get('plan'), ensure_ascii=False)}\n"
-            f"盯盘价位：{json.dumps(last.get('watch_levels'), ensure_ascii=False)}\n当前没有持仓。"
+            f"盯盘价位：{json.dumps(last.get('lines'), ensure_ascii=False)}\n当前没有持仓。"
         )
         try:
             result = await asyncio.wait_for(self._gate(cfg).run(prompt, model_settings=_effort("low", "ouy-gate"), usage_limits=UsageLimits(request_limit=3)), 60)
@@ -2641,7 +2837,7 @@ class Watcher:
                     st.skips += 1
                     st.last_review_ts = time.time()
                     st.last_review_px = st.last_px or st.last_review_px
-                    st.next_due_ts = st.last_review_ts + min(cfg.review_seconds, STYLES[cfg.style_for(inst_id)]["max_review"])
+                    st.next_due_ts = self._next_look(cfg, inst_id, st, st.last_review_ts)
                     work_id = self.store.add_work(cfg.env, inst_id, "event", reason, "skipped", model="规则" if why.startswith("规则过滤") else cfg.router_model)
                     self.store.update_work(work_id, "skipped", why)
                     self._emit(cfg.env, inst_id, "router", "skip", f"{reason} → 不唤醒 Worker：{why}", work_id)
@@ -2649,6 +2845,7 @@ class Watcher:
                     return
             await self.review(inst_id, reason, source="event")
             st.pending_wakes = [r for r in st.pending_wakes if r not in pending]
+            st.pending_hard = st.pending_hard and bool(st.pending_wakes)
             st.last_error = ""
             st.fails = 0
             st.retry_after_ts = 0.0
@@ -2752,9 +2949,11 @@ class Watcher:
             deps = Deps(
                 trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons,
                 remember=lambda inst, note: self._remember(cfg.env, inst, note),
-                sub=self._sub_from_worker, spawn=self._spawn, close_sub=self._close_sub,
+                sub=partial(self._sub_from_worker, owner_inst_id=inst_id, parent_work_id=work_id),
+                spawn=partial(self._spawn, owner_inst_id=inst_id, parent_work_id=work_id),
+                close_sub=partial(self._close_sub, owner_inst_id=inst_id),
                 emit=self._emitter(cfg.env, inst_id, "worker", work_id),
-                strategy=self.strategies, standby=self._stop_watching, plan_check=self._plan_checker(cfg, inst_id, best), set_quant=self._set_quant,
+                strategy=self.strategies, standby=self._stop_watching, plan_check=self._plan_checker(cfg, inst_id, best), lines_check=partial(self._lines_gate, cfg, inst_id), set_quant=self._set_quant,
             )
             # 被行情事件叫醒（触及价位、进入入场区间、异动、仓位变化）：要快，用低一档的思考强度；定时复盘和用户交代的事用正常强度
             fast = source == "event" and reason not in ("定时复盘", "开始盯盘，首次复盘") and "留言" not in reason
@@ -3031,9 +3230,9 @@ class Watcher:
                 if mine:
                     return {"status": "kept", "text": f"之前照计划布置的 {ids} 继续等（价格先到止损、没回来就先到第一目标、或者到期，它会自己作废）"}
                 if not skip and report.no_plan_reason:
-                    wait = "；".join(f"{w.price:g}：{w.note}" for w in report.watch_levels[:3])
+                    wait = "；".join(f"{w.price:g}：{w.note}" for w in report.lines[:4])
                     return {"status": "watching", "text": f"本轮没有入场委托：{self.NO_PLAN[report.no_plan_reason]}。"
-                            + (f"观察位：{wait}（触及只复核）。" if wait else "没有设置观察价，等待下一次行情事件或定时复核。")}
+                            + (f"计划线：{wait}。" if wait else "没有划计划线，等待下一次行情事件或定时看盘。")}
                 return None
             if skip:
                 if skip == "已有入场挂单":
@@ -3199,11 +3398,10 @@ class Watcher:
         st.report = record
         st.fails, st.retry_after_ts, st.last_error = 0, 0.0, ""
         st.error_work_id = None
-        st.observe_price = None
         st.skips = 0
         st.last_review_ts = time.time()
         st.last_review_px = extra["price"]
-        st.next_due_ts = st.last_review_ts + min(max(report.next_check_seconds, cfg.min_review_seconds), cfg.review_seconds, STYLES[cfg.style_for(inst_id)]["max_review"])
+        st.next_due_ts = self._next_look(cfg, inst_id, st, st.last_review_ts)
         self.store.set(f"report:{cfg.env}:{inst_id}", record)
         self._sync_observation_rules(cfg, inst_id)
         self._note("cycle", report.summary, record, inst_id=inst_id)
@@ -3322,7 +3520,10 @@ class Watcher:
         deps = Deps(
             trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, propose_only=kind == "task",
             remember=lambda inst, note: self._remember(cfg.env, inst, note),
-            sub=self._sub_from_worker, spawn=self._spawn, close_sub=self._close_sub, emit=self._emitter(cfg.env, inst_id, "worker", work_id), strategy=self.strategies, standby=self._stop_watching,
+            sub=partial(self._sub_from_worker, owner_inst_id=inst_id, parent_work_id=work_id),
+            spawn=partial(self._spawn, owner_inst_id=inst_id, parent_work_id=work_id),
+            close_sub=partial(self._close_sub, owner_inst_id=inst_id),
+            emit=self._emitter(cfg.env, inst_id, "worker", work_id), strategy=self.strategies, standby=self._stop_watching,
             plan_check=self._plan_checker(cfg, inst_id) if kind == "review" else None, set_quant=self._set_quant,
         )
         agent = self._worker_agent(cfg, inst_id) if kind == "review" else self._task_agent(cfg, inst_id)
@@ -3557,7 +3758,7 @@ class Watcher:
             lines.append(streak)
         goal = self.goal(cfg.env, inst_id)
         if cfg.worker(inst_id).standby:
-            lines.append(f"【你现在是停下的状态】{cfg.worker(inst_id).paused_by or '用户让你停下'}。这次是触发线、策略、留言或持仓变化把你叫醒的：处理完这件事，把接下来要等的价位写进 watch_levels 或布置成策略。")
+            lines.append(f"【你现在是停下的状态】{cfg.worker(inst_id).paused_by or '用户让你停下'}。这次是触发线、策略、留言或持仓变化把你叫醒的：处理完这件事，把接下来要等的价位写成计划线（lines）或布置成策略。")
         if goal and goal["status"] in ("stopped", "done"):
             lines.append(f"【目标已结束：{goal['note']}】不能开仓、加仓，也不能自己重设目标；等用户给新的目标。")
         if goal and goal["status"] == "active":
@@ -3651,15 +3852,21 @@ class Watcher:
             "一种做法你用过、也验证了有效，用 write_strategy 写成一条存进来；复盘发现规则有问题就用 write_strategy 改写同名的那条；"
             "确实不好用的用 delete_strategy 删掉。停用的策略不能直接用，改写之后才会重新启用。"
         )
-        loose = [w for w in ((self._state(inst_id).report or {}).get("watch_levels") or []) if re.search(r"撤|减仓|平仓|平掉|止盈|移止损|保本|收紧|做多|做空|开多|开空|挂单|加仓|离场", w.get("note") or "")]
-        if loose:  # 上一轮把要做的动作只写在了观察线的说明里：到了不会自动执行
+        loose = [w for w in ((self._state(inst_id).report or {}).get("lines") or [])
+                 if (w.get("do") or "wake") == "wake" and re.search(r"撤|减仓|平仓|平掉|止盈|移止损|保本|收紧|做多|做空|开多|开空|挂单|加仓|离场", w.get("note") or "")]
+        if loose:  # 上一轮把要做的动作只写在了「只叫醒」的线的说明里：到了不会自动执行
             lines.append(
-                "【这些动作还只是观察线】上一轮你在 watch_levels 里写了到价要做的动作，但观察线到了只会叫醒你，不会自动执行："
+                "【这些线到了只会叫醒你】上一轮这几条计划线是 do=wake，说明里却写了要做的动作，程序到了不会替你做："
+                + "；".join(f"{w['price']:g}：{str(w.get('note'))[:60]}" for w in loose[:6])
+                + "。仍然有效的，这一轮把这条线改成 do=enter（进场）或 do=cancel（撤单）；减仓、移止损这类用 add_trigger。已经有触发器或挂单在管的就不用重复写。"
+            )
+        lines.append(
+                "【这些动作还只是观察线】上一轮你在 lines（计划线） 里写了到价要做的动作，但观察线到了只会叫醒你，不会自动执行："
                 + "；".join(f"{w['price']:g}：{str(w.get('note'))[:60]}" for w in loose[:6])
                 + "。仍然有效、还没有对应触发器的，这一轮用 add_trigger 写成触发器（条件 → 操作），让程序到了直接执行；已经有触发器或挂单在管的就不用重复写。"
             )
         lines.append(
-            "【什么时候停】你不能因为没行情、空仓、觉得今天不适合就停，也不要让 Router 代停：现在进不了就把单挂在结构位上等（plan 的 pullback / breakout），需要你到时再判断的价位写进 watch_levels。"
+            "【什么时候停】你不能因为没行情、空仓、觉得今天不适合就停，也不要让 Router 代停：现在进不了就把单挂在结构位上等（plan 的 pullback / breakout），到了要进场、撤单或再判断的价位都写成计划线（lines）。"
             "只有用户 / Router 交代给你的停止条件达到了才停：净赚多少、最多亏多少、做多久由系统核对并自动停；"
             "目标里写了别的停止条件（【停止条件】那一句）而且确实达到了，用 stop_watching 停下并写明依据。"
         )
@@ -3728,7 +3935,7 @@ class Watcher:
             ))
             if not plan and report.get("no_plan_reason") in self.NO_PLAN:
                 rows.append("未开仓原因：" + self.NO_PLAN[report["no_plan_reason"]])
-            if levels := report.get("watch_levels"):
+            if levels := report.get("lines"):
                 rows.append("当轮关注：" + "；".join(f"{v['price']} {v.get('note', '')}" for v in levels[:3]))
         return "\n".join(rows)
 
@@ -3825,7 +4032,9 @@ class Watcher:
         deps = Deps(
             trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, propose_only=True,
             remember=lambda inst, note: self._remember(cfg.env, inst, note),
-            sub=self._sub_from_worker, spawn=self._spawn, close_sub=self._close_sub,
+            sub=partial(self._sub_from_worker, owner_inst_id=inst_id, parent_work_id=work_id),
+            spawn=partial(self._spawn, owner_inst_id=inst_id, parent_work_id=work_id),
+            close_sub=partial(self._close_sub, owner_inst_id=inst_id),
             emit=self._emitter(cfg.env, inst_id, "worker", work_id),
             strategy=self.strategies, standby=self._stop_watching, set_quant=self._set_quant,
         )
@@ -3935,7 +4144,7 @@ class Watcher:
             rows[inst] = {
                 "状态": status,
                 "交易风格": STYLES[cfg.style_for(inst)]["label"],
-                "唤醒方式": "一直唤醒" if cfg.wake_for(inst) == "always" else "有事才唤醒",
+                "定时看盘": "每次都看" if cfg.wake_for(inst) == "always" else "没变化就跳过",
                 "模型": cfg.model_for(inst) or "默认",
                 "模拟盘流动性": st.illiquid or None,
                 "连续失败": st.fails or None,

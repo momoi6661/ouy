@@ -163,7 +163,7 @@ export function Cockpit({ state, account, ticks, journal, pending, inst, redUp, 
       for (const l of levelsOf(past)) out.push({ price: l.price, color: color[l.kind], title: l.title, dashed: true });
     }
     for (const l of st?.rules ?? []) {
-      if (l.type === "watch" && l.status === "waiting" && l.level) out.push({ price: l.level, color: "#848e9c", title: "观察", dashed: true, group: "watch" });
+      if (l.type === "watch" && l.status === "waiting" && l.level) out.push({ price: l.level, color: "#848e9c", title: l.action === "open_market" ? "进场线" : l.action === "cancel_orders" ? "撤单线" : "叫醒线", dashed: true, group: "watch" });
     }
     for (const s of st?.strategies ?? []) {
       const p = s.params;

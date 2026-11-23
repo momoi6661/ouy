@@ -8,6 +8,7 @@ import { Chart, useLotEntries, type ChartLine } from "../components/Chart";
 import { ErrorDetails } from "../components/ErrorDetails";
 import { Positions } from "../components/Positions";
 import { AlgoPanel } from "../components/AlgoPanel";
+import { LineForm } from "../components/LineForm";
 import { Recorders } from "../components/Recorders";
 import { AssetsPanel } from "../components/AssetsPanel";
 import { useLevelLines } from "../components/LevelLines";
@@ -36,7 +37,7 @@ const RULE_ACTION: Record<string, string> = {
 };
 const TRG_FILTERS: [string, string][] = [["live", "等待中"], ["ended", "已结束"], ["all", "全部"]];
 const trgShown = (r: Rule, f: string) => f === "all" || RULE_LIVE.includes(r.status) === (f === "live");
-const SIDE_TABS: [string, string][] = [["overview", "总览"], ["algo", "算法"], ["tasks", "任务"], ["triggers", "触发器"], ["watch", "观察线"], ["positions", "持仓"], ["order", "下单"], ["chart", "K 线"], ["account", "账户"]];
+const SIDE_TABS: [string, string][] = [["overview", "总览"], ["algo", "算法"], ["tasks", "任务"], ["triggers", "触发线"], ["positions", "持仓"], ["order", "下单"], ["chart", "K 线"], ["account", "账户"]];
 const BIAS = { long: "看多", short: "看空", neutral: "观望" } as const;
 const WORK_STATE: Record<string, string> = { queued: "排队", running: "进行中", waiting: "等你同意", done: "完成", failed: "失败" };
 const WORK_FROM: Record<string, string> = { user: "交办", event: "行情触发", manual: "手动复盘" };
@@ -399,19 +400,17 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   }, [coin]);
   // 触发器清单：已经不在的挂单，它的撤单条件不再列出
   const allRules = (st?.rules ?? []).filter((r) => !r.ord_id || account?.orders.some((o) => o.ord_id === r.ord_id));
-  // 观察线也是一种触发器（到了叫醒 Worker），界面上单独一页；触发器页只放条件到了程序直接执行的
-  const watchPage = sideTab === "watch";
   const stForNode = (node: string) => {
     const [instrument, suffix] = node.split(":");
     if (!/^s\d+$/.test(suffix ?? "")) return undefined;
     return agent.instruments[instrument]?.rules?.find((r) => r.strategy_id === Number(suffix.slice(1)));
   };
-  const rules = allRules.filter((r) => !r.recorder && (r.type === "watch") === watchPage);
+  // 触发线：只叫醒 Worker 的线和到了直接下单、撤单的线放在同一页，用「到了做什么」筛
+  const rules = allRules.filter((r) => !r.recorder);
   const actions = [...new Set(rules.flatMap((r) => r.action ? [r.action] : []))];
-  const actionFilter = !watchPage && actions.includes(trgAction) ? trgAction : "";
+  const actionFilter = actions.includes(trgAction) ? trgAction : "";
   const shownRules = rules.filter((r) => trgShown(r, trgFilter) && (!actionFilter || r.action === actionFilter));
-  const liveTriggers = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status) && r.type !== "watch").length;
-  const liveWatch = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status) && r.type === "watch").length;
+  const liveTriggers = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status)).length;
   const openWork = work.filter((w) => w.status === "running" || w.status === "queued" || w.status === "waiting");
   const pastWork = work.filter((w) => w.status === "done" || w.status === "failed").slice(0, 4);
 
@@ -458,7 +457,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
       preview.take_profits.forEach((price) => out.push({ price, color: "#0ecb81", title: "方案止盈", dashed: true }));
     }
     for (const w of st?.rules ?? []) {
-      if (w.type === "watch" && w.status === "waiting" && w.level) out.push({ price: w.level, color: "#9aa4b2", title: "观察", dashed: true, group: "watch" });
+      if (w.type === "watch" && w.status === "waiting" && w.level) out.push({ price: w.level, color: "#9aa4b2", title: w.action === "open_market" ? "进场线" : w.action === "cancel_orders" ? "撤单线" : "叫醒线", dashed: true, group: "watch" });
     }
     for (const order of account?.orders ?? []) {
       if (order.inst_id === coin && order.px) out.push({ price: order.px, color: "#f0b90b", title: order.side === "buy" ? "买单" : "卖单", dashed: true, group: "orders" });
@@ -633,7 +632,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             setTab("chat");
           } else {
             const rule = stForNode(v);
-            setSideTab(v.endsWith(":pos") ? "positions" : rule ? (rule.recorder ? "overview" : rule.type === "watch" ? "watch" : "triggers") : v.includes(":") && !v.endsWith(":quant") ? "tasks" : "overview");
+            setSideTab(v.endsWith(":pos") ? "positions" : rule ? (rule.recorder ? "overview" : "triggers") : v.includes(":") && !v.endsWith(":quant") ? "tasks" : "overview");
             if (rule) {
               setTrgFilter("all");
               setTrgAction("");
@@ -845,7 +844,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               {label}
               {id === "tasks" && openWork.length > 0 && <em>{openWork.length}</em>}
               {id === "triggers" && liveTriggers > 0 && <em>{liveTriggers}</em>}
-              {id === "watch" && liveWatch > 0 && <em>{liveWatch}</em>}
               {id === "positions" && pos && <em>1</em>}
             </button>
           ))}
@@ -1192,12 +1190,12 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             </div>
           ))}
         </div>
-        <div className="ws-card wide trg" hidden={sideTab !== "triggers" && !watchPage}>
+        <div className="ws-card wide trg" hidden={sideTab !== "triggers"}>
           <div className="trg-head">
             <div>
-              <b>{watchPage ? "观察线" : "触发器"}</b>
+              <b>触发线</b>
               <span className="muted small">
-                {watchPage ? "一行一条：到了这个位置程序叫醒 Worker 来判断，不会自己下单" : "一行一条：等什么条件 → 到了做什么。标着「自动执行」的由程序直接做，不经过 Worker 思考"}
+                一行一条：到了什么条件 → 做什么。「提醒 Worker」的只叫它来看；其余的由程序直接下单、撤单或平仓（照样过风控），做完再告诉 Worker
               </span>
             </div>
             <button
@@ -1205,7 +1203,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               disabled={!!acting || !rules.some((r) => !RULE_LIVE.includes(r.status))}
               title="清掉已执行、没执行成、已撤销、已过期的记录；还在等的不动"
               onClick={() =>
-                window.confirm(`清除 ${shortInst(coin)} 已结束的触发器记录？还在等待的触发器不受影响。`) && act("clear-trg", () => api.clearHistory(coin, "triggers"), "已清除")
+                window.confirm(`清除 ${shortInst(coin)} 已结束的触发线记录？还在等待的不受影响。`) && act("clear-trg", () => api.clearHistory(coin, "triggers"), "已清除")
               }
             >
               清除已结束
@@ -1218,17 +1216,16 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               ))}
             </div>
           </div>
-          {!watchPage && actions.length > 0 && (
-            <select aria-label="按动作筛选触发器" value={actionFilter} onChange={(e) => setTrgAction(e.target.value)}>
-              <option value="">全部动作</option>
+          <LineForm coin={coin} last={last} busy={!!acting} run={(fn, ok) => act("line", fn, ok)} />
+          {actions.length > 1 && (
+            <select aria-label="按到了做什么筛选" value={actionFilter} onChange={(e) => setTrgAction(e.target.value)}>
+              <option value="">到了做什么：全部</option>
               {actions.map((id) => <option key={id} value={id}>{RULE_ACTION[id] ?? id}</option>)}
             </select>
           )}
           {shownRules.length === 0 && (
             <p className="muted trg-empty">
-              {actionFilter ? "没有符合当前动作和状态筛选的触发器。" : watchPage
-                ? trgFilter === "ended" ? "最近 12 小时没有结束的观察线。" : "现在没有观察线。Worker 写了「到某个位置叫我来看」会出现在这里。"
-                : trgFilter === "ended" ? "最近 12 小时没有执行过或结束的触发器。" : "现在没有在等的触发器。Worker 写了「到某个情况就做某件事」会出现在这里。"}
+              {actionFilter ? "没有符合当前筛选的触发线。" : trgFilter === "ended" ? "最近 12 小时没有执行过或结束的触发线。" : "现在没有在等的触发线。Worker 做计划时会划；你也可以在上面自己加一条。"}
             </p>
           )}
           {shownRules.map((r) => (

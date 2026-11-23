@@ -16,7 +16,7 @@ const GROUPS: [string, string, string, string][] = [
   ["events", "算法触发", "#a78bfa", "各个算法（行情判断、转折、候选位、快判、保盈线……）每次触发的那根 K 线上画一个圆点：紫色是还没核对，绿色 / 红色是 15 分钟后价格照它说的走了 / 走反了。明细在「算法」页"],
   ["algo", "算法候选位", "#f59e0b", "最近一次复盘时算法给 Worker 的入场候选：入场、止损、目标。只画合格的前两条；是参考位，不是已经下的单"],
   ["plan", "Worker 计划", "#8ab4ff", "Worker 当前计划的入场区间、止损和目标"],
-  ["watch", "观察线", "#9aa4b2", "到了只叫醒 Worker 的价位"],
+  ["watch", "计划线", "#9aa4b2", "Worker 每轮划的线：到了由程序进场、撤单或叫醒它"],
   ["trigger", "触发器", "#c084fc", "触发器和到价策略的触发价、止损止盈，以及挂单的撤单线"],
   ["orders", "当前挂单", "#f0b90b", "交易所当前委托的价格"],
 ];
@@ -37,7 +37,7 @@ function previousShow(): string[] {
 }
 
 /** K 线上的参考线：上一段的高点低点（按时间段分别开关）、区间上下沿、支撑、阻力（各一个开关）。每 20 秒更新。
- *  Worker 的计划、观察线、触发器这几类线由页面自己画，这里只管它们的开关（on）。
+ *  Worker 的计划、计划线、触发器这几类线由页面自己画，这里只管它们的开关（on）。
  *  工作台和交易页共用同一份开关设置。返回要画的线和那一排开关。 */
 export function useLevelLines(inst: string, bar: string, candidates?: Candidate[]) {
   const [levels, setLevels] = useState<ChartLevels | null>(null);

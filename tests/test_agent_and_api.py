@@ -26,7 +26,7 @@ REPORT = {
     "bias": "long", "confidence": 0.7, "summary": "上升趋势回踩 EMA20 企稳，按趋势回踩策略开多。",
     "plan": {"direction": "long", "entry_low": 59_800, "entry_high": 60_100, "stop_loss": 59_400, "take_profits": [61_000, 62_000],
              "leverage": 5, "invalidation": "15m 收盘跌破 59400"},
-    "watch_levels": [{"price": 60_600, "note": "1R，止损移保本"}], "next_check_seconds": 120,
+    "lines": [{"price": 60_600, "note": "1R，止损移保本"}, {"price": 59_300, "note": "跌破这里原判断失效"}],
 }
 
 
@@ -113,7 +113,7 @@ async def test_triggers(settings, fake):
     st = InstState()
     assert "首次" in w._trigger(cfg, st, None, 1000.0)
     st.last_review_ts, st.last_review_px, st.next_due_ts = 1000.0, 60_000, 1300.0
-    st.report = {"watch_levels": [{"price": 60_600, "note": "1R"}], "plan": None}
+    st.report = {"lines": [{"price": 60_600, "note": "1R"}], "plan": None}
     st.prev_px, st.last_px = 60_000, 60_010
     assert w._trigger(cfg, st, None, 1010.0) is None  # 距上次复盘太近
     assert w._trigger(cfg, st, None, 1100.0) is None  # 没异动、没到点
@@ -201,7 +201,7 @@ async def test_emergency_exit_respects_advise_mode(settings, fake):
     assert BTC in fake.positions
 
 
-async def test_watcher_loop_runs_a_review_and_stops_on_lost_auth(settings, fake):
+async def test_watcher_loop_runs_a_review_and_degrades_on_lost_auth(settings, fake):
     rt = make_rt(settings, fake, scripted_model([]))
     rt.save_config(AgentConfig(mode="auto", instruments=[BTC], tick_seconds=2))
     await rt.watcher.start()
@@ -210,13 +210,18 @@ async def test_watcher_loop_runs_a_review_and_stops_on_lost_auth(settings, fake)
         if BTC in fake.positions and not rt.watcher._state(BTC).reviewing:
             break
     assert BTC in fake.positions and rt.watcher.status()["instruments"][BTC]["report"]["bias"] == "long"
-    fake.logged_in = False  # 授权失效：盯盘循环应当自己停下来并留下记录
-    for _ in range(80):
-        await asyncio.sleep(0.05)
-        if not rt.watcher.running:
-            break
-    assert not rt.watcher.running
-    assert any("授权已失效" in e["title"] for e in rt.store.journal("demo"))
+    try:
+        fake.logged_in = False
+        writes = len(fake.called("swap_place_order"))
+        for _ in range(80):
+            await asyncio.sleep(0.05)
+            if rt.watcher._auth_retry_at:
+                break
+        assert rt.watcher.running and rt.watcher._auth_retry_at
+        assert len(fake.called("swap_place_order")) == writes
+        assert any("授权暂不可用" in e["title"] for e in rt.store.journal("demo"))
+    finally:
+        await rt.watcher.stop()
 
 
 async def test_start_refuses_without_login(settings, fake):
@@ -600,7 +605,7 @@ async def test_fast_path_skips_quiet_ticks_without_calling_the_model_and_failure
 
     rt = make_rt(settings, fake, FunctionModel(run))
     st = rt.watcher._state(BTC)
-    st.report = {**REPORT, "ts": 0, "price": 60_000, "plan": None, "watch_levels": [{"price": 61_500, "note": "区间上沿"}]}
+    st.report = {**REPORT, "ts": 0, "price": 60_000, "plan": None, "lines": [{"price": 61_500, "note": "区间上沿"}]}
     st.last_px, st.last_review_px = 60_020, 60_000
     await rt.watcher._review_task(BTC, "定时复盘", gate=True)
     assert not calls and st.skips == 1 and st.last_gate.startswith("规则过滤")
@@ -623,7 +628,7 @@ async def test_fourth_quiet_timer_does_not_force_a_worker_review(rt, fake):
     st.skips = 3
     st.last_review_ts = time.time() - 3600
     st.last_review_px = fake.prices[BTC]
-    st.report = {"summary": "观察", "watch_levels": []}
+    st.report = {"summary": "观察", "lines": []}
     await w._tick(cfg)
     assert st.task is not None
     await st.task
@@ -1132,21 +1137,24 @@ async def test_worker_spawns_its_own_subagents_on_the_fly(settings, fake):
         if not returns:
             assert "spawn_subagent" in tools
             return ModelResponse(parts=[
-                ToolCallPart("spawn_subagent", {"inst_id": BTC, "name": "关键位核对", "task": "核对 60000 这个位置近 4 小时有没有守住"}),
-                ToolCallPart("spawn_subagent", {"inst_id": BTC, "name": "资金费率", "task": "查现在的资金费率和持仓量，说明拥挤不拥挤"}),
+                ToolCallPart("spawn_subagent", {"inst_id": ETH, "name": "关键位核对", "task": "核对 60000 这个位置近 4 小时有没有守住"}),
+                ToolCallPart("ask_subagent", {"inst_id": ETH, "role": "intel", "task": "查现在的资金费率和持仓量，说明拥挤不拥挤"}),
             ])
         assert len(returns) == 2 and all("60000" in str(r.content) and "子代理没查成" not in str(r.content) for r in returns)  # 结果交回到了 Worker 手上
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, REPORT)])
 
     rt = make_rt(settings, fake, FunctionModel(run))
     await rt.watcher.review(BTC, "定时复盘")
-    assert len(tasks) == 2 and any("核对 60000" in t for t in tasks) and all("模拟盘" in t for t in tasks)
-    work = [w for w in rt.store.work_items("demo") if w["source"] == "adhoc"]
-    assert len(work) == 2 and all(w["status"] == "done" for w in work)
-    acts = [a for a in rt.store.activity("demo") if a["agent"] == "adhoc"]
-    assert {a["data"]["name"] for a in acts if a["kind"] == "done"} == {"关键位核对", "资金费率"}
+    assert len(tasks) == 2 and any("核对 60000" in t for t in tasks) and all(ETH in t for t in tasks)
+    work = rt.store.work_items("demo", inst_id=BTC)
+    children = [w for w in work if w["source"] in ("adhoc", "intel")]
+    assert len(children) == 2 and all(w["status"] == "done" for w in children)
+    assert not rt.store.work_items("demo", inst_id=ETH)
+    parent = next(w for w in work if w["source"] == "manual")
+    acts = [a for a in rt.store.activity("demo") if a["agent"] in ("adhoc", "intel") and a["kind"] == "done"]
+    assert len(acts) == 2 and all(a["data"]["parent_work_id"] == parent["id"] and a["data"]["subject_inst_id"] == ETH for a in acts)
     assert rt.watcher.status()["instruments"][BTC]["adhoc"] == []  # 一次性的：交回结果就从图上消失
-    for i in range(4):  # 10 分钟内最多 6 次
+    for i in range(5):  # 10 分钟内最多 6 次
         await rt.watcher._spawn(BTC, f"第{i}个", "随便查查")
     with pytest.raises(RuntimeError, match="10 分钟内"):
         await rt.watcher._spawn(BTC, "多出来的", "随便查查")

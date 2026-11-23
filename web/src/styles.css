@@ -3618,3 +3618,6 @@ select option:checked { background: #2b3340; color: #f0b90b; }
 .cache-bars { display: flex; align-items: flex-end; gap: 2px; height: 48px; margin-bottom: 12px; border-bottom: 0.5px solid var(--line); }
 .cache-bars i { flex: 1; max-width: 10px; background: var(--blue); opacity: 0.75; border-radius: 1px 1px 0 0; }
 .algo-table tr.algo-layer td { padding-top: 10px; color: var(--muted); font-size: 11px; white-space: normal; width: auto; }
+.line-new { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.line-new input, .line-new select { padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.04); color: inherit; font-variant-numeric: tabular-nums; }
+.line-new input { width: 112px; }

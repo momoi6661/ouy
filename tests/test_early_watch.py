@@ -7,7 +7,9 @@ import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 
-from ouy.agent.early_watch import QuoteWatch, ShiftRetest
+from ouy.agent.early_watch import ShiftRetest
+from ouy.agent.signals import trend_run
+from ouy.indicators import Candle
 from ouy.agent.watcher import InstState
 from .test_agent_and_api import BTC, make_rt
 
@@ -32,18 +34,6 @@ async def test_confirmed_turn_reaches_the_review_already_in_progress(rt, monkeyp
     assert len(messages) == 1
     assert "5 分钟收盘确认转折" in messages[0][0] and messages[0][1] == "asap"
     assert state.task is None
-
-
-def test_quotes_approach_without_touch_or_repeated_wake():
-    watch = QuoteWatch()
-    events = [watch.sample(3 * i, px, {100}, .6) for i, px in enumerate(
-        [99.7, 99.82, 99.87, 99.88, 99.87, 99.88, 99.89])]
-    assert [i for i, event in enumerate(events) if event] == [2]
-    assert "尚未触线" in events[2]
-    for t in range(21, 90, 3):
-        assert not watch.sample(t, 99.88, {100}, .6)
-    assert not watch.sample(90, 99.65, {100}, .6)
-    assert "接近观察位" in watch.sample(93, 99.87, {100}, .6)
 
 
 def test_opening_quote_rollover_dedup_and_minute_history(settings, fake):
@@ -79,69 +69,6 @@ def test_shift_retest_needs_fresh_distinct_quotes_and_limits_wakes(side, adverse
     assert "疑似假突破" in watch.sample(1021, 1021, adverse, m) and not watch.first_loss
     watch = ShiftRetest()
     assert not any(watch.sample(t, t, adverse, m) for t in (1040, 1043))  # 结构样本太旧
-
-
-@pytest.mark.parametrize(("prices", "event"), [([100, 100.10, 100.35], "反弹"), ([100, 99.90, 99.65], "回落")])
-def test_fast_move_without_level_and_no_stale_or_duplicate_samples(prices, event):
-    watch = QuoteWatch()
-    assert not watch.sample(0, prices[0], set(), .6)
-    assert not watch.sample(3, prices[1], set(), .6)
-    assert not watch.sample(3, 120, set(), .6)
-    assert not watch.sample(1, 70, set(), .6)
-    assert event in watch.sample(6, prices[2], set(), .6)
-    assert not watch.sample(200, 110, set(), .6)
-
-
-@pytest.mark.parametrize("env", ["demo", "live"])
-async def test_actual_tick_only_observes_demo_without_orders(settings, fake, monkeypatch, env):
-    requests = []
-
-    def run(messages, info):
-        assert not info.function_tools
-        requests.append(str(messages))
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name,
-                                                 {"reason": "尚未确认突破，先观察。", "observe_price": 99.92})])
-
-    rt = make_rt(settings, fake, FunctionModel(run))
-    cfg = rt.config().model_copy(update={"env": env, "intel_minutes": 0})
-    rt.save_config(cfg)
-    w = rt.watcher
-    st = w._state(BTC)
-    report = st.report = {"watch_levels": [{"price": 100, "note": "前高"}], "summary": "等待确认"}
-    start = time.time()
-    st.last_review_ts, st.next_due_ts, st.last_review_px = start, start + 300, 99.7
-    stamp = [start - 9]
-    base = fake._market_get_ticker
-    monkeypatch.setattr(fake, "_market_get_ticker", lambda args: [{**base(args)[0], "ts": int(stamp[0] * 1000)}])
-    for px in [99.7, 99.82, 99.87, 99.88]:
-        fake.set_price(BTC, px)
-        await w._tick(cfg)
-        if st.observe_task:
-            await st.observe_task
-        stamp[0] += 3
-
-    assert len(requests) == (1 if env == "demo" else 0)
-    assert st.observe_price == (99.92 if env == "demo" else None)
-    assert st.report is report and st.last_review_ts == start and not st.task
-    assert not fake.positions and not fake.orders and not fake.algos
-    if env == "demo":
-        assert "尚未触线" in requests[0]
-
-
-async def test_no_observation_after_stale_quote_or_stale_busy_signal(rt):
-    w, cfg = rt.watcher, rt.config()
-    st = w._state(BTC)
-    st.report = {"watch_levels": [{"price": 100}]}
-    now = time.time()
-    st.last_px = 99.65
-    w._sample_observation(cfg, BTC, st, now - 60, now, False)
-    assert not st.quote_watch.samples
-    w._sample_observation(cfg, BTC, st, now, now, True)
-    st.last_px = 99.88
-    w._sample_observation(cfg, BTC, st, now + 3, now + 3, True)
-    assert st.pending_observation and not st.observe_task
-    w._sample_observation(cfg, BTC, st, now + 24, now + 24, False)
-    assert not st.pending_observation and not st.observe_task
 
 
 async def test_one_turn_wakes_the_worker_once_and_logs_the_rest_under_one_algorithm(rt, fake, monkeypatch):
@@ -181,3 +108,66 @@ async def test_one_turn_wakes_the_worker_once_and_logs_the_rest_under_one_algori
     assert len([r for r in woken if "疑似假突破" in r]) == 1 and not any("回到原突破方向" in r for r in woken)
     turn = w.status()["instruments"][BTC]["turn"]
     assert turn["stage"] == "lost" and turn["side"] == "long" and turn["level"] == 100.0
+
+
+def _closes(closes: list[float], step_ms: int = 900_000) -> list[Candle]:
+    out, prev = [], closes[0]
+    for i, close in enumerate(closes):
+        out.append(Candle(i * step_ms, prev, max(prev, close) + 1, min(prev, close) - 1, close, 100.0))
+        prev = close
+    return out
+
+
+def test_trend_run_needs_consecutive_closes_and_enough_distance():
+    flat = [100 + (i % 2) for i in range(31)]  # 一上一下，最后一根收低：平均波幅约 3
+    assert trend_run(_closes(flat)) is None
+    assert trend_run(_closes([*flat, 103, 105])) is None  # 只连了两根
+    assert trend_run(_closes([*flat, 102, 103, 104])) is None  # 连了三根但没走出几倍波幅
+    run = trend_run(_closes([*flat, 104, 108, 112]))
+    assert run and run["side"] == "long" and run["bars"] == 3 and run["origin"] == 100 and run["to"] == 112 and run["step"] == 1
+    assert run["ts"] == 30 * 900_000 and run["bar_ts"] == 33 * 900_000
+    longer = trend_run(_closes([*flat, 104, 108, 112, 113]))
+    assert longer["ts"] == run["ts"] and longer["step"] == 1  # 同一段走线、没多走出一档：不算新事件
+    assert trend_run(_closes([*flat, 104, 108, 112, 124]))["step"] == 2
+    down = trend_run(_closes([*flat, 97, 93, 89]))
+    assert down["side"] == "short" and down["pct"] < 0
+    assert trend_run(_closes([*flat, 104, 108, 112, 111])) is None  # 最后一根反着收：这段走线结束
+
+
+async def test_a_run_wakes_the_worker_once_per_step_and_is_recorded(rt, fake, monkeypatch):
+    cfg, w = rt.config(), rt.watcher
+    st = w._state(BTC)
+    st.last_px = 112.0
+    snap = await rt.market.snapshot(BTC, cfg.env, ("5m", "15m", "1H", "4H"))
+    flat = [100 + (i % 2) for i in range(31)]
+    bars = _closes([*flat, 104, 108, 112])
+    clock = [bars[-1].ts + 900_000 + 1]
+    snap["timeframes"]["15m"]["last_closed_open_ts_ms"] = bars[-1].ts
+
+    async def snapshot(*args):
+        return snap
+
+    async def candles(inst, bar, limit, env):
+        return bars
+
+    monkeypatch.setattr(rt.market, "snapshot", snapshot)
+    monkeypatch.setattr(rt.market, "candles", candles)
+    monkeypatch.setattr("ouy.agent.watcher.now_ms", lambda: clock[0])
+    await w._algo_tick(cfg, BTC, st)
+    runs = [e for e in rt.store.algo_events("demo", BTC) if e["algo"] == "run"]
+    assert len(runs) == 1 and runs[0]["side"] == "long" and "连续 3 根收高" in runs[0]["text"] and runs[0]["effect"].startswith("叫醒")
+    mail = [n for n in w.inbox("demo", BTC) if n.get("market_key") == "run"]
+    assert len(mail) == 1 and "不要因此追单" in mail[0]["text"]
+
+    bars = _closes([*flat, 104, 108, 112, 113])  # 又收高一根，但没多走出一档
+    snap["timeframes"]["15m"]["last_closed_open_ts_ms"] = bars[-1].ts
+    clock[0] += 900_000
+    await w._algo_tick(cfg, BTC, st)
+    assert len([e for e in rt.store.algo_events("demo", BTC) if e["algo"] == "run"]) == 1
+    bars = _closes([*flat, 104, 108, 112, 113, 125])  # 走出第二档：再报一次，信箱里还是只有最新的一条
+    snap["timeframes"]["15m"]["last_closed_open_ts_ms"] = bars[-1].ts
+    clock[0] += 900_000
+    await w._algo_tick(cfg, BTC, st)
+    assert len([e for e in rt.store.algo_events("demo", BTC) if e["algo"] == "run"]) == 2
+    assert len([n for n in w.inbox("demo", BTC) if n.get("market_key") == "run"]) == 1
+    assert w.ALGOS["run"] == "连续走线" and w.ALGO_LAYER["run"] == "read"

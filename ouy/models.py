@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 Env = Literal["demo", "live"]
 Mode = Literal["advise", "confirm", "auto"]
@@ -67,7 +67,9 @@ STANCES: dict[str, dict] = {
         "- 「观望」不是默认选项：只有价差或最小报价单位太大吃掉利润、已到当日亏损上限、或者找不到任何能放止损的结构位时才可以不给计划，并且要明说是哪一条。",
     },
 }
-# 交易风格：决定 Agent 看哪些周期、多久复盘一次、止损大概放多宽、一笔单打算拿多久
+# 交易风格：决定 Agent 看哪些周期、多久定时看一次盘、止损大概放多宽、一笔单打算拿多久
+# look_minutes：空仓时每隔这么久、对齐到 K 线收盘定时看一次盘做计划；有仓时改成每根结构周期 K 线（bar_minutes）看一次。
+# 两次定时看盘之间不轮询模型，只有触发线、转折、连续走线、持仓变化这些事件能提前叫醒 Worker。
 # 盈利回吐多少就叫醒 Worker 判断：（浮盈至少到过几 R 才开始盯，回吐百分之多少叫醒）。波段和长线的仓放得宽，不因为正常震荡就折腾
 GIVEBACK: dict[str, tuple[float, float]] = {"scalp": (0.6, 30.0), "intraday": (1.0, 40.0), "swing": (1.5, 55.0)}
 # 保盈线：浮盈最高到过这么多 R（按初始止损距离）之后，程序把止损移到「入场价 + 往返成本」，盈利单不再变亏损单。
@@ -81,7 +83,7 @@ STYLES: dict[str, dict] = {
         "bars": ("1m", "5m", "15m", "1H"),
         "struct_bar": "5m",
         "bar_minutes": 5,
-        "max_review": 180,
+        "look_minutes": 15,
         "limit_dist_pct": 0.8,
         "stale_min": 10,
         "plan_minutes": 30,
@@ -96,7 +98,7 @@ STYLES: dict[str, dict] = {
         "bars": ("5m", "15m", "1H", "4H"),
         "struct_bar": "15m",
         "bar_minutes": 15,
-        "max_review": 900,
+        "look_minutes": 60,
         "limit_dist_pct": 2.0,
         "stale_min": 45,
         "plan_minutes": 180,
@@ -110,7 +112,7 @@ STYLES: dict[str, dict] = {
         "bars": ("15m", "1H", "4H", "1D"),
         "struct_bar": "1H",
         "bar_minutes": 60,
-        "max_review": 3600,
+        "look_minutes": 240,
         "limit_dist_pct": 5.0,
         "stale_min": 240,
         "plan_minutes": 720,
@@ -148,7 +150,7 @@ class RiskLimits(BaseModel):
 class WorkerOverride(BaseModel):
     """某个币种的 Worker 的单独设置；没填的沿用全局。"""
 
-    wake: Wake | None = Field(None, description="event 有事才唤醒 / always 一直唤醒；留空用全局设置")
+    wake: Wake | None = Field(None, description="定时看盘时：event 没变化就跳过 / always 每次都看；留空用全局设置")
     model: str = Field("", description="这个 Worker 用的模型；留空用全局的 Worker 模型")
     effort: Effort | None = Field(None, description="思考强度；留空用全局设置")
     paused: bool = Field(False, description="暂停：这个币的 Worker 不再被唤醒（紧急平仓线仍然有效）")
@@ -190,7 +192,7 @@ class AgentConfig(BaseModel):
     style: Style = Field("intraday", description="默认交易风格：scalp 超短线 / intraday 日内短线 / swing 波段")
     router_model: str = Field("", description="Router（负责和用户沟通、分派任务、过滤事件）用的模型；留空用 .env 里的 AI_MODEL")
     worker_model: str = Field("", description="Worker（每个币一个，负责分析和交易）用的模型；留空用 .env 里的 AI_MODEL")
-    wake: Wake = Field("event", description="Worker 的唤醒方式：event 有事才唤醒（软事件先过滤）/ always 按 Worker 给出的下次检查时间持续复盘（软事件不过滤）；硬事件可提前唤醒，自动唤醒都遵守失败退避")
+    wake: Wake = Field("event", description="定时看盘（对齐 K 线收盘）时：event 价格没动、离线都远就跳过（软事件先过滤）/ always 每次都叫醒 Worker。两种都只在 K 线收盘和事件时叫醒，硬事件可提前，自动唤醒都遵守失败退避")
     max_parallel: int = Field(3, ge=1, le=8, description="最多同时有几个 Worker 在思考（不同的币并行）；超出的排队。子代理另有一组名额，是它的 2 倍")
     intel_minutes: int = Field(0, ge=0, le=1440, description="子代理多久定时更新一次简报（分钟）；0 = 不定时更新，只在 Worker 觉得需要时才派（默认）")
     trigger_effort: Effort = Field("low", description="Worker 被行情事件叫醒（价格触及盯盘价位、进入入场区间、突然异动）时的思考强度：要快，默认低")
@@ -231,7 +233,7 @@ class AgentConfig(BaseModel):
     instruments: list[str] = Field(default_factory=lambda: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
     margin_mode: Literal["cross", "isolated"] = "cross"
     tick_seconds: int = Field(3, ge=1, le=60, description="盯盘轮询间隔（秒）；策略执行器也按这个间隔检查触发条件")
-    review_seconds: int = Field(300, ge=60, le=3600, description="没有异动时 Agent 复盘的最长间隔（秒）")
+    max_event_wakes: int = Field(6, ge=1, le=60, description="每个品种每小时最多被行情事件（触发线、转折、连续走线、新候选、价格波动、快判）叫醒几次；超过的先记着，并到下一次叫醒里，不丢")
     min_review_seconds: int = Field(45, ge=10, le=600, description="两次 Agent 复盘的最短间隔（秒），防止刷爆模型额度")
     setup_min_score: int = Field(3, ge=1, le=4, description="记录器算多空分数时用（四项：大方向、在关键位、收盘确认、量），保留给打分函数")
     setup_vol_ratio: float = Field(1.3, ge=0.5, le=10, description="多空分数里「放量」这一项：这根 5 分钟 K 线的量至少是前 20 根平均的多少倍")
@@ -486,10 +488,36 @@ class Instrument(BaseModel):
 
 # ---------- Agent 输出 ----------
 
-class WatchLevel(BaseModel):
+class PlanLine(BaseModel):
+    """计划线：价格到了这个位置（或 K 线收盘越过它）时程序做什么。到了由程序直接执行，只执行一次。"""
+
     price: float = Field(gt=0)
-    note: str = Field(description="到这个价位意味着什么、到了要做什么")
-    valid_minutes: int | None = Field(None, ge=1, le=1440, description="观察线有效分钟数；省略则按当前交易风格")
+    when: Literal["price_touch", "close_above", "close_below"] = Field(
+        "price_touch", description="怎么算到了：price_touch 报价碰到；close_above / close_below 指定周期的 K 线收盘站上 / 跌破这个价")
+    bar: Literal["1m", "5m", "15m", "1H"] | None = Field(None, description="收盘确认周期，省略时用当前风格的结构周期")
+    do: Literal["wake", "cancel", "enter"] = Field(
+        "wake",
+        description="到了做什么：wake 叫醒你来看；cancel 撤掉这个币还没成交的入场挂单和入场策略；"
+        "enter 程序按现价进场（必须填 side、stop_loss、take_profit），进场前照样核对成本、盈亏比和风控，过不了就改成叫醒你",
+    )
+    side: Direction | None = Field(None, description="do=enter 时的方向")
+    stop_loss: float | None = Field(None, gt=0, description="do=enter 时的止损价")
+    take_profit: float | None = Field(None, gt=0, description="do=enter 时的止盈价")
+    strategy: str = Field("", max_length=40, description="do=enter 时用的是哪条策略（【策略目录】里的名字）")
+    edge: str = Field("", max_length=200, description="do=enter 而且这条打法标了「没有优势」时必填：算法看不到的额外依据")
+    note: str = Field(description="这条线是什么位置、到了为什么这么做")
+    valid_minutes: int | None = Field(None, ge=1, le=1440, description="这条线有效多少分钟；省略则按当前交易风格")
+
+    @model_validator(mode="after")
+    def _entry_fields(self) -> "PlanLine":
+        if self.do != "enter":
+            return self
+        if not (self.side and self.stop_loss and self.take_profit):
+            raise ValueError("do=enter 的线要同时给 side、stop_loss、take_profit")
+        sign = 1 if self.side == "long" else -1
+        if (self.price - self.stop_loss) * sign <= 0 or (self.take_profit - self.price) * sign <= 0:
+            raise ValueError(f"{self.price:g} 这条进场线的止损 / 止盈放错边了：做多的止损在线下方、止盈在线上方，做空相反")
+        return self
 
 
 class TradePlan(BaseModel):
@@ -549,9 +577,12 @@ class CycleReport(BaseModel):
         description="空仓时，程序快判（每几秒用 1 分钟 K 线判断收盘突破、放量急动、假突破收回）出了信号怎么办：verify = 叫醒我核实（默认）；"
         "long / short / both = 这些方向的信号我事先同意，程序直接照它算好的价位进场，做完再告诉我。只在大方向明确、你愿意让程序替你抢这一下的时候才授权",
     )
-    watch_levels: list[WatchLevel] = Field(default_factory=list, max_length=6, description="价格触及这些位置时立刻叫醒我")
+    lines: list[PlanLine] = Field(
+        default_factory=list, max_length=8,
+        description="计划线：这一轮的预案，每轮必交。空仓时现价上方至少一条、下方至少一条——往上走到哪里做什么、往下走到哪里做什么都要事先定好；"
+        "到了由程序执行（进场 / 撤单 / 叫醒你），两次看盘之间不会有人替你盯",
+    )
     lot_verdicts: list[LotVerdict] = Field(default_factory=list, description="有持仓时必填：对「各笔仓位」里的每一笔各给一个结论；没有持仓留空")
-    next_check_seconds: int = Field(300, ge=30, le=3600, description="没有异动的话多久后再看")
 
 
 class ClosedTrade(BaseModel):

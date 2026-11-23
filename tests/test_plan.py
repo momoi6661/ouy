@@ -63,7 +63,7 @@ def plan_rows(rt) -> list[dict]:
 
 @pytest.mark.parametrize("reason,stance,rechecks", [("cost", "active", 1), ("limit", "active", 0), ("cost", "cautious", 0)])
 async def test_active_worker_reconciles_cost_veto_once_without_forcing_trade(settings, fake, monkeypatch, reason, stance, rechecks):
-    refused = {**REPORT, "plan": None, "no_plan_reason": reason, "watch_levels": [{"price": 59700, "note": "等结构确认"}]}
+    refused = {**REPORT, "plan": None, "no_plan_reason": reason, "lines": [{"price": 59700, "note": "等结构确认"}, {"price": 60900, "note": "站上再看"}]}
     seen = []
     rt = make_rt(settings, fake, reporting(refused, seen=seen))
     rt.save_config(rt.config().model_copy(update={"stance": stance}))
@@ -450,22 +450,38 @@ async def test_losing_playbook_is_not_pushed_and_needs_an_extra_reason(rt, tmp_p
     assert (await rt.watcher._check_plan(cfg, BTC, TradePlan(**{**PLAN, "strategy": "趋势回踩"}))).ok  # 这条没有回测结论，不拦
 
 
-async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked_by_origin(rt, fake):
+async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked_by_origin(rt, fake, monkeypatch):
     """行情判断和候选位由程序按结构周期自己算，不等大模型复盘；每笔单记下是谁的主意，平仓后按来源另记一份战绩。"""
     from ouy.agent.plan import PlanCheck, plan_origin
     from ouy.models import TradeAction
 
     cfg, st = rt.config(), rt.watcher._state(BTC)
     st.last_px = 60_000
+    real_snapshot = await rt.market.snapshot(BTC, cfg.env, ("5m", "15m", "1H", "4H"))
+    frame_15m = real_snapshot["timeframes"]["15m"]
+    bar_start = frame_15m["last_closed_open_ts_ms"] // 900_000 * 900_000
+    frame_15m["last_closed_open_ts_ms"] = bar_start
+    clock = bar_start + 900_001
+
+    async def snapshot(*args):
+        return real_snapshot
+
+    monkeypatch.setattr(rt.market, "snapshot", snapshot)
+    monkeypatch.setattr("ouy.agent.watcher.now_ms", lambda: clock)
     await rt.watcher._algo_tick(cfg, BTC, st)
     assert st.regime and st.regime["kind"] in ("trend", "range", "reversal", "mixed", "unknown") and isinstance(st.regime["candidates"], list)
     first = st.regime["ts"]
     await rt.watcher._algo_tick(cfg, BTC, st)
     assert st.regime["ts"] == first  # 同一根结构周期 K 线里不重算
     st.reviewing = True
-    st.regime["ts"] = 0
+    clock += 900_000
+    st.regime["ts"] = clock  # Worker 刚复盘过；交易所还没返回最新确认收盘
     await rt.watcher._algo_tick(cfg, BTC, st)
-    assert st.regime["ts"] > 0  # Worker 正在复盘，算法仍按自己的时钟刷新
+    assert st.algo_clock == ("demo", "intraday", bar_start)
+    frame_15m["last_closed_open_ts_ms"] += 900_000
+    clock += 5001
+    await rt.watcher._algo_tick(cfg, BTC, st)
+    assert st.regime["ts"] == clock and st.algo_clock == ("demo", "intraday", bar_start + 900_000)
 
     # 行情判断和新出现的合格候选都记成算法事件（带中文名），页面和图上才看得到
     events = rt.store.algo_events("demo", BTC)
