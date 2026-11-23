@@ -189,6 +189,20 @@ def test_wave_tracker_records_pivots_direction_and_amplitude():
     r = wt.readings(101.4)
     assert wt.dir == 1 and wt.last_trough == 101.0 and r["wave_dir"] == 1 and r["wave_move_pct"] > 0.35
     assert "波谷 101" in wt.summary(101.4)
+    # 继续突破前波峰 102.0：确认波峰波谷同步抬高（prev_trough=100 < last_trough=101 且 px > last_peak=102），触发盘中实时走向切换
+    wt.update(8000, 102.3, atr5=0.5)
+    flip = wt.trend_flip(102.3, atr5=0.5)
+    assert flip and flip[0] == "long" and "盘中实时走向转多" in flip[1]
+    assert wt.trend_flip(102.5, atr5=0.5) is None  # 同方向不重复触发
+
+    # 验证打破整点死锁：上一小时虽标为上涨，但小周期已转 downtrend 且实时拐点走向转 short 时，大方向立即切换为 short
+    from ouy.agent.plan import major_direction
+    snap = {
+        "last": 76.0, "live_wave": {"trend": "short"},
+        "timeframes": {"5m": {"structure": "downtrend", "adx14": 35, "atr14": 0.4}},
+        "windows": {"1H": {"trend": "上涨（高点低点都在抬高）"}},
+    }
+    assert major_direction(snap, "scalp") == ("short", "实时拐点走向")
 
 
 async def test_pullback_limit_catches_up_on_early_turn_and_position_trails_new_pivot(settings, fake):

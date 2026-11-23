@@ -22,11 +22,14 @@ class WaveTracker:
     extreme_px: float = 0.0
     extreme_ts: int = 0
     prev_pct: float = 0.0
+    prev_peak: float = 0.0
     last_peak: float = 0.0
     last_peak_ts: int = 0
+    prev_trough: float = 0.0
     last_trough: float = 0.0
     last_trough_ts: int = 0
     turned_ts: int = 0
+    reported_trend: str = ""
 
     @staticmethod
     def threshold_pct(px: float, atr5: float | None) -> float:
@@ -63,6 +66,8 @@ class WaveTracker:
             pull = (self.extreme_px - px) / self.extreme_px * 100
             if pull >= rev:
                 self.prev_pct = round((self.extreme_px / self.anchor_px - 1) * 100, 3)
+                if self.last_peak > 0:
+                    self.prev_peak = self.last_peak
                 self.last_peak, self.last_peak_ts = self.extreme_px, self.extreme_ts
                 self.dir = -1
                 self.anchor_px, self.anchor_ts = self.extreme_px, self.extreme_ts
@@ -76,6 +81,8 @@ class WaveTracker:
         bounce = (px - self.extreme_px) / self.extreme_px * 100
         if bounce >= rev:
             self.prev_pct = round((self.extreme_px / self.anchor_px - 1) * 100, 3)
+            if self.last_trough > 0:
+                self.prev_trough = self.last_trough
             self.last_trough, self.last_trough_ts = self.extreme_px, self.extreme_ts
             self.dir = 1
             self.anchor_px, self.anchor_ts = self.extreme_px, self.extreme_ts
@@ -106,6 +113,31 @@ class WaveTracker:
             peaks.append(f"最近波谷 {self.last_trough:g}")
         tail = f"｜{'、'.join(peaks)}" if peaks else ""
         return f"{prev}自{pivot_name} {self.anchor_px:g} {way} {r['wave_move_pct']:+.2f}%{ret}{tail}"
+
+    def live_trend(self, px: float, atr5: float | None = None) -> str:
+        """盘中实时结构走向：波峰波谷同步抬高（或放量突破前波峰加速）判 long；同步降低（或跌破前波谷加速）判 short。"""
+        if self.anchor_px <= 0 or px <= 0 or self.dir == 0:
+            return ""
+        surge_pct = max(0.55, (atr5 / px * 100 * 1.2) if atr5 and px > 0 else 0.60)
+        if self.dir == 1:
+            hh_hl = self.prev_trough > 0 and self.last_trough > self.prev_trough and (
+                (self.last_peak > 0 and px > self.last_peak) or (self.prev_peak > 0 and self.last_peak > self.prev_peak)
+            )
+            surge = self.last_peak > 0 and px > self.last_peak and (px / self.anchor_px - 1) * 100 >= surge_pct
+            return "long" if (hh_hl or surge) else ""
+        lh_ll = self.prev_peak > 0 and 0 < self.last_peak < self.prev_peak and (
+            (self.last_trough > 0 and px < self.last_trough) or (self.prev_trough > 0 and 0 < self.last_trough < self.prev_trough)
+        )
+        plunge = self.last_trough > 0 and px < self.last_trough and (self.anchor_px / px - 1) * 100 >= surge_pct
+        return "short" if (lh_ll or plunge) else ""
+
+    def trend_flip(self, px: float, atr5: float | None = None) -> tuple[str, str] | None:
+        """盘中实时走向首次切换到新方向时返回 (side, 描述)，同一方向不重复触发。"""
+        tr = self.live_trend(px, atr5)
+        if tr in ("long", "short") and tr != self.reported_trend:
+            self.reported_trend = tr
+            return tr, f"盘中实时走向转{'多' if tr == 'long' else '空'}：{self.summary(px)}"
+        return None
 
 
 @dataclass

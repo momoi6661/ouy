@@ -222,17 +222,27 @@ REGIME_ADX = 20  # 结构周期 ADX 到这个数以上、高低点又和大方�
 
 TURN_FIRST = ("scalp",)  # 这些风格：5 分钟刚确认、还没被收回的结构转折先于前高前低定大方向（回测见 knowledge/evidence.md「行情判断：转折优先和 ADX 缓冲」）
 TURN_BY = "5m 转折"
+WAVE_BY = "实时拐点走向"
 
 
 def major_direction(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | None = None) -> tuple[str, str]:
+    live_wave = str(((snapshot.get("live_wave") or {}).get("trend")) or "")
+    frames = snapshot.get("timeframes") or {}
+    local = {"uptrend": "long", "downtrend": "short"}.get((frames.get(STYLES[style]["struct_bar"]) or {}).get("structure"), "")
     if style in TURN_FIRST and shift and shift.get("side") in ("long", "short"):
-        return shift["side"], TURN_BY
+        if not (live_wave in ("long", "short") and live_wave != shift["side"] and local == live_wave):
+            return shift["side"], TURN_BY
+    win_major, win_name = "", ""
     windows = snapshot.get("windows") or {}
     for name in TREND_FRAMES[style]:
         word = str((windows.get(name) or {}).get("trend") or "")
         if word.startswith(("上涨", "下跌")):
-            return ("long" if word.startswith("上涨") else "short"), name
-    return "", ""
+            win_major, win_name = ("long" if word.startswith("上涨") else "short"), name
+            break
+    # 打破整点切块滞后：若上一整小时无方向，或整点旧方向已被「小周期收盘结构 + 盘中实时波峰波谷走向」双重反向推翻，按实时走向定方向
+    if live_wave in ("long", "short") and (not win_major or (win_major != live_wave and local == live_wave)):
+        return live_wave, WAVE_BY
+    return win_major, win_name
 
 
 def candidate_rows(rows: list[dict[str, Any]], style: str) -> list[dict[str, Any]]:

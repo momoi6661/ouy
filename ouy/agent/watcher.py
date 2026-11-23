@@ -1594,6 +1594,7 @@ class Watcher:
         tickers = await asyncio.gather(*(self.market.ticker(i, cfg.env) for i in cfg.instruments), return_exceptions=True)
         now = time.time()
         prices = {i: _f(t.get("last")) for i, t in zip(cfg.instruments, tickers) if not isinstance(t, BaseException)}
+        wave_flips: dict[str, str] = {}
         for inst_w, px_w in prices.items():
             if px_w > 0 and not cfg.worker(inst_w).paused:
                 st_w = self._state(inst_w)
@@ -1602,6 +1603,13 @@ class Watcher:
                 st_w.wave.update(now_ms(), px_w, atr_w)
                 if m_w.get("values") is not None:
                     m_w["values"].update(st_w.wave.readings(px_w))
+                if flip := st_w.wave.trend_flip(px_w, atr_w):
+                    side_f, text_f = flip
+                    wave_flips[inst_w] = text_f
+                    self._algo(cfg.env, inst_w, "wave", text_f, "盘中走向切换：立即重算行情判断与候选并通知 Worker", side_f, px_w, atr_w, sub="走向切换")
+                    if now_ms() - st_w.regime.get("ts", 0) >= 30_000:
+                        st_w.algo_clock = None
+                        st_w.algo_poll_after = 0
         try:  # 挂单的撤单线、有效期及近区提前拐头追进：满足即执行，不等模型
             await self._guard_orders(cfg, account, prices)
         except Exception as exc:  # noqa: BLE001 - 撤单/追单出错不能拖垮盯盘循环
@@ -1721,6 +1729,15 @@ class Watcher:
                         self.interject(inst_id, retest, "走势记录器")
                     else:
                         reason = f"{retest} 同时：{reason}" if reason else retest
+            if w_flip := wave_flips.get(inst_id):
+                note_w = f"{w_flip}。核对已有计划与挂单方向，顺最新走向给 plan 或调整。"
+                if not standby:
+                    if st.reviewing or st.lock.locked() or st.run is not None:
+                        self.interject(inst_id, note_w, "实时走向", market_key="wave")
+                    elif now - st.last_review_ts >= cfg.min_review_seconds:
+                        reason = f"{note_w} 同时：{reason}" if reason else note_w
+                    else:
+                        self.interject(inst_id, note_w, "实时走向", market_key="wave")
             # 软事件（价格波动、定时）先过 Router 的第二级过滤；硬事件（首次、持仓变化、触及价位、进入入场区间、BTC 异动）直接唤醒
             if (not reason and btc_alert and inst_id != BTC and self._asset.get(inst_id, "crypto") == "crypto"
                     and account.position(inst_id) and now - st.last_review_ts >= cfg.min_review_seconds):
@@ -1775,7 +1792,7 @@ class Watcher:
         self._note("system", alert + "，正在检查所有持仓", {"move_pct": round(move, 3)})
         return alert
 
-    ALGOS = {"regime": "行情判断", "run": "连续走线", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发线"}
+    ALGOS = {"wave": "实时走向", "regime": "行情判断", "run": "连续走线", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发线"}
 
     def _algo(self, env: str, inst: str, algo: str, text: str, effect: str, side: str = "", px: float = 0.0, atr: float | None = None,
               *, sub: str = "", data: dict[str, Any] | None = None, score: bool = True) -> None:
@@ -1798,7 +1815,7 @@ class Watcher:
     }
     # 以前分开记的「结构转折」「盘中转折位」现在都算「转折」这一个算法的不同阶段；库里的旧记录读出来时归过去
     ALGO_MERGED = {"shift": "turn", "retest": "turn"}
-    ALGO_LAYER = {"tape": "read", "open": "read", "regime": "read", "run": "read", "turn": "turn",
+    ALGO_LAYER = {"wave": "read", "tape": "read", "open": "read", "regime": "read", "run": "read", "turn": "turn",
                   "cand": "entry", "fast": "entry", "rule": "entry", "lock": "hold"}
 
     def _algo_check(self, env: str, prices: dict[str, float]) -> None:
@@ -1884,6 +1901,9 @@ class Watcher:
         if fast_bad and fast_does != "已关闭":
             fast_does += f"；回测扣费后亏的几类（{'、'.join(fast_bad)}）只记录"
         return [
+            row("wave", "实时走向", watching and st.wave.dir != 0, st.wave.turned_ts,
+                st.wave.summary(st.last_px) if watching and st.wave.dir != 0 else ("等待盘中走出第一个确认拐点" if watching else off),
+                "每 3 秒跟踪盘中波峰波谷、当前走向和波幅；拐点结构反转或加速时不等收盘，立刻重算行情判断并叫醒 Worker"),
             row("tape", "走势记录", watching and fresh, m.get("ts"), (m.get("narrative") or "")[:160] if fresh else off, "每 10 秒算一次 5 分钟走势，只记录"),
             row("open", "开盘记录", watching and oq.get("env") == cfg.env, oq.get("ts"),
                 f"开盘 {oq['session_open']:g}，现在 {oq.get('session_pct', 0):+.2f}%；这根 5 分钟 {oq.get('bar_pct', 0):+.2f}%" if oq.get("session_open") else "还没有覆盖到开盘的数据",
@@ -2185,6 +2205,10 @@ class Watcher:
         行情判断变了记一条算法事件。返回候选（持仓时不出候选）。"""
         style = cfg.style_for(inst_id)
         follow = self._follow_trend(cfg, inst_id)
+        atr_cur = ((self.strategies.metrics.get(inst_id) or {}).get("values") or {}).get("atr")
+        if st.wave.dir != 0 and st.last_px > 0 and isinstance(snapshot, dict) and "live_wave" not in snapshot:
+            if w_tr := st.wave.live_trend(st.last_px, atr_cur):
+                snapshot = {**snapshot, "live_wave": {"trend": w_tr}}
         rows = [] if pos else build_candidates(
             snapshot, style=style, min_rr=STANCES[cfg.stance_for(inst_id)]["min_rr"],
             maker_fee_pct=cfg.maker_fee_pct, taker_fee_pct=cfg.taker_fee_pct, entry_mode=cfg.entry_mode_for(inst_id),
@@ -2325,9 +2349,11 @@ class Watcher:
         prior = self.strategies.metrics.get(inst_id) or {}
         fast_ts = prior.get("fast_ts", 0)
         old = prior.get("values", {}) if self._fast_on(cfg, inst_id) and 0 <= now_ms() - fast_ts <= FAST_DATA_MS else {}
+        live_tr = st.wave.live_trend(px, atr5)
+        eff_trend_side = live_tr or j["trend_side"]
         values = {
             "px": px, "vol_ratio": round(j["ratio"], 2), "chg_pct": round((last.close / last.open - 1) * 100, 3), "score_long": j["scores"]["long"], "score_short": j["scores"]["short"],
-            "trend": {"long": 1, "short": -1}.get(j["trend_side"], 0), "range_pos": round((px - lo) / (hi - lo) * 100, 1) if lo and hi and hi > lo else None,
+            "trend": {"long": 1, "short": -1}.get(eff_trend_side, 0), "range_pos": round((px - lo) / (hi - lo) * 100, 1) if lo and hi and hi > lo else None,
             "spread_pct": book.get("spread_pct"), "book_bias": round(book["imbalance"] * 100) if book.get("imbalance") is not None else None,
             "atr": atr5, **st.wave.readings(px),
             **{k: old[k] for k in ("sig_long", "sig_short", "move_1m", "vol_1m") if k in old},  # 快的那几项由 _fast 写，这里原样留着
