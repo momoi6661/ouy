@@ -1783,20 +1783,21 @@ async def test_profit_lock_keeps_a_winner_from_turning_into_a_loss(settings, fak
         await rt.watcher._watch_lots(cfg, BTC, st, time.time())
         return st.lot_alert
 
-    assert await at(60_240) == "" and fake.algos[0]["slTriggerPx"] == "59400"  # +0.4R：还没到
-    alert = await at(60_330)  # +0.55R
+    assert await at(60_600) == "" and fake.algos[0]["slTriggerPx"] == "59400"  # +1.0R：未到 1.5R 高点，不提前锁死
+    alert = await at(60_960)  # +1.6R：冲出高点后才启动保盈线
     lid = str(rt.trader.lots("demo", BTC)[0]["id"])
-    assert "保盈线" in alert and "扣费后不亏" in alert and fake.algos[0]["slTriggerPx"] == "60072"
+    assert "保盈线" in alert and "扣费后不亏" in alert and float(fake.algos[0]["slTriggerPx"]) >= 60_060
+    locked_px = float(fake.algos[0]["slTriggerPx"])
     writes = len(fake.called("swap_place_algo_order")) + len(fake.called("swap_amend_algo_order"))
     rt.watcher.states.clear()  # 模拟重启：内存状态没了，轨迹还在库里
-    assert await at(60_200) == "" and writes == len(fake.called("swap_place_algo_order")) + len(fake.called("swap_amend_algo_order"))
+    assert await at(60_800) == "" and writes == len(fake.called("swap_place_algo_order")) + len(fake.called("swap_amend_algo_order"))
     track = rt.watcher.lot_track("demo")[lid]
-    assert track["peak"] >= 0.55 and track["locked"] == 60_072 and "保盈线已执行" in rt.watcher.track_text(track)
-    fake.set_price(BTC, 60_700)  # +1.17R：1R 移保本不能把已经锁好的止损往回放
-    await rt.watcher.strategies.tick(cfg, await rt.trader.account("demo"), {BTC: 60_700})
-    assert fake.algos[0]["slTriggerPx"] == "60072" and all(r["status"] != "failed" for r in rt.store.strategies("demo", BTC, live=False))
+    assert track["peak"] >= 1.6 and track["locked"] == pytest.approx(locked_px) and "保盈线已执行" in rt.watcher.track_text(track)
+    fake.set_price(BTC, 61_000)  # 移保本规则不能把已经锁好的止损往回放
+    await rt.watcher.strategies.tick(cfg, await rt.trader.account("demo"), {BTC: 61_000})
+    assert float(fake.algos[0]["slTriggerPx"]) == pytest.approx(locked_px) and all(r["status"] != "failed" for r in rt.store.strategies("demo", BTC, live=False))
     cash = fake.cash
-    await at(60_050)  # 回落：止损在成本线外，打掉也不亏
+    await at(60_040)  # 回落：止损在成本线外，打掉也不亏
     assert BTC not in fake.positions and fake.cash > cash
 
     # Worker 对这笔写了 lock_r=0：不用保盈线

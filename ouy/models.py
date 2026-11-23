@@ -76,43 +76,42 @@ STANCES: dict[str, dict] = {
 # 两次定时看盘之间不轮询模型，只有触发线、转折、连续走线、持仓变化这些事件能提前叫醒 Worker。
 # 盈利回吐多少就叫醒 Worker 判断：（浮盈至少到过几 R 才开始盯，回吐百分之多少叫醒）。波段和长线的仓放得宽，不因为正常震荡就折腾
 GIVEBACK: dict[str, tuple[float, float]] = {"scalp": (0.6, 30.0), "intraday": (1.0, 40.0), "swing": (1.5, 55.0)}
-# 保盈线：浮盈最高到过这么多 R（按初始止损距离）之后，程序把止损移到「入场价 + 往返成本」，盈利单不再变亏损单。
-# 数值来自候选位回测（python -m ouy.backtest_plans --lock-r，结果见 knowledge/evidence.md），不要凭感觉改。
-LOCK_R: dict[str, float] = {"scalp": 0.5, "intraday": 0.5, "swing": 0.5}
+# 保盈线：浮盈冲出足够高点（≥1.5R~1.8R）后，程序才把止损上移到「入场价 + 手续费 + 0.25R 净利」，绝不在微利时提前移到买入价被正常波动扫出。
+LOCK_R: dict[str, float] = {"scalp": 1.5, "intraday": 1.5, "swing": 1.8}
 
 STYLES: dict[str, dict] = {
     "scalp": {
         "label": "超短线",
-        "edge": "抓蓄势起爆的快速脉冲与顺势浅回踩：止损用 15m 波动留足呼吸，1m 放量点火，移动止损吃整段",
+        "edge": "在现价与近端拐点做短平快脉冲或踩支撑反弹：挂单不离现价超过 0.45%，冲出高点再推保护",
         "bars": ("1m", "5m", "15m", "1H"),
         "struct_bar": "5m",
-        "atr_bar": "15m",
+        "atr_bar": "5m",
         "confirm_bar": "1m",
         "bar_minutes": 5,
         "look_minutes": 15,
-        "limit_dist_pct": 0.8,
-        "min_stop_pct": 0.45,
-        "trail_atr": 3.5,
+        "limit_dist_pct": 0.45,
+        "min_stop_pct": 0.25,
+        "trail_atr": 3.2,
         "trail_bar": "15m",
         "stale_min": 10,
         "stale_impulse_min": 20,
         "plan_minutes": 30,
         "hold_minutes": 30,
         "impulse_hold_minutes": 60,
-        "guide": "用 1H/15m 定方向，5m 看蓄势箱体和浅回踩、1m 抓放量起爆；止损按 15m ATR 留足空间（通常 ≥0.45%，让手续费占比低于 0.22R），"
-        "突破与脉冲单不设近端死止盈封顶，用移动止损跟完整波快速走势；进去 20 分钟完全冲不动就提前离场。",
+        "guide": "用 1H/15m 看背景，5m/1m 抓近端拐点（踩支撑收回、收口起爆、贴身 EMA20 回踩）。超短线严禁把单子挂到离现价超过 0.45% 的远处空等："
+        "看准方向且踩稳支撑或突破启动就现价进（entry_type=now），挂单只挂贴身近端结构位；浮盈未到 1.5R 高点前不提前把止损拉回买入价。",
     },
     "intraday": {
         "label": "日内短线",
-        "edge": "赚当天多小时箱体突破或顺势主推浪的钱：收敛末端预埋突破、趋势中段浅回踩，移动止损拿满波段",
+        "edge": "赚当天多小时箱体突破或顺势主推浪的钱：挂单不超过 1.2%，冲出 1.5R 高点再移保本并跟踪",
         "bars": ("5m", "15m", "1H", "4H"),
         "struct_bar": "15m",
         "atr_bar": "15m",
         "confirm_bar": "5m",
         "bar_minutes": 15,
         "look_minutes": 60,
-        "limit_dist_pct": 2.0,
-        "min_stop_pct": 0.55,
+        "limit_dist_pct": 1.2,
+        "min_stop_pct": 0.40,
         "trail_atr": 3.5,
         "trail_bar": "15m",
         "stale_min": 45,
@@ -120,8 +119,8 @@ STYLES: dict[str, dict] = {
         "plan_minutes": 180,
         "hold_minutes": 240,
         "impulse_hold_minutes": 360,
-        "guide": "用 4H/1H 定方向，15m/5m 抓箱体放量突破或 EMA20 浅回踩；止损放在结构外（通常 ≥0.55%），"
-        "首目标减仓锁底后，余仓用 15m ATR 跟踪止损吃完整段单边推进，不因 0.5R 小幅波动过早下车。",
+        "guide": "用 4H/1H 定方向，15m/5m 抓箱体放量突破、刺穿收回或近端 EMA20 浅回踩（挂单离现价 ≤1.2%）；"
+        "浮盈到 1.5R 高点后再移保本锁利，余仓用 15m ATR 与实时拐点跟踪吃完整段波段。",
     },
     "swing": {
         "label": "波段",
@@ -132,8 +131,8 @@ STYLES: dict[str, dict] = {
         "confirm_bar": "15m",
         "bar_minutes": 60,
         "look_minutes": 240,
-        "limit_dist_pct": 5.0,
-        "min_stop_pct": 0.85,
+        "limit_dist_pct": 3.0,
+        "min_stop_pct": 0.75,
         "trail_atr": 3.8,
         "trail_bar": "1H",
         "stale_min": 240,

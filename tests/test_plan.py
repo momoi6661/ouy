@@ -103,7 +103,7 @@ def test_program_checks_a_plan_with_costs_and_decides_how_to_enter():
     assert resting.limit and resting.cost_pct == 0.07 and resting.net_rr > wait.net_rr and not wait.limit
     params = order_params(TradePlan(**PULLBACK), wait, "scalp")
     assert params["trigger"] == 59_700 and params["take_profit"] == 61_000 and params["miss_px"] == 60_600 and params["plan"] is True
-    assert params["manage"]["breakeven_r"] == 1.0 and params["manage"]["partials"][0]["fraction"] == 0.5 and params["manage"]["max_hold_minutes"] == 30
+    assert params["manage"]["breakeven_r"] == 1.5 and params["manage"]["partials"][0]["fraction"] == 0.5 and params["manage"]["max_hold_minutes"] == 30
     assert same_plan({"kind": "pullback", "side": "long", "params": params}, TradePlan(**{**PULLBACK, "entry_high": 59_720}), check_plan(TradePlan(**{**PULLBACK, "entry_high": 59_720}), 60_000, min_rr=1.2, cost_pct=0.1), "scalp")
     # 同一份价位，手续费高了就不够格：数字由程序算，告诉它第一目标至少要多远
     thin = check_plan(TradePlan(**{**PLAN, "take_profits": [60_700]}), 60_000, min_rr=1.2, cost_pct=0.1)
@@ -124,7 +124,7 @@ async def test_a_plan_whose_entry_zone_holds_the_price_is_executed_without_any_t
     assert record["plan_order"]["status"] == "executed" and "照计划现价做多" in record["plan_order"]["text"]
     assert record["actions"][0]["status"] == "executed"
     manage = plan_rows(rt)[0]
-    assert manage["kind"] == "manage" and manage["status"] == "active" and manage["params"]["breakeven_r"] == 1.0 and manage["params"]["partials"]
+    assert manage["kind"] == "manage" and manage["status"] == "active" and manage["params"]["breakeven_r"] == 1.5 and manage["params"]["partials"]
 
 
 async def test_a_plan_away_from_the_price_rests_as_a_limit_order_on_the_exchange(settings, fake):
@@ -609,7 +609,7 @@ def test_squeeze_arms_breakout_and_miss_price_prevents_instant_self_cancel():
     brk = next((r for r in rows if r["strategy"] == "收敛突破" and r["plan"].direction == "long"), None)
     assert brk and brk["ok"] and brk["check"].how == "breakout"
     rules = manage_rules(brk["plan"], brk["check"], "intraday")
-    assert rules["lock_r"] == 0 and rules["breakeven_r"] == 1.3 and rules["trail_atr"] == 3.5 and rules["stale_minutes"] == 60
+    assert rules["lock_r"] == 0 and rules["breakeven_r"] == 1.5 and rules["trail_atr"] == 3.5 and rules["stale_minutes"] == 60
 
     short_pb = TradePlan(
         direction="short", strategy="趋势回踩", entry_low=1729.79, entry_high=1729.79,

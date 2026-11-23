@@ -61,7 +61,15 @@ def trade_cost_pct(taker_fee_pct: float, spread_pct: float | None) -> float:
     return taker_fee_pct * 2 + max(spread_pct or 0.0, 0.0)
 
 
-def check_plan(plan: TradePlan, px: float, *, min_rr: float, cost_pct: float, limit_cost_pct: float | None = None) -> PlanCheck:
+def check_plan(
+    plan: TradePlan,
+    px: float,
+    *,
+    min_rr: float,
+    cost_pct: float,
+    limit_cost_pct: float | None = None,
+    max_dist_pct: float = 0.0,
+) -> PlanCheck:
     """limit_cost_pct：等价格回来的单是在交易所挂限价单成交的，这是它的往返成本（挂单手续费 + 吃单手续费 + 点差）；不给就按到价市价进算。"""
     long = plan.direction == "long"
     lo, hi = sorted((plan.entry_low, plan.entry_high))
@@ -95,6 +103,13 @@ def check_plan(plan: TradePlan, px: float, *, min_rr: float, cost_pct: float, li
             out.how, out.ref = "pullback", (hi if long else lo)  # 等价格回来：先碰到的是离现价近的那一边
             if limit_cost_pct is not None:
                 out.limit, out.cost_pct = True, limit_cost_pct
+            if max_dist_pct > 0 and abs(out.ref / px - 1) * 100 > max_dist_pct:
+                dist_now = abs(out.ref / px - 1) * 100
+                out.issues.append(
+                    f"挂单价 {out.ref:g} 离现价 {px:g} 达 {dist_now:.2f}%，超过当前风格允许的挂单距离上限 {max_dist_pct:g}%（挂太远根本成交不了）："
+                    "请改为现价附近直接进场（entry_type=now），或改挂在离现价更近的 5m/15m 支撑阻力位"
+                )
+                return out
     ref, cost_pct = out.ref, out.cost_pct
     if (stop - ref) * sign >= 0:
         out.issues.append(f"{side}的止损 {stop:g} 要在入场价 {ref:g} 的{'下' if long else '上'}方")
@@ -136,19 +151,19 @@ def manage_rules(plan: TradePlan, check: PlanCheck, style: str) -> dict[str, Any
     tps = sorted(plan.take_profits, reverse=not long)
     impulse = check.how == "breakout" or plan.strategy in IMPULSE_PLAYS
     trend_play = not impulse and plan.strategy in TREND_PLAYS
-    rules: dict[str, Any] = {"breakeven_r": 1.3 if impulse else 1.0}
+    rules: dict[str, Any] = {"breakeven_r": 1.5}
     if impulse:
         rules.update(
             lock_r=0,
             trail_atr=spec.get("trail_atr", 3.5),
             trail_bar=spec.get("trail_bar", spec["struct_bar"]),
-            trail_start_r=1.2,
+            trail_start_r=1.5,
         )
         if spec.get("stale_impulse_min"):
             rules.update(stale_minutes=spec["stale_impulse_min"], stale_min_r=0.4)
     elif trend_play:
         rules.update(
-            lock_r=1.2,
+            lock_r=1.5,
             trail_atr=spec.get("trail_atr", 3.5),
             trail_bar=spec.get("trail_bar", spec["struct_bar"]),
             trail_start_r=1.5,
@@ -290,12 +305,12 @@ def market_regime(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | 
     return {"kind": "mixed", "side": major, "why": f"大方向{'向上' if major == 'long' else '向下' if major == 'short' else '不明'}，{STYLES[style]['struct_bar']}结构{'同向' if local == major else '不一致'}，ADX {adx:.0f}"}
 
 
-# 每种行情用哪几类打法：趋势纳入顺势突破与动量延续（不再只给深回踩），震荡与收口蓄势纳入区间两头与收敛突破，刚反转做变盘回踩与顺向突破。
+# 每种行情用哪几类打法：趋势纳入顺势突破、动量延续、浅回踩及关键位假突破反转（踩支撑收回）；震荡与收口蓄势做区间边缘、假突破收回与收敛突破。
 REGIME_PLAYS = {
-    "trend": ("收敛突破", "动量延续", "趋势回踩", "前高前低法"),
-    "range": ("区间高抛低吸", "收敛突破"),
-    "reversal": ("变盘后回踩", "收敛突破"),
-    "mixed": (),
+    "trend": ("收敛突破", "动量延续", "趋势回踩", "前高前低法", "假突破反转"),
+    "range": ("区间高抛低吸", "假突破反转", "收敛突破"),
+    "reversal": ("变盘后回踩", "假突破反转", "收敛突破"),
+    "mixed": ("假突破反转",),
     "unknown": (),
 }
 REGIME_LABEL = {"trend": "趋势", "range": "震荡", "reversal": "刚反转", "mixed": "方向打架", "unknown": "数据不足"}
@@ -363,7 +378,9 @@ def build_candidates(
 
     def targets_from(entry: float, stop: float, long: bool) -> list[float]:
         risk = abs(entry - stop)
-        pool = sorted({v for v in (ups if long else downs) if (v - entry if long else entry - v) >= risk * 0.5}, reverse=not long)
+        # 跳过离入场太近（不足 1.15R）的贴身微噪音高低点，防止为了凑盈亏比被迫把挂单推到天边
+        min_gap = risk * max(min_rr * 1.15, 1.2) if has_box else risk * 0.5
+        pool = sorted({v for v in (ups if long else downs) if (v - entry if long else entry - v) >= min_gap}, reverse=not long)
         t1 = _sig(pool[0]) if pool else _sig(entry + (1 if long else -1) * risk * max(min_rr + 0.4, 1.8))
         t2 = _sig(pool[1]) if len(pool) > 1 else _sig(t1 + (1 if long else -1) * risk)
         return [t1] if t1 == t2 else [t1, t2]
@@ -412,26 +429,47 @@ def build_candidates(
                     take_profits=targets_from(entry, stop, False), leverage=20, entry_type=how, invalidation=f"收盘站回 {lo:g} 上方",
                 )))
         elif now_read.startswith("假突破") and hi > lo:
-            stop = _sig(max(hi, px) + max(0.6 * atr, px * 0.0025))
-            how = "now" if px <= hi and abs(hi - px) <= 0.25 * atr else "pullback"
+            stop = _sig(max(hi, px) + max(0.6 * atr, stop_floor))
+            how = "now" if entry_mode != "limit" and px <= hi and abs(hi - px) <= 0.65 * wide_atr else "pullback"
             entry = _sig(px if how == "now" else hi)
-            mid = _sig((hi + lo) / 2)
-            tps = [t for t in ([mid, _sig(lo)] if mid < entry else [_sig(lo)]) if t < entry]
+            tps = targets_from(entry, stop, False)
             if tps and entry < stop:
-                raw.append(("假突破反转", f"{wname} 刺穿前高 {hi:g} 后收回，看回落", TradePlan(
+                raw.append(("假突破反转", f"{wname} 刺穿前高 {hi:g} 后收回，{'现价直接做空' if how == 'now' else '近端挂空'}", TradePlan(
                     direction="short", strategy="假突破反转", entry_low=entry, entry_high=entry, stop_loss=stop,
                     take_profits=tps, leverage=20, entry_type=how, invalidation=f"连续收盘站上 {stop:g}",
                 )))
         elif now_read.startswith("假跌破") and hi > lo:
-            stop = _sig(min(lo, px) - max(0.6 * atr, px * 0.0025))
-            how = "now" if px >= lo and abs(px - lo) <= 0.25 * atr else "pullback"
+            stop = _sig(min(lo, px) - max(0.6 * atr, stop_floor))
+            how = "now" if entry_mode != "limit" and px >= lo and abs(px - lo) <= 0.65 * wide_atr else "pullback"
             entry = _sig(px if how == "now" else lo)
-            mid = _sig((hi + lo) / 2)
-            tps = [t for t in ([mid, _sig(hi)] if mid > entry else [_sig(hi)]) if t > entry]
+            tps = targets_from(entry, stop, True)
             if tps and entry > stop:
-                raw.append(("假突破反转", f"{wname} 刺穿前低 {lo:g} 后收回，看反弹", TradePlan(
+                raw.append(("假突破反转", f"{wname} 刺穿前低 {lo:g} 后收回，{'现价直接做多' if how == 'now' else '近端挂多'}", TradePlan(
                     direction="long", strategy="假突破反转", entry_low=entry, entry_high=entry, stop_loss=stop,
                     take_profits=tps, leverage=20, entry_type=how, invalidation=f"连续收盘跌破 {stop:g}",
+                )))
+
+    # 2b. 近端支撑踩稳 / 阻力受阻现价直进（解决「都已经踩住收回了还不买、跑去老远处挂单」）
+    patterns_text = " ".join(str(p) for p in (tf.get("patterns") or []))
+    near_sup = max((v for v in downs if v < px * 1.0005), default=None)
+    near_res = min((v for v in ups if v > px * 0.9995), default=None)
+    if entry_mode != "limit" and near_sup and 0 <= (px - near_sup) <= 0.6 * wide_atr:
+        bull_hold = any(k in patterns_text for k in ("假跌破", "长下影线", "看涨吞没"))
+        if bull_hold:
+            stop = _sig(near_sup - max(0.7 * wide_atr, stop_floor))
+            if px > stop:
+                raw.append(("假突破反转", f"近端支撑 {near_sup:g} 已踩稳收回（{spec['struct_bar']} 承接信号），现价直接做多", TradePlan(
+                    direction="long", strategy="假突破反转", entry_low=_sig(px), entry_high=_sig(px), stop_loss=stop,
+                    take_profits=targets_from(px, stop, True), leverage=20, entry_type="now", invalidation=f"{spec['struct_bar']} 收盘跌破 {stop:g}",
+                )))
+    if entry_mode != "limit" and near_res and 0 <= (near_res - px) <= 0.6 * wide_atr:
+        bear_hold = any(k in patterns_text for k in ("假突破上沿", "长上影线", "看跌吞没"))
+        if bear_hold:
+            stop = _sig(near_res + max(0.7 * wide_atr, stop_floor))
+            if px < stop:
+                raw.append(("假突破反转", f"近端阻力 {near_res:g} 上冲受阻收回（{spec['struct_bar']} 承压信号），现价直接做空", TradePlan(
+                    direction="short", strategy="假突破反转", entry_low=_sig(px), entry_high=_sig(px), stop_loss=stop,
+                    take_profits=targets_from(px, stop, False), leverage=20, entry_type="now", invalidation=f"{spec['struct_bar']} 收盘站上 {stop:g}",
                 )))
 
     # 3. 最近结构支撑 / 阻力挂单（趋势回踩或区间高抛低吸）及 EMA20 顺势浅回踩
@@ -453,13 +491,12 @@ def build_candidates(
                     take_profits=[_sig(px + t_sign * 2.0 * risk_m), _sig(px + t_sign * 4.0 * risk_m)],
                     leverage=20, entry_type="now", invalidation=f"{spec['struct_bar']} 收盘跌破 {stop:g}" if t_long else f"{spec['struct_bar']} 收盘站上 {stop:g}",
                 )))
-    near_sup = max((v for v in downs if v < px * 1.0005), default=None)
     supports = {float(s["price"]) for s in tf.get("support") or [] if isinstance(s, dict) and s.get("price") and 0 < float(s["price"]) < px}
     if regime["kind"] == "trend" and regime["side"] == "long" and 0 < e20 < px:
         supports.add(_sig(e20))
     for lv in sorted(supports | ({near_sup} if near_sup else set()), reverse=True)[:3]:
         stop = _sig(lv - max(0.8 * wide_atr, stop_floor))
-        how = "now" if entry_mode != "limit" and px >= lv and abs(px - lv) <= 0.35 * atr else "pullback"
+        how = "now" if entry_mode != "limit" and px >= lv and abs(px - lv) <= 0.45 * atr else "pullback"
         entry = _sig(px if how == "now" else lv)
         if lv != near_sup and lv != _sig(e20) and not any(v > px and v - entry >= (entry - stop) * 0.5 for v in ups):
             continue  # 备选挂位必须有已知的首目标，不为凑候选外推首目标
@@ -468,13 +505,12 @@ def build_candidates(
             direction="long", strategy=strat, entry_low=entry, entry_high=entry, stop_loss=stop,
             take_profits=targets_from(entry, stop, True), leverage=20, entry_type=how, invalidation=f"{spec['struct_bar']} 收盘跌破 {stop:g}",
         )))
-    near_res = min((v for v in ups if v > px * 0.9995), default=None)
     resistances = {float(r["price"]) for r in tf.get("resistance") or [] if isinstance(r, dict) and r.get("price") and float(r["price"]) > px}
     if regime["kind"] == "trend" and regime["side"] == "short" and e20 > px:
         resistances.add(_sig(e20))
     for lv in sorted(resistances | ({near_res} if near_res else set()))[:3]:
         stop = _sig(lv + max(0.8 * wide_atr, stop_floor))
-        how = "now" if entry_mode != "limit" and px <= lv and abs(lv - px) <= 0.35 * atr else "pullback"
+        how = "now" if entry_mode != "limit" and px <= lv and abs(lv - px) <= 0.45 * atr else "pullback"
         entry = _sig(px if how == "now" else lv)
         if lv != near_res and lv != _sig(e20) and not any(v < px and entry - v >= (stop - entry) * 0.5 for v in downs):
             continue
@@ -539,9 +575,10 @@ def build_candidates(
             continue
         in_regime = bool(
             quant_mode not in ("auto", "regime")
-            or (name in REGIME_PLAYS[regime["kind"]] and (not regime["side"] or regime["kind"] == "range" or plan.direction == regime["side"]))
+            or (name in REGIME_PLAYS[regime["kind"]] and (not regime["side"] or regime["kind"] == "range" or name == "假突破反转" or plan.direction == regime["side"]))
         )
-        check = check_plan(plan, px, min_rr=min_rr, cost_pct=taker_cost, limit_cost_pct=limit_cost)
+        max_dist = float(spec.get("limit_dist_pct") or 0.0) if has_box else 0.0
+        check = check_plan(plan, px, min_rr=min_rr, cost_pct=taker_cost, limit_cost_pct=limit_cost, max_dist_pct=max_dist)
         stale = "" if check.how in ("now", "breakout") else line_status(px, check.ref, plan.direction, shift, atr, spec["plan_minutes"], spec["bar_minutes"])
         align = "顺大方向" if major == plan.direction else "逆大方向" if major else "震荡边缘"
         ok = check.ok and not stale
@@ -556,8 +593,8 @@ def build_candidates(
     out.sort(key=lambda c: (
         not c["ok"],
         not c["in_regime"],
-        0 if (squeeze_now and c["strategy"] == "收敛突破") or (c["check"].how == "now" and c["strategy"] in IMPULSE_PLAYS) else 1,
-        0 if c["align"] == "顺大方向" else 1 if c["align"] == "震荡边缘" else 2,
+        0 if c["check"].how == "now" else 1 if (squeeze_now and c["strategy"] == "收敛突破") else 2,
+        0 if c["align"] == "顺大方向" else 1 if c["align"] == "震荡边缘" or c["strategy"] == "假突破反转" else 2,
         bool(preferred and c["check"].how != preferred),
         c["dist_pct"],
     ))

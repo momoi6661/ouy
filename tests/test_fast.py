@@ -89,7 +89,7 @@ async def test_an_authorized_signal_is_executed_at_once_and_the_worker_is_told_a
     assert fake.positions[BTC]["pos"] > 0 and len(calls) == used  # 直接下单，模型一次都没被调用
     assert st.fast_last["status"] == "executed" and "Worker 授权过这个方向" in st.fast_last["result"]
     manage = next(r for r in rt.store.strategies("demo", BTC) if r["kind"] == "manage")
-    assert manage["params"]["by"] == "快判" and manage["params"]["breakeven_r"] == 1.0
+    assert manage["params"]["by"] == "快判" and manage["params"]["breakeven_r"] == 1.5
     assert any(m["who"] == "快判" and "入场单已提交" in m["text"] for m in w.inbox("demo", BTC))
     assert any(a["agent"] == "strategy" and a["kind"] == "action" and "快判" in a["text"] for a in rt.store.activity("demo", inst_id=BTC))
 
@@ -101,6 +101,7 @@ async def test_a_signal_kind_that_loses_in_the_backtest_is_only_recorded(setting
 
     calls: list[int] = []
     rt, w, st = await _armed(settings, fake, "agent", on_signal="long", calls=calls)
+    rt.save_config(rt.config().model_copy(update={"stance": "balanced"}))
     used = len(calls)
     monkeypatch.setattr(bp, "REPORT_DIR", tmp_path)
     save("scalp", {BTC: [Trade(i * 60_000, "breakout", "long", 3, 100.0, 99.7, -0.4, -0.12, "止损", i * 60_000 + 1) for i in range(120)]}, {"kind": "fast"}, tmp_path)

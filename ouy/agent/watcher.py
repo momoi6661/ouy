@@ -647,9 +647,8 @@ class Watcher:
         return self._models[name]
 
     def _limiter(self, cfg: AgentConfig, pool: str) -> ConcurrencyLimiter:
-        """并发和排队用 PydanticAI 自带的限制器。Worker 一组名额；子代理另一组（是它的 2 倍），
-        这样组长占着名额等子代理回来时，子代理不会因为没有名额而和组长互相卡死。"""
-        size = cfg.max_parallel * (2 if pool == "subagents" else 1)
+        """并发和排队用 PydanticAI 自带的限制器。Worker 一组名额；子代理与对话任务另起名额（2 倍），互不卡死。"""
+        size = cfg.max_parallel * (2 if pool in ("subagents", "chat") else 1)
         if (pool, size) not in self._limiters:
             self._limiters[(pool, size)] = ConcurrencyLimiter(size, name=f"ouy-{pool}")
         return self._limiters[(pool, size)]
@@ -663,7 +662,7 @@ class Watcher:
     def _task_agent(self, cfg: AgentConfig, inst_id: str) -> Agent[Deps, str]:
         key = f"{cfg.model_for(inst_id)}|{cfg.max_parallel}"
         if key not in self._task_agents:
-            self._task_agents[key] = build_chat_agent(self._model(cfg.model_for(inst_id)), self.kb, self._limiter(cfg, "workers"))
+            self._task_agents[key] = build_chat_agent(self._model(cfg.model_for(inst_id)), self.kb, self._limiter(cfg, "chat"))
         return self._task_agents[key]
 
     @asynccontextmanager
@@ -1049,11 +1048,12 @@ class Watcher:
             if role == "risk":
                 account = await self.trader.account(cfg.env)
                 pos = account.position(inst_id)
+                day_lim = f"上限 -{cfg.risk.max_daily_loss_pct:g}%" if cfg.risk.max_daily_loss_pct > 0 else "当日亏损不限"
                 prompt += (
-                    f"\n【账户】权益 {account.equity:.2f} USDT，可用 {account.available:.2f}，当日盈亏 {account.day_pnl_pct or 0:+.2f}%（上限 -{cfg.risk.max_daily_loss_pct:g}%）。"
+                    f"\n【账户】权益 {account.equity:.2f} USDT，可用 {account.available:.2f}，当日盈亏 {account.day_pnl_pct or 0:+.2f}%（{day_lim}）。"
                     f"\n【这个币的持仓】{pos.model_dump(exclude_none=True) if pos else '无'}"
                     f"\n【全部持仓】" + ("；".join(f"{p.inst_id} {p.side} {p.contracts:g} 张 {p.leverage:g}x 浮盈亏 {p.upl:+.2f}" for p in account.positions) or "无")
-                    + f"\n【风控上限】单仓风险 {cfg.risk.risk_per_trade_pct:g}%，杠杆上限 {cfg.risk.max_leverage}x。"
+                    + f"\n【风控上限】单仓风险 {cfg.risk.risk_per_trade_pct:g}%，杠杆上限 {cfg.risk.max_leverage}x（超出预算或强平距离不够时下单层会自动缩量降杠杆，无须因此否决）。"
                 )
             result = await asyncio.wait_for(self._sub_agent(cfg, role).run(prompt, deps=deps, usage_limits=UsageLimits(request_limit=14), model_settings=_effort(cfg.sub_effort, f"ouy-sub-{role}")), REVIEW_TIMEOUT)
             brief = {**result.output.model_dump(), "ts": now_ms(), "question": question, "role": role, **link}
@@ -1931,34 +1931,37 @@ class Watcher:
         return self.store.get(f"lot_track:{env}", {})
 
     def _lock_r(self, cfg: AgentConfig, inst_id: str, lot: dict[str, Any]) -> float:
-        """这笔仓的保盈线：Worker 在 manage 规则里写了 lock_r 就按它（0 = 不要），否则按风格默认。"""
-        if not cfg.profit_lock:
+        """这笔仓的保盈线：用户手动开的单不自动把止损抢拉到买入点；Worker 在 manage 规则里写了 lock_r 就按它（0 = 不要），否则按风格默认（1.5R~1.8R 高点）。"""
+        if not cfg.profit_lock or lot.get("source") in MANUAL_SOURCES:
             return 0.0
         for row in self.store.strategies(cfg.env, inst_id):
             if row["kind"] == "manage" and row["status"] in ("armed", "active") and row["params"].get("lot_id") == lot["id"] and "lock_r" in row["params"]:
                 return float(row["params"]["lock_r"] or 0)
-        return LOCK_R.get(lot["style"], 0.5)
+        return LOCK_R.get(lot["style"], 1.5)
 
     async def _lock_profit(self, cfg: AgentConfig, inst_id: str, lot: dict[str, Any], mark: dict[str, Any], px: float, why: str) -> str:
-        """把这笔仓的止损移到「入场价 + 往返成本」（扣费后不亏）；价格已经回到那条线里面就退一步移到入场价。返回做了什么，没做成返回原因。"""
+        """浮盈冲出高点后，把止损移到「入场价 + 往返成本」（扣费后真实不亏）；现价空间还不够时等下一拍，绝不退而求其次移到不含手续费的裸买入价。"""
         long, entry, stop = lot["side"] == "long", lot["entry_px"], lot["stop_loss"]
         sign = 1 if long else -1
-        buffer = entry * (cfg.taker_fee_pct * 2 + 0.02) / 100
-        if stop and (stop - entry - sign * buffer) * sign >= 0:
+        buffer = max(entry * (cfg.taker_fee_pct * 2 + 0.02) / 100, 0.1 * mark["r0"])
+        lock_px = entry + sign * buffer
+        if stop and (stop - lock_px) * sign >= 0:
             mark["locked"] = stop
             return ""
-        room = max(0.3 * mark["r0"], entry * 0.001)  # 新止损离现价至少留这么远：贴着现价移等于直接平仓
-        tighter = [p for p in (entry + sign * buffer, entry) if (px - p) * sign >= room and (not stop or (p - stop) * sign > 0)]
-        if not tighter and (px - entry) * sign > 0:
-            return ""  # 还在盈利，只是离成本线太近：下一拍再看
-        if not tighter:
+        room = max(0.35 * mark["r0"], entry * 0.0012)  # 新止损离现价至少留足呼吸，贴着现价移等于直接被扫出局
+        if (px - lock_px) * sign < room:
+            if (px - entry) * sign > 0:
+                return ""  # 还在盈利但离锁盈线还太近：等涨高一点再移，不移到裸入场价
             mark["locked"] = "missed"
             return f"价格已经回到成本线 {entry:g} {'下' if long else '上'}方，来不及锁"
-        target = float(f"{tighter[0]:.8g}")
+        target = float(f"{lock_px:.8g}")
+        if stop and (target - stop) * sign <= 0:
+            mark["locked"] = stop
+            return ""
         result = await self.trader.execute(TradeAction(kind="set_stops", inst_id=inst_id, lot_id=lot["id"], stop_loss=target, reason=why), cfg.env, source="guard")
         if result.status == "executed":
             mark["locked"] = target
-            return f"止损已移到 {target:g}（{'入场价 + 往返成本，扣费后不亏' if target != entry else '入场价，不含手续费'}）"
+            return f"止损已移到 {target:g}（入场价 + 往返成本，扣费后不亏）"
         mark["lock_fail"] = mark.get("lock_fail", 0) + 1
         mark["lock_retry"] = time.time() + 30
         return f"没做成：{result.message[:160]}"
@@ -2022,7 +2025,7 @@ class Watcher:
                 changed = True
                 self._algo(cfg.env, inst_id, "lot", f"结构反向：{who}和 5 分钟刚确认的转折方向相反，现在 {gain:+.2f}R", "叫醒 Worker 判断入场理由还在不在", shift["side"], px)
                 locked = ""
-                if not m.get("locked") and not martingale and not hands_off and cfg.profit_lock and gain > 0:
+                if not m.get("locked") and not martingale and not hands_off and lot.get("source") not in MANUAL_SOURCES and cfg.profit_lock and gain >= 1.0:
                     locked = await self._lock_profit(cfg, inst_id, lot, m, px, "结构反向：先锁住不亏")
                 st.lot_alert = (
                     f"结构反向：{who}和 5m 刚确认的转折（{shift['why']}）方向相反，现在 {gain:+.2f}R，浮盈最高到过 {m['peak']:+.2f}R。"
@@ -2489,7 +2492,7 @@ class Watcher:
         pref = cfg.leverage_pref()
         plan = sig.plan(pref[1] if pref else min(cfg.risk.max_leverage, 20)).model_copy(update={"strategy": f"快判·{FAST_KIND[sig.kind]}"})
         style = cfg.style_for(inst_id)
-        if plan.strategy in losing(style):  # 和算法候选位同一条规矩：机械照做回测扣费后亏的，程序不照着下单，也不为它叫醒 Worker
+        if not self._follow_trend(cfg, inst_id) and plan.strategy in losing(style):  # 非积极档才按旧存盘回测拦快判；积极档放行放量快判信号
             st.fast_at[sig.side] = now
             done("skipped", f"这类信号机械照做的回测是亏的（{evidence(style).get(plan.strategy, '')}）：只记录，不下单、不叫醒 Worker", emit=False)
             return None
@@ -3318,8 +3321,13 @@ class Watcher:
         ticker = await self.market.ticker(inst_id, cfg.env)
         bid, ask = _f(ticker.get("bidPx")), _f(ticker.get("askPx"))
         spread = (ask - bid) / bid * 100 if bid and ask >= bid else 0.0
-        check = check_plan(plan, _f(ticker.get("last")), min_rr=STANCES[cfg.stance_for(inst_id)]["min_rr"], cost_pct=trade_cost_pct(cfg.taker_fee_pct, spread),
-                           limit_cost_pct=cfg.maker_fee_pct + cfg.taker_fee_pct + spread)
+        style_name = cfg.style_for(inst_id)
+        check = check_plan(
+            plan, _f(ticker.get("last")), min_rr=STANCES[cfg.stance_for(inst_id)]["min_rr"],
+            cost_pct=trade_cost_pct(cfg.taker_fee_pct, spread),
+            limit_cost_pct=cfg.maker_fee_pct + cfg.taker_fee_pct + spread,
+            max_dist_pct=cfg.limit_dist_for(style_name),
+        )
         if check.ok:
             issue = self._reentry_issue(plan, check.ref, RETRY_MINUTES[cfg.style_for(inst_id)],
                                         self.store.lots(cfg.env, inst_id, live=False, limit=10), now_ms())
@@ -3503,7 +3511,7 @@ class Watcher:
                     require_flat=True, cancel_before_entry=plan.cancel_before_entry,
                     expires_minutes=plan.valid_minutes or STYLES[style]["plan_minutes"], reason=f"照计划挂限价单（{check.numbers()}）",
                 )
-                result = await self.trader.submit(action, source="agent", far_ok=True)
+                result = await self.trader.submit(action, source="agent", far_ok=False)
                 deps.actions.append(result)
                 if result.status == "executed":
                     self.scores.tag(cfg.env, inst_id, plan.direction, plan.strategy, "计划挂限价单", ttl_minutes=(action.expires_minutes or 60) + 2, origin=self._origin(inst_id, plan, check, "计划"))
@@ -4242,9 +4250,18 @@ class Watcher:
         if not queue and not parent.propose_only and self._steer(cfg, inst_id, goal or task, who):
             parent.steered = True
             return f"{inst_id} 的 Worker 正在思考，这件事已经直接送进它当前这一轮，它下一步就会读到并处理，不用等、也不用再交一次；结果会由它发到这个币的对话里。"
-        work_id = self.store.add_work(cfg.env, inst_id, "user", (goal or task)[:300], "queued" if st.lock.locked() else "running", model=cfg.model_for(inst_id))
+        router_fast = who == "Router" and parent.propose_only and not queue and st.reviewing
+        work_id = self.store.add_work(cfg.env, inst_id, "user", (goal or task)[:300], "queued" if (st.lock.locked() and not router_fast) else "running", model=cfg.model_for(inst_id))
         self.bus.publish("work", {"inst_id": inst_id})
         try:
+            # Router 对话分派在后台正在自动复盘时不排队苦等 st.lock，直接独立并发响应，秒回用户
+            if router_fast:
+                if cfg.env != self.get_config().env:
+                    reason = "交易环境已切换，请在当前环境重新发起任务。"
+                    self.store.update_work(work_id, "failed", reason)
+                    self.bus.publish("work", {"inst_id": inst_id})
+                    return reason
+                return await self._dispatch_once(cfg, inst_id, task, parent, work_id, said="", concurrent=True)
             async with self._turn(cfg, inst_id, "处理交来的任务"):
                 if cfg.env != self.get_config().env:
                     reason = "交易环境已切换，请在当前环境重新发起任务。"
@@ -4259,7 +4276,7 @@ class Watcher:
                 self.bus.publish("work", {"inst_id": inst_id})
             raise
 
-    async def _dispatch_once(self, cfg: AgentConfig, inst_id: str, task: str, parent: Deps, work_id: int, said: str = "") -> str:
+    async def _dispatch_once(self, cfg: AgentConfig, inst_id: str, task: str, parent: Deps, work_id: int, said: str = "", *, concurrent: bool = False) -> str:
         st = self._state(inst_id)
         self.store.update_work(work_id, "running")
         self.bus.publish("work", {"inst_id": inst_id})
@@ -4299,7 +4316,8 @@ class Watcher:
         ]))
         try:
             result = await self._run(
-                self._task_agent(cfg, inst_id), [prompt, *pics] if pics else prompt, st, REVIEW_TIMEOUT, live=LiveText(self.bus.publish, "worker", inst_id),
+                self._task_agent(cfg, inst_id), [prompt, *pics] if pics else prompt, None if concurrent else st, REVIEW_TIMEOUT,
+                live=LiveText(self.bus.publish, "worker", inst_id),
                 deps=deps, usage_limits=UsageLimits(request_limit=20), model_settings=_effort(parent.effort or cfg.effort_for(inst_id), _worker_cache_key("task", inst_id)),
             )
         except BaseException as exc:
