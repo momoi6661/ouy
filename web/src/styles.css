@@ -3181,6 +3181,9 @@ select option:checked { background: #2b3340; color: #f0b90b; }
 .pb dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; font-size: 12.5px; }
 .pb dt { color: var(--muted); }
 .pb dd { margin: 0; }
+.pb-builtin { margin-top: 6px; }
+.pb-builtin > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.pb-builtin .pb-list { max-height: 40vh; }
 .pb-form { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 .pb-form .row { display: flex; gap: 10px; }
 .pb-form .row .field { flex: 1; }
@@ -3621,3 +3624,39 @@ select option:checked { background: #2b3340; color: #f0b90b; }
 .line-new { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .line-new input, .line-new select { padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.04); color: inherit; font-variant-numeric: tabular-nums; }
 .line-new input { width: 112px; }
+
+/* ===== Agent 的一轮运行：状态、步骤列表、思考中 ===== */
+.run-state { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 400; color: var(--muted); white-space: nowrap; }
+.run-state.run { color: var(--green); }
+.run-state.ask { color: var(--accent); }
+.run-state.bad { color: var(--red); }
+.spin { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid currentColor; border-right-color: transparent; animation: run-spin 0.8s linear infinite; flex: none; }
+@keyframes run-spin { to { transform: rotate(360deg); } }
+.run-steps { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.run-fold { align-self: flex-start; border: none; background: none; color: var(--muted); font-size: 12px; padding: 0; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.run-fold:hover { color: var(--text); }
+.run-steps ol { list-style: none; margin: 0; padding: 0 0 0 5px; display: flex; flex-direction: column; border-left: 1px solid var(--line); }
+.run-step > button { display: flex; align-items: baseline; gap: 7px; width: 100%; border: none; background: none; color: var(--text); padding: 3px 0 3px 9px; font-size: 12.5px; text-align: left; cursor: pointer; min-width: 0; }
+.run-step > button:hover b { color: var(--blue); }
+.run-step > button b { font-weight: 500; flex: none; }
+.run-step > button span { color: var(--muted); font-size: 11.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-step .dot { flex: none; width: 12px; height: 12px; display: inline-grid; place-items: center; font-style: normal; font-size: 10px; line-height: 1; transform: translateY(1px); }
+.run-step.ok .dot::before { content: "✓"; color: var(--green); }
+.run-step.bad .dot::before { content: "✕"; color: var(--red); }
+.run-step.bad > button b { color: var(--red); }
+.run-step.idle .dot::before { content: "·"; color: var(--muted); }
+.run-step.run .dot { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--green); border-right-color: transparent; animation: run-spin 0.8s linear infinite; transform: none; align-self: center; }
+.run-step.handoff > button b { color: var(--blue); }
+.run-step .step-detail { margin: 2px 0 6px 9px; }
+.run-wait { display: inline-flex; align-items: center; gap: 4px; color: var(--green); font-size: 12.5px; }
+.run-wait i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: run-dots 1.2s ease-in-out infinite; }
+.run-wait i:nth-child(2) { animation-delay: 0.15s; }
+.run-wait i:nth-child(3) { animation-delay: 0.3s; }
+.run-wait span { margin-left: 4px; }
+@keyframes run-dots { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+.msg.agent .bub .body.clamp { max-height: 5.2em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent); }
+.run-earlier { align-self: center; border: 1px solid var(--line); background: none; color: var(--muted); font-size: 12px; padding: 3px 12px; border-radius: 999px; cursor: pointer; }
+.run-earlier:hover { color: var(--text); border-color: var(--muted); }
+.run-skip { font-size: 11.5px; color: var(--muted); text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-messages > .msg { max-width: none; margin: 0; }
+.chat-messages > .msg.agent .bub { font-size: inherit; }

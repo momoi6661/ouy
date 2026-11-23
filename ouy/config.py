@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     ai_api_mode: Literal["auto", "responses", "chat"] = Field("auto", alias="AI_API_MODE")
     # 把固定的系统规则放在请求 input 的最前面（developer 消息），服务端的提示缓存才够得着它；见 agent/core.py 的 lead_instructions
     ai_instructions_first: bool = Field(True, alias="AI_INSTRUCTIONS_FIRST")
-    ai_cache_breakpoints: bool = Field(True, alias="AI_CACHE_BREAKPOINTS")  # 在不变资料的末尾标显式缓存断点；上游不认时程序会自己退回自动缓存
     embedding_model: str = Field("BAAI/bge-small-zh-v1.5", alias="KB_EMBEDDING_MODEL")
     proxy_url: str = Field("", alias="LOCAL_PROXY_URL")
 

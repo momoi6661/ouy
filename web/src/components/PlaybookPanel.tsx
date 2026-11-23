@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type Playbook } from "../api";
+import { api, type BuiltinPlaybook, type Playbook } from "../api";
 import { Modal, toast } from "./ui";
 
 const BASES: { id: Playbook["base"]; label: string }[] = [
@@ -23,8 +23,10 @@ export function PlaybookPanel({ env, onClose, onCount }: { env: "demo" | "live";
   const [form, setForm] = useState<typeof EMPTY | null>(null);
   const [busy, setBusy] = useState("");
   const set = (list: Playbook[]) => (setRows(list), onCount(list.length));
+  const [builtin, setBuiltin] = useState<BuiltinPlaybook[]>([]);
   useEffect(() => {
     api.playbooks().then(set, (e) => toast(e.message, "error"));
+    api.builtinPlaybooks().then(setBuiltin, () => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const run = async (key: string, fn: () => Promise<Playbook[]>, ok: string) => {
@@ -56,7 +58,7 @@ export function PlaybookPanel({ env, onClose, onCount }: { env: "demo" | "live";
       {rows === null ? (
         <div className="muted small">加载中…</div>
       ) : rows.length === 0 && !form ? (
-        <div className="muted small">还没有策略。Worker 验证过有效的做法会自己写进来，你也可以先加一条。</div>
+        <div className="muted small">自己写的策略还没有。Worker 验证过有效的做法会自己写进来，你也可以先加一条；下面的内置打法 Worker 一直在用。</div>
       ) : (
         <div className="pb-list">
           {rows.map((p) => (
@@ -117,6 +119,23 @@ export function PlaybookPanel({ env, onClose, onCount }: { env: "demo" | "live";
             </div>
           ))}
         </div>
+      )}
+      {!form && builtin.length > 0 && (
+        <details className="pb-builtin" open={rows !== null && rows.length === 0}>
+          <summary>内置打法 {builtin.length} 套（知识库里的，Worker 每轮都能选用；全文在「知识库」页）</summary>
+          <div className="pb-list">
+            {builtin.map((b) => (
+              <div key={b.id} className="pb">
+                <div className="pb-h">
+                  <b>{b.name}</b>
+                  {b.losing && <span className="tag" title="存盘回测里机械照做扣费后是亏的：Worker 要做必须写出额外依据">回测扣费后亏</span>}
+                  <span className="pb-score">{b.score ? `${where}战绩：${b.score}` : `${where}还没做过`}</span>
+                </div>
+                <div className="muted small">{b.when}</div>
+              </div>
+            ))}
+          </div>
+        </details>
       )}
       {form ? (
         <div className="pb-form">

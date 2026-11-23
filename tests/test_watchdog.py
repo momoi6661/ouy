@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 from pydantic_ai.models.function import FunctionModel
 
+from ouy.models import WorkerOverride
+
 from .test_agent_and_api import BTC, make_rt
 
 
@@ -136,6 +138,11 @@ def test_next_look_follows_style_position_and_skips_a_close_that_is_too_near(rt)
     assert w._next_look(cfg, BTC, st, hour + 60) == hour + 300 + 10  # 有仓：每根结构周期 K 线
     st.had_position = False
     assert w._next_look(cfg.model_copy(update={"style": "swing"}), BTC, st, hour + 60) == hour // 14_400 * 14_400 + 14_400 + 10
+    fixed = cfg.model_copy(update={"look_minutes": 60})
+    assert w._next_look(fixed, BTC, st, hour + 60) == hour + 3600 + 10  # 设置里选了 1 小时：空仓有仓都按它
+    own = fixed.model_copy(update={"workers": {BTC: WorkerOverride(look_minutes=5)}})
+    assert w._next_look(own, BTC, st, hour + 60) == hour + 300 + 10  # 这个 Worker 自己选了 5 分钟
+    assert w._next_look(own, "ETH-USDT-SWAP", st, hour + 60) == hour + 3600 + 10
 
 
 async def test_market_events_are_capped_per_hour_and_carried_into_the_next_look(rt, fake, monkeypatch):

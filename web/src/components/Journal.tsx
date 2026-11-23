@@ -1,4 +1,5 @@
-import { fmtTime, shortInst, STATUS_LABEL, type JournalEntry } from "../api";
+import { fmtPx, fmtTime, shortInst, STATUS_LABEL, type JournalEntry } from "../api";
+import { lineCond, lineKind } from "./LevelLines";
 import { Empty } from "./ui";
 
 const KIND = { cycle: "复盘", action: "操作", alert: "警报", system: "系统" } as const;
@@ -8,6 +9,11 @@ export interface PastLevel {
   price: number;
   kind: "entry" | "sl" | "tp" | "watch" | "price";
   title: string;
+}
+
+/** 一轮复盘当时交的计划线。改名前的旧记录叫 watch_levels，没有动作，到了只叫醒。 */
+function pastLines(e: JournalEntry): { price: number; do?: string; side?: string; when?: string; bar?: string }[] {
+  return e.body?.lines ?? e.body?.watch_levels ?? [];
 }
 
 /** 一条记录当时给出的价位：计划的入场区间、止损、止盈，以及盯盘价位。没有价位的记录返回空数组。 */
@@ -27,7 +33,7 @@ export function levelsOf(e: JournalEntry): PastLevel[] {
       add(plan.stop_loss, "sl", "当时止损");
       (plan.take_profits ?? []).forEach((tp: number, i: number) => add(tp, "tp", `当时止盈${i + 1}`));
     }
-    for (const l of e.body?.lines ?? e.body?.watch_levels ?? []) add(l.price, "watch", "当时的计划线");  // watch_levels 是改名前的旧记录
+    for (const l of pastLines(e)) add(l.price, "watch", `当时的${lineKind(l.do) ?? "叫醒线"}${lineCond(l.when, l.bar)}`);
     if (out.length) add(e.body?.price, "price", "当时价格");
   } else if (e.kind === "action") {
     const a = e.body?.action ?? {};
@@ -78,6 +84,15 @@ export function Journal({ entries, compact, onShow, shownId }: Props) {
             {e.kind === "action" && e.body.message && <div className="j-msg">{e.body.message}</div>}
             {e.kind === "action" && e.body.action?.reason && !compact && <div className="muted small">理由：{e.body.action.reason}</div>}
             {e.kind === "cycle" && !compact && e.body.reason && <div className="muted small">触发：{e.body.reason} · 当时价格 {e.body.price}</div>}
+            {e.kind === "cycle" && !compact && pastLines(e).length > 0 && (
+              <div className="muted small">
+                计划线：
+                {[...pastLines(e)]
+                  .sort((x, y) => y.price - x.price)
+                  .map((l) => `${fmtPx(l.price)} ${l.do === "enter" ? (l.side === "short" ? "做空" : "做多") : l.do === "cancel" ? "撤单" : "叫醒"}`)
+                  .join(" · ")}
+              </div>
+            )}
             {e.kind === "alert" && e.body.message && <div className="j-msg">{e.body.message}</div>}
             {can && <div className="j-show">{on ? "已显示在图上 · 点击收起" : "在图上显示当时的价位"}</div>}
           </div>

@@ -36,6 +36,37 @@ function previousShow(): string[] {
   return ["shift", "plan", "trigger", "algo", "events"];
 }
 
+/** 一条线到了之后程序做什么，画在图上的名字。action 是规则的动作（open_market / cancel_orders / close / wake），
+ *  或者计划线的 do（enter / cancel / wake）；不是这几种的返回 null，由调用的地方用原来的叫法。 */
+/** 线的条件写在标签上：碰到就算，还是要等某个周期的 K 线收盘越过。两种线在图上长得一样，不写出来看不出为什么价格过了线却没动。 */
+export function lineCond(when: unknown, bar?: unknown): string {
+  const w = String(when ?? "");
+  const tf = bar ? `${bar} ` : "";
+  if (w === "close_above") return ` · ${tf}收盘站上`;
+  if (w === "close_below") return ` · ${tf}收盘跌破`;
+  if (w === "price_above") return " · 涨到";
+  if (w === "price_below") return " · 跌到";
+  if (w.startsWith("price")) return " · 碰到";
+  return "";
+}
+
+export function lineKind(action: unknown): string | null {
+  switch (action) {
+    case "open_market":
+    case "enter":
+      return "进场线";
+    case "cancel_orders":
+    case "cancel":
+      return "撤单线";
+    case "close":
+      return "平仓线";
+    case "wake":
+      return "叫醒线";
+    default:
+      return null;
+  }
+}
+
 /** K 线上的参考线：上一段的高点低点（按时间段分别开关）、区间上下沿、支撑、阻力（各一个开关）。每 20 秒更新。
  *  Worker 的计划、计划线、触发器这几类线由页面自己画，这里只管它们的开关（on）。
  *  工作台和交易页共用同一份开关设置。返回要画的线和那一排开关。 */

@@ -11,12 +11,12 @@ import { AlgoPanel } from "../components/AlgoPanel";
 import { LineForm } from "../components/LineForm";
 import { Recorders } from "../components/Recorders";
 import { AssetsPanel } from "../components/AssetsPanel";
-import { useLevelLines } from "../components/LevelLines";
+import { lineCond, lineKind, useLevelLines } from "../components/LevelLines";
 import { OrderTicket, PositionCard } from "../components/OrderTicket";
 import { PlaybookPanel } from "../components/PlaybookPanel";
 import { MemoryPanel } from "../components/MemoryPanel";
 import { TeamCanvas } from "../components/TeamCanvas";
-import { Markdown } from "../components/Markdown";
+import { Earlier, RunCard, liveKey, settleTurns, toTurns, useLiveText, useRecent, type Turn } from "../components/AgentRun";
 import { ChatPanel, type ShownPlan } from "../components/ChatPanel";
 import { PlanExecution } from "../components/PlanExecution";
 import { Num, Pnl, toast, useStored } from "../components/ui";
@@ -59,134 +59,7 @@ interface Props {
   onTrade: () => void;
 }
 
-const NAME: Record<string, string> = { general: "通用 Worker", adhoc: "临时子代理", watchdog: "Watchdog", router: "Router", worker: "Worker", strategy: "策略执行器", intel: "情报", smart: "聪明钱", risk: "风险复核" };
-const AVATAR: Record<string, string> = { general: "通", adhoc: "子", watchdog: "看", router: "R", worker: "W", strategy: "策", intel: "情", smart: "聪", risk: "风" };
 const BARS = ["1m", "5m", "15m", "1H", "4H"];
-
-interface Step {
-  id: number;
-  label: string;
-  why?: string;
-  result?: string;
-  handoff?: boolean;
-  sub?: boolean; // 这一步是临时开的子代理：它自己的过程收在这一步里，点开才看
-  tool?: string;
-}
-/** Router 用这些工具把事情交出去：交出去之后它这条消息就结束，等 Worker 说完，它的总结另起一条排在后面 */
-const HANDOFF_TOOLS = new Set(["ask_worker", "ask_general", "ask_intel"]);
-/** 开子代理的工具调用本身不出标签：子代理自己会出一个标签，不然每开一个出两个 */
-const SPAWN_TOOLS = new Set(["spawn_subagent", "spawn_helper"]);
-interface Turn {
-  key: string;
-  ts: number;
-  agent: string;
-  inst: string;
-  user?: string; // 用户说的话（右边的气泡）
-  images?: string[]; // 这句话附的图片
-  sub?: string; // 气泡下面的小字：这句话是怎么送到的
-  trigger?: string;
-  steps: Step[];
-  asks: Activity[];
-  notes: Activity[]; // 排队、插话、你的决定、执行的操作
-  body?: string;
-  error?: string;
-  errorEvent?: Activity;
-  done: boolean;
-  handed?: boolean; // Router 已经把事情交出去了：这条消息到此为止
-  quiet?: Step[]; // 不出标签的步骤（开子代理的调用）；出错了才显示
-}
-
-/** 活动流按「一轮」归到一起：一次唤醒 → 若干步工具调用 → 结论 */
-function toTurns(rows: Activity[]): Turn[] {
-  const turns: Turn[] = [];
-  const open = new Map<string, Turn>();
-  const subSteps = new Map<number, Step>();
-  const subLogs = new Map<number, string>();
-  for (const a of rows) {
-    if (a.kind === "interject" && a.data?.who === "用户") {
-      // 你在它思考时送进去的话，或者留的言：就是你说的一句话
-      turns.push({ key: `u${a.id}`, ts: a.ts, agent: "user", inst: a.inst_id, user: a.text.replace(/^[^：]*：/, ""), sub: a.data?.delivered ? "已送进它正在跑的这一轮" : "它空闲，已放进信箱", steps: [], asks: [], notes: [], done: true });
-      continue;
-    }
-    if (a.agent === "adhoc" && a.kind === "closed") continue; // 关子代理这件事已经显示在关它的那条消息里（「关掉子代理」标签）
-    // 临时子代理不单开一条消息：收进派它的那条消息里，当成一个工具小卡片
-    if (a.agent === "adhoc" && a.work_id != null) {
-      let step = subSteps.get(a.work_id);
-      if (!step && a.kind === "wake") {
-        const by = a.data?.by === "Router" ? "router" : a.data?.by === "通用 Worker" ? "general" : "worker";
-        const parent = [...turns].reverse().find((t) => t.user === undefined && t.agent === by && (by !== "worker" || t.inst === a.inst_id));
-        if (parent) {
-          step = { id: a.id, label: `子代理「${a.data?.name ?? "临时"}」`, why: a.text.replace(/^[^：]*：/, ""), handoff: true, sub: true };
-          parent.steps.push(step);
-          subSteps.set(a.work_id, step);
-          subLogs.set(a.work_id, "");
-        }
-      }
-      if (step) {
-        const log = subLogs.get(a.work_id) ?? "";
-        if (a.kind === "tool") subLogs.set(a.work_id, `${log}· ${a.text}\n`);
-        else if (a.kind === "done") step.result = `${log}结论：${a.text}`;
-        else if (a.kind === "error") step.result = `${log}没查成：${a.text}`;
-        continue;
-      }
-    }
-    const key = a.work_id != null ? `w${a.work_id}` : a.agent === "router" ? "router" : `s${a.id}`;
-    let t = open.get(key);
-    const start = !t || (a.kind === "wake" && a.work_id == null);
-    if (start) {
-      t = { key: `${key}-${a.id}`, ts: a.ts, agent: a.agent, inst: a.inst_id, steps: [], asks: [], notes: [], done: a.agent === "strategy" || a.agent === "watchdog" };
-      open.set(key, t);
-      turns.push(t);
-    }
-    if (!t) continue;
-    if (a.kind === "interject" && start && a.work_id == null) t.done = true; // 独立留言不是新一轮思考；插入已有任务也不代表它已结束
-    // Router 交出任务后，后面的总结另起一条，排在 Worker 的消息后面（中间没有别人说话就还接在原来那条里）
-    if (t.handed && a.agent === "router" && a.kind !== "result" && a.kind !== "wake" && a.kind !== "handoff" && !(HANDOFF_TOOLS.has(a.data?.tool) && a.kind === "tool")) {
-      if (turns[turns.length - 1] !== t) {
-        t = { key: `${key}-${a.id}`, ts: a.ts, agent: a.agent, inst: a.inst_id, steps: [], asks: [], notes: [], done: false };
-        open.set(key, t);
-        turns.push(t);
-      } else {
-        t.handed = false;
-        t.done = false;
-      }
-    }
-    if (a.kind === "handoff" && a.agent !== "router" && a.data?.goal) t.done = true; // 你在面板上定的目标：这条只是记录，不是它在思考
-    if (a.kind === "wake" && a.agent === "strategy" && a.data?.strategy_id && a.data?.status === "proposed") t.asks.push(a);
-    if (a.kind === "wake") {
-      if (a.data?.source === "user") {
-        turns.splice(turns.length - 1, 0, { key: `u${a.id}`, ts: a.ts, agent: "user", inst: a.agent === "router" ? "" : a.inst_id, user: a.text.replace(/^用户：/, ""), images: a.data?.images, steps: [], asks: [], notes: [], done: true });
-      } else t.trigger = a.text;
-    } else if (a.kind === "tool" || a.kind === "handoff") {
-      const step: Step = { id: a.id, label: a.text, why: a.data?.why, handoff: a.kind === "handoff", tool: a.data?.tool };
-      if (SPAWN_TOOLS.has(a.data?.tool)) (t.quiet ??= []).push(step);
-      else t.steps.push(step);
-      if (a.agent === "router" && (a.kind === "handoff" || HANDOFF_TOOLS.has(a.data?.tool))) {
-        t.handed = true;
-        t.done = true;
-      }
-    } else if (a.kind === "result") {
-      const pending = [...t.steps, ...(t.quiet ?? [])].filter((x) => x.result === undefined && !x.sub);
-      const last = pending.reverse().find((x) => !a.data?.tool || !x.tool || x.tool === a.data.tool) ?? pending[0];
-      if (last) {
-        last.result = a.text.replace(/^[^→]*→\s*/, "");
-        if (t.quiet?.includes(last) && last.result.startsWith("[")) t.steps.push(last); // 子代理没开成：把这一步亮出来
-      }
-    } else if (a.kind === "ask") t.asks.push(a);
-    else if (a.kind === "done") {
-      t.body = a.text;
-      t.done = true;
-    } else if (a.kind === "error") {
-      t.error = a.text;
-      t.errorEvent = a;
-      t.done = true;
-    } else if (a.kind === "skip") {
-      t.body = a.text;
-      t.done = true;
-    } else t.notes.push(a);
-  }
-  return turns;
-}
 
 export function Workspace({ state, account, ticks, pending, activity, inst, redUp, loggedIn, setInst, refresh, onTrade }: Props) {
   // 改设置时先在界面上立刻生效（不等后端和欧易那一两秒），后端存好、状态刷新回来后再以后端为准；保存失败就退回去
@@ -210,21 +83,8 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   /* ---------- 对话 ---------- */
   // 团队动态是活动记录。对话与确认卡由 ChatPanel 提供。
   const [feed, setFeed] = useStored<"router" | "all">("ouy.ws.feed", "router");
-  const turns = useMemo(() => {
-    const list = toTurns(activity);
-    const latest = new Map<string, Turn>();
-    for (const t of list) if (t.user === undefined && !t.done) latest.set(`${t.agent}:${t.inst}`, t);
-    for (const t of list) {
-      if (t.user !== undefined || t.done) continue;
-      const w = agent.instruments[t.inst];
-      const busy = t.agent === "worker" ? !!(w?.busy || w?.reviewing) : t.agent === "general" ? !!agent.general?.busy : Date.now() - t.ts < 5 * 60_000;
-      // 没结束的标记只留给「这个 Agent 最新的一条、而且它确实还在忙」：之前被打断、重启丢掉的那些不再一直转圈
-      if (latest.get(`${t.agent}:${t.inst}`) !== t || !busy || t.asks.length) t.done = true;
-    }
-    return list;
-  }, [activity, agent]);
-  const [openStep, setOpenStep] = useState<number | null>(null);
-  const [openTurn, setOpenTurn] = useState<Record<string, boolean>>({});
+  const turns = useMemo(() => settleTurns(toTurns(activity), agent), [activity, agent]);
+  const recent = useRecent(turns, 20);
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
   useEffect(() => {
@@ -264,23 +124,8 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     }
   };
 
-  // 流式输出：Agent 正在写的内容（还没写完），按「谁:哪个币」存；写完就清掉，由正式的结论接上
-  const [live, setLive] = useState<Record<string, { text: string; thinking: string }>>({});
-  useEffect(() => {
-    const on = (e: Event) => {
-      const d = (e as CustomEvent).detail as { agent: string; inst_id: string; text: string; thinking: string; done: boolean };
-      const key = `${d.agent}:${d.agent === "router" ? "" : d.inst_id}`;
-      setLive((all) => {
-        if (!d.done) return { ...all, [key]: { text: d.text, thinking: d.thinking } };
-        const { [key]: _gone, ...rest } = all;
-        return rest;
-      });
-    };
-    window.addEventListener("ouy:stream", on);
-    return () => window.removeEventListener("ouy:stream", on);
-  }, []);
+  const live = useLiveText();
   // 每个 Agent 最新一条还没结束的消息：流式内容就显示在这一条里
-  const liveKey = (t: Turn) => `${t.agent}:${t.agent === "router" ? "" : t.inst}`;
   const liveTurn = new Map<string, string>();
   for (const t of turns) if (t.user === undefined && !t.done) liveTurn.set(liveKey(t), t.key);
   const liveOf = (t: Turn) => (t.key === "router-live" ? live["router:"] : !t.done && !t.body && liveTurn.get(liveKey(t)) === t.key ? live[liveKey(t)] : undefined);
@@ -457,7 +302,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
       preview.take_profits.forEach((price) => out.push({ price, color: "#0ecb81", title: "方案止盈", dashed: true }));
     }
     for (const w of st?.rules ?? []) {
-      if (w.type === "watch" && w.status === "waiting" && w.level) out.push({ price: w.level, color: "#9aa4b2", title: w.action === "open_market" ? "进场线" : w.action === "cancel_orders" ? "撤单线" : "叫醒线", dashed: true, group: "watch" });
+      if (w.type === "watch" && w.status === "waiting" && w.level) out.push({ price: w.level, color: "#9aa4b2", title: (lineKind(w.action) ?? "叫醒线") + lineCond(w.cond, w.bar), dashed: true, group: "watch" });
     }
     for (const order of account?.orders ?? []) {
       if (order.inst_id === coin && order.px) out.push({ price: order.px, color: "#f0b90b", title: order.side === "buy" ? "买单" : "卖单", dashed: true, group: "orders" });
@@ -470,7 +315,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
       const p = s.params;
       if (p.observation) continue;
       const level = s.kind === "trigger" && String(p.when ?? "").match(/^(price|close)/) ? p.level : p.trigger;
-      if (level) out.push({ price: level, color: "#c084fc", title: `#${s.id} 触发`, dashed: true, group: "trigger" });
+      if (level) out.push({ price: level, color: "#c084fc", title: `#${s.id} ${(s.kind === "trigger" && lineKind(p.do)) || "触发"}${s.kind === "trigger" ? lineCond(p.when, p.bar) : ""}`, dashed: true, group: "trigger" });
       if (p.price) out.push({ price: p.price, color: "#c084fc", title: `#${s.id} 挂单价`, dashed: true, group: "trigger" });
       if (p.low) out.push({ price: p.low, color: "#c084fc", title: `#${s.id} 下沿`, dashed: true, group: "trigger" });
       if (p.high) out.push({ price: p.high, color: "#c084fc", title: `#${s.id} 上沿`, dashed: true, group: "trigger" });
@@ -544,7 +389,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             {(
               [
                 ["reasoning_effort", "Worker"],
-                ["router_effort", "Router"],
                 ["sub_effort", "子代理"],
               ] as const
             ).map(([field, label]) => (
@@ -701,7 +545,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             {feed === "all" ? "返回对话" : "查看团队动态"}
           </button>
         </div>
-          <ChatPanel inst={coin} config={cfg} agent={agent} defaultEffort={cfg.reasoning_effort} shown={shownPlan} hidden={feed === "all" || tab !== "chat"}
+          <ChatPanel inst={coin} config={cfg} agent={agent} activity={activity} defaultEffort={cfg.reasoning_effort} shown={shownPlan} hidden={feed === "all"}
             onShow={(plan) => {
               setShownPlan(plan);
               if (plan) {
@@ -725,7 +569,8 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               暂无团队动态
             </div>
           )}
-          {[...turns, ...(live["router:"] && !liveTurn.has("router:") ? [{ key: "router-live", ts: Date.now(), agent: "router", inst: "", steps: [], asks: [], notes: [], done: false } as Turn] : [])].map((t) =>
+          <Earlier count={recent.earlier} onMore={recent.more} />
+          {[...recent.visible, ...(live["router:"] && !liveTurn.has("router:") ? [{ key: "router-live", id: 0, ts: Date.now(), agent: "router", inst: "", steps: [], asks: [], notes: [], done: false } as Turn] : [])].map((t, k, shown) =>
             t.user !== undefined ? (
               <div key={t.key} className="msg user">
                 <div className="bub">
@@ -747,65 +592,8 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                 </time>
               </div>
             ) : (
-              <div key={t.key} className={`msg agent ag-${t.agent} ${t.done ? "" : "running"} ${t.asks.some(askWaiting) ? "has-ask" : ""}`}>
-                <i className="ava">{AVATAR[t.agent] ?? "A"}</i>
-                <div className="col">
-                  <div className="meta">
-                    <b onClick={() => t.inst && setSel(t.inst)}>
-                      {t.inst && t.agent !== "router" && t.agent !== "watchdog" && t.agent !== "general" ? `${shortInst(t.inst)} ` : ""}
-                      {NAME[t.agent] ?? t.agent}
-                    </b>
-                    <time>{fmtTime(t.ts)}</time>
-                    {!t.done && !t.asks.length && liveTurn.get(liveKey(t)) === t.key && (t.agent !== "router" || liveOf(t)) && <span className="typing">处理中…</span>}
-                  </div>
-                  <div className="bub">
-                    {t.trigger && t.agent !== "strategy" && t.agent !== "watchdog" && <div className="trigger">{t.agent === "router" ? t.trigger : `被唤醒：${t.trigger}`}</div>}
-                    {t.steps.length > 0 && (
-                      <div className="chips">
-                        {(openTurn[t.key] || t.steps.length <= 6 ? t.steps : t.steps.slice(-5)).map((s) => (
-                          <button key={s.id} className={`chip ${s.handoff ? "handoff" : ""} ${openStep === s.id ? "on" : ""}`} onClick={() => setOpenStep(openStep === s.id ? null : s.id)}>
-                            {s.handoff ? s.label : s.label.replace(/（.*$/, "")}
-                          </button>
-                        ))}
-                        {t.steps.length > 6 && (
-                          <button className="chip more" onClick={() => setOpenTurn({ ...openTurn, [t.key]: !openTurn[t.key] })}>
-                            {openTurn[t.key] ? "收起" : `共 ${t.steps.length} 步`}
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {t.steps
-                      .filter((s) => s.id === openStep)
-                      .map((s) => (
-                        <div key={s.id} className="step-detail">
-                          <b>{s.label}</b>
-                          {s.why && <p>为什么：{s.why}</p>}
-                          {s.result && <pre>{s.result}</pre>}
-                        </div>
-                      ))}
-                    {t.notes.map((n) => (
-                      <div key={n.id} className={`note ${n.kind}`}>
-                        {n.text}
-                      </div>
-                    ))}
-                    {liveOf(t) && (
-                      <div className="body live">
-                        {liveOf(t)!.thinking && !liveOf(t)!.text && <p className="think">{liveOf(t)!.thinking}</p>}
-                        {liveOf(t)!.text && <Markdown text={liveOf(t)!.text} />}
-                        <i className="caret" />
-                      </div>
-                    )}
-                    {t.asks.map(askCard)}
-                    {(t.agent === "strategy" || t.agent === "watchdog") && t.trigger && <div className="body">{t.trigger}</div>}
-                    {t.body && (
-                      <div className="body">
-                        <Markdown text={t.body} />
-                      </div>
-                    )}
-                    {t.error && <div className="note error">出错：{t.error}<ErrorDetails workId={t.errorEvent?.work_id ?? t.errorEvent?.data?.related_work_id} error={t.errorEvent?.data?.error} message={t.error} /></div>}
-                  </div>
-                </div>
-              </div>
+              <RunCard key={t.key} t={t} live={liveOf(t)} active={!t.done && liveTurn.get(liveKey(t)) === t.key && (t.agent !== "router" || !!liveOf(t))} brief={k < shown.length - 3}
+                askWaiting={askWaiting} renderAsk={askCard} onPick={setSel} />
             ),
           )}
         </div>

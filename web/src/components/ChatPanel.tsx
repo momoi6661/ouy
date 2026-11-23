@@ -1,9 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { api, EFFORTS, KIND_LABEL, fmtPx, fmtUsd, shortInst, shotUrl, STATUS_LABEL, type ActionResult, type ChatMessage, type Effort, type PlanPreview, type AgentConfig, type AgentStatus, type UiCommand } from "../api";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { api, EFFORTS, KIND_LABEL, fmtPx, fmtUsd, shortInst, shotUrl, STATUS_LABEL, type ActionResult, type Activity, type ChatMessage, type Effort, type PlanPreview, type AgentConfig, type AgentStatus, type UiCommand } from "../api";
 import { Markdown } from "./Markdown";
 import { toast, useStored } from "./ui";
 import { Composer } from "./Composer";
 import { ErrorDetails } from "./ErrorDetails";
+import { Earlier, RunCard, liveKey, settleTurns, toTurns, useLiveText, useRecent, type Turn } from "./AgentRun";
 
 /** 图上正在展示的那份方案 */
 export interface ShownPlan {
@@ -27,6 +28,8 @@ interface Props {
   hidden?: boolean;
   /** 盯盘状态：用来知道这个币的 Worker 现在是不是正在思考 */
   agent?: AgentStatus;
+  /** 活动记录：Agent 每一轮被谁叫醒、调了哪些工具、结论是什么，直接显示在对话里 */
+  activity?: Activity[];
 }
 
 const PLAN_STATE: Record<string, string> = {
@@ -70,7 +73,7 @@ function StepChips({ steps }: { steps: { label: string; args?: Record<string, an
   );
 }
 
-export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onActed, config, onUi, onUnread, agent, hidden }: Props) {
+export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onActed, config, onUi, onUnread, agent, activity, hidden }: Props) {
   // 对话区跟着图表上的币种走；但如果是 Agent 自己把图表切到别的币，这段对话留在原地，回答不会“消失”
   const [inst, setThread] = useState(chartInst);
   const pinned = useRef(false);
@@ -99,6 +102,10 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   // 同时可以有好几句在路上：对方在忙时，新的话进待发框，或者点「立即发送」直接送进它这一轮
   const [sending, setSending] = useState(0);
   const busy = sending > 0;
+  // 这句话发出去时活动记录写到哪了：之后才开始的那几轮就是为这句话跑的
+  const lastActivity = useRef(0);
+  lastActivity.current = activity?.length ? activity[activity.length - 1].id : 0;
+  const sentAfter = useRef(0);
   const [acting, setActing] = useState<number | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -133,7 +140,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!hidden && el && followLatest.current) el.scrollTop = el.scrollHeight;
-  }, [msgs, busy, activeThread, hidden]);
+  }, [msgs, busy, activeThread, hidden, activity?.length]);
   useEffect(() => {
     const el = scroller.current;
     const body = content.current;
@@ -193,7 +200,10 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     if (content === text) setText("");
     followLatest.current = true;
     setMsgs((m) => [...m, { role: "user", text: message, to: target, images }]);
-    setSending((n) => n + 1);
+    setSending((n) => {
+      if (n === 0) sentAfter.current = lastActivity.current;
+      return n + 1;
+    });
     try {
       const r = await api.chat(message, effort, thread, inst, target, false, images);
       if (r.steered) toast("它正在思考，这句话已直接送进它当前这一轮，回答随这一轮的结论发在这里", "ok");
@@ -360,12 +370,44 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
 
   const name = shortInst(inst);
   const workerBusy = !!(agent?.instruments[inst]?.busy || agent?.instruments[inst]?.reviewing);
+
+  // Agent 的运行过程直接显示在对话里。对 Worker 的这一段：它自己被叫醒的每一轮（定时看盘、计划线到了、算法事件）按时间插在对话中间；
+  // 对 Router 的这一段：只放正在跑的（Router 自己这一轮，以及此刻正在思考的 Worker），跑完由正式的回答接上
+  const live = useLiveText();
+  const turns = useMemo(() => (activity && agent ? settleTurns(toTurns(activity), agent) : []), [activity, agent]);
+  const mine = (t: Turn) => t.user === undefined && (to === "worker" ? t.agent === "worker" && t.inst === inst : t.agent === "router" || t.agent === "worker" || t.agent === "general");
+  const latestOpen = new Map<string, string>();
+  for (const t of turns) if (t.user === undefined && !t.done) latestOpen.set(liveKey(t), t.key);
+  const isActive = (t: Turn) => !t.done && latestOpen.get(liveKey(t)) === t.key;
+  const running = turns.filter((t) => mine(t) && (isActive(t) || (busy && t.id > sentAfter.current && (to === "router" || t.byUser))));
+  const past = to === "worker" ? turns.filter((t) => mine(t) && t.done && !t.byUser && !running.includes(t)).slice(-30) : [];
+  type Item = { ts: number; m?: ChatMessage; i: number; t?: Turn };
+  const items: Item[] = [];
+  let lastTs = 0;
+  msgs.forEach((m, i) => {
+    lastTs = m.ts ?? (lastTs || Date.now());
+    items.push({ ts: lastTs, m, i });
+  });
+  for (const t of past) {
+    const at = t.endTs ?? t.ts;
+    const k = items.findIndex((x) => x.ts > at);
+    items.splice(k < 0 ? items.length : k, 0, { ts: at, t, i: -1 });
+  }
+  const recent = useRecent(items, 30);
+  const lastRun = past[past.length - 1];
+  const runCard = (t: Turn) => <RunCard key={t.key} t={t} active={isActive(t)} live={isActive(t) ? live[liveKey(t)] : undefined} brief={t !== lastRun && !isActive(t)} />;
   const samples = [`${name} 现在能做多还是做空？给我一个方案`, `帮我做多 ${name}，投 200 U`, "看一下我的持仓，要不要动", "把止损移到保本"];
 
   return (
     <div className="chat-dock" ref={root} hidden={hidden}>
       <div className="chat-thread">
         <b>{to === "router" ? "Router" : `${name} Worker`}</b>
+        {to === "worker" && workerBusy && (
+          <span className="run-state run">
+            <i className="spin" />
+            思考中
+          </span>
+        )}
         {inst !== chartInst && (
           <button className="btn xs" onClick={() => setThread(chartInst)}>
             图表现在是 {shortInst(chartInst)}，切到它的对话
@@ -416,7 +458,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
         if (el.clientHeight > 0) followLatest.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       }}>
         <div className="chat-messages" ref={content}>
-        {msgs.length === 0 && !busy && (
+        {items.length === 0 && running.length === 0 && !busy && (
           <div className="chat-empty">
             <div className="chips">
               {samples.map((s) => (
@@ -427,7 +469,8 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
             </div>
           </div>
         )}
-        {msgs.map((m, i) => (
+        <Earlier count={recent.earlier} onMore={recent.more} />
+        {recent.visible.map(({ m, i, t }) => t ? runCard(t) : m && (
           <div key={i} className={`bubble ${m.role} ${m.proactive ? "proactive" : ""}`}>
             {m.role === "ai" && (
               <div className="bubble-from">
@@ -488,7 +531,12 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
             )}
           </div>
         ))}
-        {busy && <div className="bubble ai thinking">Agent 正在看行情和账户…</div>}
+        {running.map(runCard)}
+        {busy && !running.length && (
+          <div className="bubble ai thinking">
+            <span className="run-wait"><i /><i /><i /><span>{to === "worker" ? `${name} Worker` : "Router"} 思考中</span></span>
+          </div>
+        )}
         </div>
       </div>
       <Composer
@@ -515,7 +563,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
         busyText={`${to === "worker" ? `${name} Worker` : "Router"} 正在忙`}
         onSend={(t, images) => send(t, images)}
         left={
-          <label className="muted small" title="思考强度：越高想得越细，但越慢、越费 token">
+          <label className="muted small" title="接手这件事的 Worker 的思考强度：越高想得越细，但越慢、越费 token。Router 只负责分发，固定用最低强度">
             思考强度
             <select value={effort} onChange={(e) => setEffort(e.target.value as Effort)}>
               {EFFORTS.map((e) => (

@@ -96,36 +96,7 @@ def _split_stable(items: list[Any]) -> bool:
     return changed
 
 
-MAX_BREAKPOINTS = 4  # 服务端一个请求最多认四个显式缓存断点，多了丢最前面的
-
-
-def mark_breakpoints(items: list[Any]) -> int:
-    """在开头那几条 developer 消息的末尾标显式缓存断点（prompt_cache_breakpoint），返回标了几个。
-
-    不标断点时由服务端自动决定缓存位置；读取量和写入量以服务端实际返回的用量为准。
-    标了之后「到这里为止」的整段前缀会被写进缓存，下一轮只要这一段一字不差就从这里读。
-    每一段的结尾都是一个候选位置（规则那条除外：它和后面的品种设置一起不变，断点标在设置后面就把它盖住了）；
-    超过四个时去掉最短那一段后面的断点——它前面的内容并进下一段，下一段变了才会多丢这一小段。最后一个断点永远保留。"""
-    lead = 0
-    while lead < len(items) and isinstance(items[lead], dict) and items[lead].get("role") == "developer" and isinstance(items[lead].get("content"), str):
-        lead += 1
-    picks = list(range(1, lead)) or list(range(lead))
-    while len(picks) > MAX_BREAKPOINTS:
-        picks.remove(min(picks[:-1], key=lambda i: len(items[i]["content"])))
-    for i in picks:
-        items[i] = {**items[i], "content": [{"type": "input_text", "text": items[i]["content"], "prompt_cache_breakpoint": {"mode": "explicit"}}]}
-    return len(picks)
-
-
-def drop_breakpoints(body: dict[str, Any]) -> None:
-    """把显式缓存断点去掉，退回自动缓存（上游不认这个参数时用）。"""
-    for item in body.get("input") or []:
-        content = item.get("content") if isinstance(item, dict) else None
-        if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict) and "prompt_cache_breakpoint" in content[0]:
-            item["content"] = content[0].get("text", "")
-
-
-def lead_instructions(body: dict[str, Any], breakpoints: bool = False) -> bool:
+def lead_instructions(body: dict[str, Any]) -> bool:
     """把 Responses 请求改成服务端缓存用得上的形状。返回有没有改。
 
     实测（2026-11-21，中转接口 + gpt-6.2-sol，每轮约 3.3 万输入 token 的真实复盘请求）：服务端只在三个位置命中缓存——
@@ -134,7 +105,7 @@ def lead_instructions(body: dict[str, Any], breakpoints: bool = False) -> bool:
     1. 顶层 instructions 排在用户消息后面，行情一变 7500 token 的固定规则整段不命中：挪成 input 的第一条 developer 消息。
     2. 用户消息里用 STABLE_MARK 隔开的不变资料（品种设置、只在 K 线收盘时才变的行情数据、检索到的知识库条目）各拆成一条 developer 消息，
        跟在规则后面。首请求命中从 57% 提到 73%（只拆设置和 K 线时的读数）。
-    3. breakpoints=True 时在这些 developer 消息的末尾标显式缓存断点（见 mark_breakpoints）。
+    显式缓存断点（prompt_cache_breakpoint）试过：这个模型的上游直接报「not supported on this model」，所以不标，缓存位置由服务端自动定。
     接着服务端状态续跑的请求不动。"""
     ins, items = body.get("instructions"), body.get("input")
     if not isinstance(items, list) or body.get("previous_response_id") or body.get("conversation"):
@@ -144,8 +115,6 @@ def lead_instructions(body: dict[str, Any], breakpoints: bool = False) -> bool:
         items.insert(0, {"role": "developer", "content": ins})
         body["instructions"] = LEAD_NOTE  # 留一句固定的短话：字段空着时有的中转会塞进它自己的默认提示词
         changed = True
-    if changed and breakpoints:
-        mark_breakpoints(items)
     return changed
 
 
@@ -156,34 +125,18 @@ def _http_client(settings: Settings) -> Any:
         hx = httpx
 
     class Lead(hx.AsyncHTTPTransport):  # type: ignore[name-defined,misc]
-        breakpoints = settings.ai_cache_breakpoints  # 上游明确拒绝过这个参数之后，这个进程里不再标
-
-        def _with_body(self, request: Any, body: dict[str, Any]) -> Any:
-            data = json.dumps(body, ensure_ascii=False).encode()
-            headers = [(k, v) for k, v in request.headers.raw if k.lower() != b"content-length"] + [(b"content-length", str(len(data)).encode())]
-            return hx.Request(request.method, request.url, headers=headers, content=data, extensions=request.extensions)
-
         async def handle_async_request(self, request: Any) -> Any:
-            body, marked = None, False
             if settings.ai_instructions_first and request.method == "POST" and request.url.path.endswith("/responses"):
                 try:
                     body = json.loads(request.content)
-                    changed = isinstance(body, dict) and lead_instructions(body, self.breakpoints)
+                    changed = isinstance(body, dict) and lead_instructions(body)
                 except Exception:  # noqa: BLE001 - 读不懂的请求原样发
                     changed = False
                 if changed:
-                    marked = self.breakpoints
-                    request = self._with_body(request, body)
-            response = await super().handle_async_request(request)
-            if marked and response.status_code >= 400:
-                text = (await response.aread()).decode("utf-8", "replace")
-                if "prompt_cache_breakpoint" in text:  # 这个上游不认显式断点：退回自动缓存重发一次，之后不再标
-                    await response.aclose()
-                    type(self).breakpoints = False
-                    log.warning("模型服务不接受显式缓存断点，已退回自动缓存：%s", text[:200])
-                    drop_breakpoints(body)
-                    return await super().handle_async_request(self._with_body(request, body))
-            return response
+                    data = json.dumps(body, ensure_ascii=False).encode()
+                    headers = [(k, v) for k, v in request.headers.raw if k.lower() != b"content-length"] + [(b"content-length", str(len(data)).encode())]
+                    request = hx.Request(request.method, request.url, headers=headers, content=data, extensions=request.extensions)
+            return await super().handle_async_request(request)
 
     return hx.AsyncClient(transport=Lead(proxy=settings.proxy_url or None), timeout=180)
 
@@ -1572,8 +1525,8 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
   空仓时现价上方至少一条、下方至少一条，缺了程序会退回：往上走到哪里你要做什么、往下走到哪里你要做什么，都要事先定好，不能只押一个方向。
   do=enter：到了程序按现价进场（填 side、stop_loss、take_profit、strategy）。只在「到了这里我不用再看一眼就愿意做」时用；进场前程序照样核对扣费后的盈亏比和风控，过不了会改成叫醒你。
   一条进场线成交后，其余进场线和挂着的入场单自动作废，不会两边都成交。
-  do=cancel：到了说明原计划失效，程序撤掉还没成交的入场挂单和入场策略。do=wake：到了叫醒你来看（拿不准、还要看收盘表现的位置）。
-  when=price_touch 是报价碰到；要等收盘确认用 close_above / close_below 和 bar（默认当前风格的结构周期）。
+  do=cancel：到了说明原计划失效，程序撤掉还没成交的入场挂单和入场策略。do=wake：报价一碰到就叫醒你来看（拿不准、还要看收盘表现的位置：碰到时你来了再判断收盘）。
+  when=price_touch 是报价碰到。叫醒线只有这一种，写了收盘条件也按碰到算；进场线、撤单线要等收盘确认才动手，用 close_above / close_below 和 bar（默认当前风格的结构周期）。
   上一轮的线还合适就照原样再写一遍（价位和动作不变就不会被重设）；到过一次的线在有效期内不会再触发，要再用就换一个价位。
 - 定时看盘由程序按 K 线收盘安排（空仓：超短线每 15 分钟、日内每小时、波段每 4 小时一次；有仓：每根结构周期 K 线一次），你不用也不能要求「过一会儿再看」。
   两次看盘之间只有事件会叫醒你：计划线和触发器到了、转折、连续走线、成交和持仓变化。
@@ -1666,7 +1619,10 @@ ROUTER_INSTRUCTIONS = """你是 Ouy 的 Router：常驻、唯一对用户说话�
 - 用户默认只读你的消息。收到 Worker 的结果后，直接回答原问题，保留必要的依据、价位以及下一步；不要让用户自己去翻 Worker 对话。
   留言只说已留言；方案、待确认、已提交、已成交要按工具回执区分。不要把委派当作执行结果。
   同时问了几个 Worker 时，你的收尾是把它们的结论放在一起比较、给出一个总的判断。
-- 问项目怎么用、交易术语、已有对话里足以回答的问题，直接回答，不唤醒 Worker。问当前设置或任务状态，直接读取 app_status 或 workers_board。
+- 你是分发台，要快：每句话先判断交给谁，立刻调工具交出去，不要自己先分析一遍。你自己只说三类话：打招呼和确认收到、
+  工具回执里现成的内容（设置改好了、任务交出去了、app_status / workers_board 读到的状态）、Worker 结论的收尾。
+  其余凡是要想一想、要解释、要查的（项目怎么用、交易术语、行情看法、比较、建议），一律用 ask_general 交给通用 Worker，不自己答。
+  收尾不超过三句：结论、关键价位或数字、下一步；不重新推理，不补充 Worker 没说的内容。
 - 需要新资料的普通问题（最近有什么消息、某个板块怎么回事、比较几个币）：用 ask_general 交给通用 Worker，
   它不绑定某个币，专门负责想和查（需要时会自己开子代理）。不要把这类问题转给盯盘的币种 Worker。
   币种 Worker 是用来盯盘和交易的，只有问题落到「某个币现在该怎么做 / 这笔仓怎么处理」这种具体交易上，才交给那个币的 Worker。

@@ -390,6 +390,10 @@ def _permissions_text(cfg: AgentConfig, inst_id: str | None = None) -> str:
     return "你的权限：" + "，".join(f"{name}{label[cfg.permission_for(kind, inst_id)]}" for kind, name in names.items())
 
 
+ROUTER_EFFORT = "low"  # Router 只分发任务、收尾，不做分析：固定用最低的思考强度；对话框里选的强度只交给接手的 Worker
+ROUTER_KEEP = 16  # Router 带进上下文的最近消息条数：分发用不着长对话，更早的不带（Worker 有自己的上下文和记忆）
+
+
 def _effort(level: str, key: str) -> ModelSettings:
     """Keep routing stable for a prompt family, including across approval/resume."""
     base = {"openai_prompt_cache_key": key}
@@ -982,6 +986,7 @@ class Watcher:
                 "action": action, "mode": "task" if task else "wake" if wake else "auto",
                 "status": status.get(row["status"], row["status"]), "by": p.get("by") or "Worker", "ts": row["ts"], "updated_ts": row["updated_ts"], "note": row["note"],
                 "level": level, "strategy_id": row["id"], "expires_ts": p.get("expires_ts"),
+                "cond": p.get("when") if row["kind"] == "trigger" else None, "bar": p.get("bar") or None,
                 # 记录器：Worker 小组里的节点，条件是程序记录的数据，数值可以直接改
                 "recorder": bool(p.get("recorder")), "conds": p.get("conds"),
                 "repeat": bool(p.get("repeat")), "cooldown_minutes": p.get("cooldown_minutes"), "off": bool(p.get("off")), "runs": row["state"].get("runs", 0), "last_run": row["state"].get("last_run"),
@@ -1317,7 +1322,7 @@ class Watcher:
         brief = self.skills.brief() if self.skills is not None else ""
         return f"【已装技能】只有名字和简介；手上的事用得上哪个，先用 read_skill 打开全文再照着做：\n{brief}" if brief else ""
 
-    async def _general(self, task: str, skill: dict[str, Any] | None = None) -> str:
+    async def _general(self, task: str, skill: dict[str, Any] | None = None, effort: str | None = None) -> str:
         """通用 Worker：Router 把不针对某个币的问题交给它。它自己想、自己查、需要时开子代理，结论交回给 Router。"""
         cfg = self.get_config()
         model_name = cfg.worker_model
@@ -1342,7 +1347,7 @@ class Watcher:
                 prompt += "\n" + self._skills_text()
             result = await self._run(
                 self._task_agents[key], prompt, None, REVIEW_TIMEOUT, live=LiveText(self.bus.publish, "general", ""),
-                deps=deps, usage_limits=UsageLimits(request_limit=20), model_settings=_effort(cfg.reasoning_effort, "ouy-general"),
+                deps=deps, usage_limits=UsageLimits(request_limit=20), model_settings=_effort(effort or cfg.reasoning_effort, "ouy-general"),
             )
             answer = str(result.output)
             self.general.update(busy=False, summary=answer[:400], ts=now_ms())
@@ -2528,10 +2533,10 @@ class Watcher:
 
     @staticmethod
     def _next_look(cfg: AgentConfig, inst_id: str, st: InstState, now: float) -> float:
-        """下次定时看盘的时间：对齐到下一根 K 线收盘（空仓按风格的 look_minutes，有仓按结构周期），不按秒数轮询。
-        离收盘太近（不到三分之一根）就顺延一根，免得刚看完又看。"""
+        """下次定时看盘的时间：对齐到下一根 K 线收盘，不按秒数轮询。周期用设置里选的（全局或这个 Worker 自己的）；
+        没选就按风格：空仓 look_minutes，有仓结构周期。离收盘太近（不到三分之一根）就顺延一根，免得刚看完又看。"""
         spec = STYLES[cfg.style_for(inst_id)]
-        step = (spec["bar_minutes"] if st.had_position else spec["look_minutes"]) * 60
+        step = (cfg.look_for(inst_id) or (spec["bar_minutes"] if st.had_position else spec["look_minutes"])) * 60
         due = (now // step + 1) * step + LOOK_DELAY
         return due if due - now >= max(step / 3, cfg.min_review_seconds) else due + step
 
@@ -3861,11 +3866,6 @@ class Watcher:
                 + "。仍然有效的，这一轮把这条线改成 do=enter（进场）或 do=cancel（撤单）；减仓、移止损这类用 add_trigger。已经有触发器或挂单在管的就不用重复写。"
             )
         lines.append(
-                "【这些动作还只是观察线】上一轮你在 lines（计划线） 里写了到价要做的动作，但观察线到了只会叫醒你，不会自动执行："
-                + "；".join(f"{w['price']:g}：{str(w.get('note'))[:60]}" for w in loose[:6])
-                + "。仍然有效、还没有对应触发器的，这一轮用 add_trigger 写成触发器（条件 → 操作），让程序到了直接执行；已经有触发器或挂单在管的就不用重复写。"
-            )
-        lines.append(
             "【什么时候停】你不能因为没行情、空仓、觉得今天不适合就停，也不要让 Router 代停：现在进不了就把单挂在结构位上等（plan 的 pullback / breakout），到了要进场、撤单或再判断的价位都写成计划线（lines）。"
             "只有用户 / Router 交代给你的停止条件达到了才停：净赚多少、最多亏多少、做多久由系统核对并自动停；"
             "目标里写了别的停止条件（【停止条件】那一句）而且确实达到了，用 stop_watching 停下并写明依据。"
@@ -3960,7 +3960,7 @@ class Watcher:
                 prompt = f"{brief}\n当前查看品种：{inst_id or '未指定'}\n最近只读问答：{json.dumps(context, ensure_ascii=False)}\n用户问题：{message}"
                 result = await self._run(reader, [prompt, *self._images(images)] if images else prompt, None, REVIEW_TIMEOUT,
                                          live=LiveText(self.bus.publish, "router", ""), usage_limits=UsageLimits(request_limit=1),
-                                         model_settings=_effort(effort or cfg.router_effort, "ouy-consult"))
+                                         model_settings=_effort(ROUTER_EFFORT, "ouy-consult"))
                 reply = result.output
             self._emit(cfg.env, inst_id or "", "router", "done", reply, None, data)
         except Exception:
@@ -4144,7 +4144,7 @@ class Watcher:
             rows[inst] = {
                 "状态": status,
                 "交易风格": STYLES[cfg.style_for(inst)]["label"],
-                "定时看盘": "每次都看" if cfg.wake_for(inst) == "always" else "没变化就跳过",
+                "定时看盘": ("每次都看" if cfg.wake_for(inst) == "always" else "没变化就跳过") + (f"，按 {cfg.look_for(inst)} 分钟 K 线收盘" if cfg.look_for(inst) else "，周期跟风格"),
                 "模型": cfg.model_for(inst) or "默认",
                 "模拟盘流动性": st.illiquid or None,
                 "连续失败": st.fails or None,
@@ -4213,7 +4213,7 @@ class Watcher:
         deps = Deps(
             trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, propose_only=True, control=self.control,
             dispatch=self._dispatch, board=self._board, intel=self.intel, effort=effort,
-            general=self._general, only=at or None, user_request=message if origin == "用户" else "",  # 触发器派来的不是用户本人的话：不能启停盯盘
+            general=lambda task, skill=None: self._general(task, skill, effort), only=at or None, user_request=message if origin == "用户" else "",  # 触发器派来的不是用户本人的话：不能启停盯盘
             emit=self._emitter(cfg.env, inst_id or "", "router", None), goal=self.set_goal,
             images=pics, image_names=list(images or []) if pics else [],
         )
@@ -4233,8 +4233,8 @@ class Watcher:
         try:
             result = await self._run(
                 agent, [prompt, *pics] if pics else prompt, None, REVIEW_TIMEOUT * 3, live=LiveText(self.bus.publish, "router", ""),
-                deps=deps, message_history=_trim_history(self._history(thread)), usage_limits=UsageLimits(request_limit=20),
-                model_settings=_effort(effort or cfg.router_effort, "ouy-router"),
+                deps=deps, message_history=_trim_history(self._history(thread), ROUTER_KEEP), usage_limits=UsageLimits(request_limit=20),
+                model_settings=_effort(ROUTER_EFFORT, "ouy-router"),
             )
         except BaseException as exc:
             kind, why = _fail_text(exc)
@@ -4249,7 +4249,7 @@ class Watcher:
             self.store.set(f"chat:{thread}", log[-200:])
             self.bus.publish("chat", {"thread": thread})
             raise
-        history = self._without_images(_trim_history(result.all_messages()))
+        history = self._without_images(_trim_history(result.all_messages(), ROUTER_KEEP))
         self._chat_histories[thread] = history
         self.store.set(f"chat_hist:{thread}", ModelMessagesTypeAdapter.dump_python(history, mode="json"))
         actions = [a.model_dump(mode="json") for a in deps.actions]

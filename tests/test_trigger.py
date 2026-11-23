@@ -71,7 +71,7 @@ async def test_observation_lines_are_kept_across_reviews_and_fire_once(rt, fake)
     wake_trigger = add(rt, when="price_above", level=60_300, do="wake")
     rule = next(r for r in watcher.rules("demo", BTC) if r["strategy_id"] == wake_trigger["id"])
     assert rule["type"] == "trigger" and rule["action"] == "wake"
-    with pytest.raises(Rejected, match="观察线"):
+    with pytest.raises(Rejected, match="计划线"):
         add(rt, when="price_touch", level=60_300, observation=True, do="open_market", side="long", stop_loss=59_900)
     assert not fake.positions and not fake.orders
 
@@ -319,7 +319,7 @@ async def test_trigger_can_wait_on_anything_the_program_can_see_and_on_two_thing
     extra = ("recorder", "conds", "repeat", "cooldown_minutes", "off", "runs", "last_run")
     assert {k: v for k, v in rules[f"s{late}"].items() if k not in extra} | {"ts": 0, "updated_ts": 0, "note": ""} == {
         "id": f"s{late}", "type": "trigger", "label": "触发器", "when": "这个币有了持仓（挂单成交） 且 过了 30 分钟", "do": "市价平掉这个币的仓位", "mode": "auto",
-        "status": "waiting", "by": "Worker", "ts": 0, "updated_ts": 0, "note": "", "level": None, "strategy_id": late, "expires_ts": None, "action": "close"}
+        "status": "waiting", "by": "Worker", "ts": 0, "updated_ts": 0, "note": "", "level": None, "strategy_id": late, "expires_ts": None, "action": "close", "cond": "has_position", "bar": None}
     assert rules[f"s{flat}"]["mode"] == "wake" and rules[f"s{flat}"]["status"] == "done"
 
 
@@ -583,3 +583,15 @@ async def test_user_can_draw_a_line_that_wakes_cancels_closes_or_opens(rt, fake)
         assert any(n.get("soft") and "前高" in n["text"] for n in watcher.inbox("demo", BTC))
         await tick(rt, fake, 60_300)
         assert rt.store.get_strategy(opened["id"])["status"] == "done" and fake.positions
+
+
+def test_a_wake_line_always_fires_on_touch_even_if_the_worker_asked_for_a_close():
+    """叫醒线碰到就叫是设计：Worker 写成「等 5 分钟收盘站上」也按碰到算；进场线、撤单线的收盘确认照旧。"""
+    from ouy.models import PlanLine
+
+    wake = PlanLine(price=71.54, when="close_above", bar="5m", do="wake", note="站上前高")
+    assert (wake.when, wake.bar) == ("price_touch", None)
+    cancel = PlanLine(price=71.1, when="close_below", bar="5m", do="cancel", note="跌破前低，原计划失效")
+    assert (cancel.when, cancel.bar) == ("close_below", "5m")
+    enter = PlanLine(price=71.54, when="close_above", bar="5m", do="enter", side="long", stop_loss=71.2, take_profit=72.2, note="站上前高跟多")
+    assert enter.when == "close_above"

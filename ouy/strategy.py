@@ -390,7 +390,7 @@ class StrategyEngine:
 
         if kind == "trigger":
             if p.get("observation") and (p.get("do") != "wake" or p.get("when") not in ("price_touch", "close_above", "close_below")):
-                raise Rejected("观察线支持触价或确认收盘越线时叫醒 Worker。")
+                raise Rejected("计划线的条件只能是触价或确认收盘越线。")
             need("when", "do")
             if p["do"] not in TRIGGER_DO:
                 raise Rejected(f"触发器的操作只能是 {' / '.join(TRIGGER_DO)}。")

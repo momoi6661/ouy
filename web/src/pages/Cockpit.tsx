@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { api, fmtPx, fmtTime, fmtUsd, shortInst, STATUS_LABEL, type Account, type AppState, type JournalEntry, type PendingItem, type UiCommand } from "../api";
+import { api, fmtPx, fmtTime, fmtUsd, shortInst, STATUS_LABEL, type Account, type Activity, type AppState, type JournalEntry, type PendingItem, type UiCommand } from "../api";
 import { AgentPanel } from "../components/AgentPanel";
 import { Chart, useLotEntries, type ChartLine } from "../components/Chart";
 import { Journal, levelsOf } from "../components/Journal";
 import { MarketList } from "../components/MarketList";
 import { OrderTicket } from "../components/OrderTicket";
-import { useLevelLines } from "../components/LevelLines";
+import { lineCond, lineKind, useLevelLines } from "../components/LevelLines";
 import { Positions } from "../components/Positions";
 import { AssetsPanel } from "../components/AssetsPanel";
 import { ChatPanel, type ShownPlan } from "../components/ChatPanel";
@@ -65,6 +65,7 @@ interface Props {
   ticks: Record<string, number>;
   journal: JournalEntry[];
   pending: PendingItem[];
+  activity: Activity[];
   inst: string;
   redUp: boolean;
   setInst: (inst: string) => void;
@@ -73,7 +74,7 @@ interface Props {
   loggedIn: boolean;
 }
 
-export function Cockpit({ state, account, ticks, journal, pending, inst, redUp, setInst, onToggleWatch, refresh, loggedIn }: Props) {
+export function Cockpit({ state, account, ticks, journal, pending, activity, inst, redUp, setInst, onToggleWatch, refresh, loggedIn }: Props) {
   const [bar, setBar] = useStored("ouy.bar", "15m");
   const [chartSrc, setChartSrc] = useStored<"env" | "live">("ouy.chartsrc", "env");
   const demo = state.config.env === "demo";
@@ -163,13 +164,13 @@ export function Cockpit({ state, account, ticks, journal, pending, inst, redUp, 
       for (const l of levelsOf(past)) out.push({ price: l.price, color: color[l.kind], title: l.title, dashed: true });
     }
     for (const l of st?.rules ?? []) {
-      if (l.type === "watch" && l.status === "waiting" && l.level) out.push({ price: l.level, color: "#848e9c", title: l.action === "open_market" ? "进场线" : l.action === "cancel_orders" ? "撤单线" : "叫醒线", dashed: true, group: "watch" });
+      if (l.type === "watch" && l.status === "waiting" && l.level) out.push({ price: l.level, color: "#848e9c", title: (lineKind(l.action) ?? "叫醒线") + lineCond(l.cond, l.bar), dashed: true, group: "watch" });
     }
     for (const s of st?.strategies ?? []) {
       const p = s.params;
       if (p.observation) continue;
       const level = s.kind === "trigger" && String(p.when ?? "").match(/^(price|close)/) ? p.level : p.trigger;
-      if (level) out.push({ price: level, color: "#c084fc", title: `#${s.id} 触发`, dashed: true, group: "trigger" });
+      if (level) out.push({ price: level, color: "#c084fc", title: `#${s.id} ${(s.kind === "trigger" && lineKind(p.do)) || "触发"}${s.kind === "trigger" ? lineCond(p.when, p.bar) : ""}`, dashed: true, group: "trigger" });
       if (p.price) out.push({ price: p.price, color: "#c084fc", title: `#${s.id} 挂单价`, dashed: true, group: "trigger" });
     }
     const kept = out.filter((l) => !l.group || lv.on(l.group));
@@ -290,7 +291,7 @@ export function Cockpit({ state, account, ticks, journal, pending, inst, redUp, 
             </span>
             <span>
               <i style={{ background: "#848e9c" }} />
-              Agent 盯盘价位
+              计划线
             </span>
             {shown && shown.inst_id === inst && (
               <span>
@@ -326,6 +327,7 @@ export function Cockpit({ state, account, ticks, journal, pending, inst, redUp, 
         inst={inst}
           hidden={!narrow && side !== "chat"}
         agent={state.agent}
+        activity={activity}
         defaultEffort={state.config.reasoning_effort}
         shown={shown}
         onShow={(plan) => {

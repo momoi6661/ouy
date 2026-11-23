@@ -105,6 +105,8 @@ export interface AgentConfig {
   instruments: string[];
   margin_mode: "cross" | "isolated";
   tick_seconds: number;
+  /** 定时看盘按哪个周期的 K 线收盘（分钟）；0 = 按风格自动 */
+  look_minutes: number;
   max_event_wakes: number;
   min_review_seconds: number;
   /** 记录器算多空分数用的标准 */
@@ -174,6 +176,8 @@ export const QUANT_BIASES: { id: QuantBias; label: string }[] = [
   { id: "short", label: "只盯做空" },
 ];
 export interface WorkerOverride {
+  /** 这个 Worker 定时看盘的周期（分钟）；不设跟全局走，0 = 按风格自动 */
+  look_minutes?: number | null;
   wake?: Wake | null;
   model: string;
   effort?: Effort | null;
@@ -441,6 +445,9 @@ export interface Rule {
   updated_ts: number;
   note: string;
   level: number | null;
+  /** 触发线的条件（price_touch / close_above / close_below …）和它看的 K 线周期 */
+  cond?: string | null;
+  bar?: string | null;
   strategy_id: number | null;
   expires_ts: number | null;
   ord_id?: string;
@@ -949,6 +956,7 @@ export const api = {
   enableSkill: (id: string, on: boolean) => post<SkillList>(`/api/skills/${encodeURIComponent(id)}/enable?on=${on}`),
   deleteSkill: (id: string) => request<SkillList>(`/api/skills/${encodeURIComponent(id)}`, { method: "DELETE" }),
   playbooks: () => get<Playbook[]>("/api/playbooks"),
+  builtinPlaybooks: () => get<BuiltinPlaybook[]>("/api/playbooks/builtin"),
   savePlaybook: (body: { name: string; base: Playbook["base"]; when: string; entry: string; exit: string; defaults: Record<string, number> }) =>
     request<Playbook[]>("/api/playbooks", { method: "PUT", body: JSON.stringify(body) }),
   enablePlaybook: (name: string, on: boolean) => post<Playbook[]>(`/api/playbooks/${encodeURIComponent(name)}/enable?on=${on}`),
@@ -956,6 +964,7 @@ export const api = {
   proxy: () => get<{ url: string; source: "page" | "env" }>("/api/proxy"),
   saveProxy: (url: string) => request<{ url: string; source: "page" | "env" }>("/api/proxy", { method: "PUT", body: JSON.stringify({ url }) }),
   testProxy: () => post<{ ok: boolean; message: string }>("/api/proxy/test"),
+  clearChat: (thread: string) => request(`/api/chat?thread=${thread}`, { method: "DELETE" }),
   chatLog: (thread: string) => get<{ messages: ChatMessage[] }>(`/api/chat?thread=${thread}`),
   /** 清除记录：tasks 已完成的任务；triggers 已结束的触发器；talk 对话区。inst 为空 = 所有币 */
   clearHistory: (inst: string, what: "tasks" | "triggers" | "talk") => post<{ cleared: number }>("/api/history/clear", { inst_id: inst, what }),
@@ -1012,6 +1021,15 @@ export const STATUS_LABEL: Record<string, string> = { executed: "已执行", pen
 
 /** 模型接口：地址、默认模型、密钥是否已填（密钥本身不回传，只给后四位） */
 /** 策略库里的一条策略：Agent 或你写的、可以反复用的做法 */
+/** 内置打法：知识库 strategies/ 里的一篇 */
+export interface BuiltinPlaybook {
+  id: string;
+  name: string;
+  when: string;
+  score: string;
+  losing: boolean;
+}
+
 export interface Playbook {
   name: string;
   base: "breakout" | "pullback" | "range" | "manage" | "martingale" | "grid";
@@ -1037,3 +1055,12 @@ export interface LlmInfo {
   key_hint: string;
   source: Record<"base_url" | "api_key" | "model", "page" | "env">;
 }
+
+export const LOOK_BARS: { id: number; label: string }[] = [
+  { id: 0, label: "跟风格自动" },
+  { id: 5, label: "5 分钟盘" },
+  { id: 15, label: "15 分钟盘" },
+  { id: 30, label: "30 分钟盘" },
+  { id: 60, label: "1 小时盘" },
+  { id: 240, label: "4 小时盘" },
+];

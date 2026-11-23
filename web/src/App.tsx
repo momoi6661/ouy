@@ -325,6 +325,7 @@ export default function App() {
             ticks={ticks}
             journal={journal}
             pending={pending}
+            activity={activity}
             inst={inst}
             redUp={redUp}
             setInst={setInst}

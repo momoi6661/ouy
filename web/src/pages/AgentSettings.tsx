@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ACTION_KINDS, STANCES, STYLES, type Stance, type Style, type Wake, KIND_LABEL, permissionFor, api, EFFORTS, type AgentConfig, type AppState, type Effort, type JournalEntry, type LlmInfo, type LogsInfo, type Mode, type Permission } from "../api";
+import { ACTION_KINDS, LOOK_BARS, STANCES, STYLES, type Stance, type Style, type Wake, KIND_LABEL, permissionFor, api, EFFORTS, type AgentConfig, type AppState, type Effort, type JournalEntry, type LlmInfo, type LogsInfo, type Mode, type Permission } from "../api";
 import { Journal } from "../components/Journal";
 import { SkillsPanel } from "../components/SkillsPanel";
 import { Modal, Num, toast } from "../components/ui";
@@ -432,6 +432,16 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
               <Num value={cfg.tick_seconds} onChange={(v) => patch({ tick_seconds: n(v, 3) })} min={1} max={60} step={1} suffix="秒" />
             </label>
             <label className="field">
+              <span title="每到这个周期的 K 线收盘（也就是下一根开盘）后 10 秒叫 Worker 看一次盘。跟风格自动：空仓 超短线 15 分钟 / 日内 1 小时 / 波段 4 小时，有仓 5 / 15 / 60 分钟。选了固定周期就不分空仓有仓都按它；每个 Worker 可以在 Worker 总览里单独选">定时看盘按哪个盘</span>
+              <select value={cfg.look_minutes ?? 0} onChange={(e) => patch({ look_minutes: Number(e.target.value) })}>
+                {LOOK_BARS.map((x) => (
+                  <option key={x.id} value={x.id}>
+                    {x.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
               <span title="触发线、转折、连续走线、新候选、价格波动、快判这些行情事件，每个品种每小时最多叫醒 Worker 几次；超过的先记着，并到下一次看盘。持仓变化、仓位告警、你的留言不受限制">行情事件每小时最多叫醒</span>
               <Num value={cfg.max_event_wakes} onChange={(v) => patch({ max_event_wakes: n(v, 6) })} min={1} max={60} step={1} suffix="次" />
             </label>
@@ -464,7 +474,6 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
             {(
               [
                 ["reasoning_effort", "Worker 的思考强度（复盘、下单）"],
-                ["router_effort", "Router 的思考强度（对话、分派）"],
                 ["sub_effort", "子代理的思考强度"],
               ] as const
             ).map(([field, label]) => (
@@ -481,7 +490,7 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
             ))}
           </div>
           <p className="muted small">思考强度越高判断越细，但越慢、越费 token。超短线建议 Worker 用「低」或「中」；每个币还可以在 Worker 总览里单独设。</p>
-          <p className="muted small">思考强度越高，Agent 分析越细，但每次复盘更慢、更费 token。对话框里可以单独选。</p>
+          <p className="muted small">思考强度越高，Agent 分析越细，但每次复盘更慢、更费 token。对话框里可以单独选。Router 只负责把事情分给 Worker 和收尾，固定用最低强度，不用设。</p>
           <p className="muted small">每次复盘会调用一次 模型（当前：{state.ai.model}）。间隔越短、品种越多，模型费用越高。</p>
         </div>
 

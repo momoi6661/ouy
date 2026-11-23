@@ -138,6 +138,10 @@ class Runtime:
                 st = self.watcher.states.pop(inst)
                 if st.task and not st.task.done():
                     st.task.cancel()
+            elif st := self.watcher.states[inst]:
+                # 看盘周期或风格改了：已排好的下一次定时看盘按新周期重排，不用等旧的那一次到点
+                if st.next_due_ts and (new.look_for(inst), new.style_for(inst)) != (old.look_for(inst), old.style_for(inst)):
+                    st.next_due_ts = max(self.watcher._next_look(new, inst, st, time.time()), st.retry_after_ts)
         self.bus.publish("agent", self.watcher.status())
 
     async def set_watching(self, on: bool) -> None:
@@ -769,6 +773,19 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/api/playbooks")
     async def playbooks_get(request: Request):
         return _playbooks(rt_of(request))
+
+    @app.get("/api/playbooks/builtin")
+    async def playbooks_builtin(request: Request):
+        """内置打法：knowledge/strategies 里每一篇的名字、什么时候用，加上当前环境的战绩和存盘回测里是不是扣费后亏。"""
+        from .backtest_plans import losing
+
+        rt = rt_of(request)
+        cfg = rt.config()
+        lost = losing(cfg.style)
+        return [
+            {**row, "score": rt.watcher.scores.of(cfg.env, row["name"]), "losing": any(row["name"].startswith(k.split("（")[0]) for k in lost)}
+            for row in rt.kb.catalog()
+        ]
 
     @app.put("/api/playbooks")
     async def playbooks_put(request: Request, body: PlaybookIn):

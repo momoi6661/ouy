@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, ENTRY_MODES, ENTRY_TYPE, fmtPx, fmtTime, noPlanText, shortInst, STANCES, STYLES, type Account, type AgentConfig, type AgentStatus, type Stance, type Style, type Wake, type WorkerOverride, type WorkItem } from "../api";
+import { api, ENTRY_MODES, LOOK_BARS, ENTRY_TYPE, fmtPx, fmtTime, noPlanText, shortInst, STANCES, STYLES, type Account, type AgentConfig, type AgentStatus, type Stance, type Style, type Wake, type WorkerOverride, type WorkItem } from "../api";
 import { Empty, Pnl, toast, useInterval } from "./ui";
 import { ErrorDetails } from "./ErrorDetails";
 
@@ -130,6 +130,19 @@ export function WorkersPanel({ agent, config, account, inst, onSelect, onChanged
                     <option value="">跟随全局（{config.wake === "always" ? "定时都看" : "没变化就跳过"}）</option>
                     <option value="event">没变化就跳过</option>
                     <option value="always">定时都看</option>
+                  </select>
+                  <select
+                    className="style-select"
+                    value={config.workers?.[id]?.look_minutes ?? ""}
+                    title="这个 Worker 定时看盘按哪个周期的 K 线收盘"
+                    onChange={(e) => save(id, { look_minutes: e.target.value === "" ? null : Number(e.target.value) }, "定时看盘周期已修改")}
+                  >
+                    <option value="">看盘周期跟全局（{LOOK_BARS.find((x) => x.id === (config.look_minutes ?? 0))?.label}）</option>
+                    {LOOK_BARS.map((x) => (
+                      <option key={x.id} value={x.id}>
+                        {x.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
                 <div className="wk-ctl">

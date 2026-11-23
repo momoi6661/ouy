@@ -1224,6 +1224,38 @@ async def test_router_hands_general_questions_to_the_general_worker(settings, fa
     assert all(not st.adhoc for st in rt.watcher.states.values())
 
 
+async def test_router_only_dispatches_at_the_lowest_effort_and_the_worker_gets_the_chosen_one(settings, fake):
+    """Router 是分发台：不管设置和对话框里选了什么思考强度，它自己固定用最低的，带进上下文的旧对话也只留最近一小段；
+    对话框里选的强度交给接手的通用 Worker。"""
+    from ouy.agent.watcher import ROUTER_EFFORT, ROUTER_KEEP
+
+    efforts: dict[str, list[object]] = {"router": [], "general": []}
+    carried: list[int] = []
+
+    def run(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tools = [t.name for t in info.function_tools]
+        who = "general" if "spawn_helper" in tools else "router"
+        if who == "general":
+            return ModelResponse(parts=[TextPart("查过了。")])
+        if not any(isinstance(p, ToolReturnPart) for p in messages[-1].parts):
+            carried.append(len(messages))
+            return ModelResponse(parts=[ToolCallPart("ask_general", {"task": "用户问：帮我比较一下 BTC 和 ETH"})])
+        return ModelResponse(parts=[TextPart("通用 Worker 查过了。")])
+
+    rt = make_rt(settings, fake, FunctionModel(run))
+    rt.save_config(rt.config().model_copy(update={"router_effort": "xhigh", "reasoning_effort": "medium"}))
+    run_model = rt.watcher._run
+    async def spy(agent, prompt, st, timeout, **kw):
+        efforts["router" if agent.name == "ouy-router" else "general"].append((kw.get("model_settings") or {}).get("thinking"))
+        return await run_model(agent, prompt, st, timeout, **kw)
+    rt.watcher._run = spy
+    for _ in range(8):
+        await rt.watcher.chat("帮我比较一下 BTC 和 ETH", effort="high")
+    assert set(efforts["router"]) == {ROUTER_EFFORT} and ROUTER_EFFORT == "low"
+    assert set(efforts["general"]) == {"high"}
+    assert max(carried) <= ROUTER_KEEP + 1  # 每问一次进 4 条消息：8 次是 32 条，带进去的不超过最近 16 条再加这一句
+
+
 async def test_at_mention_makes_router_forward_to_exactly_that_worker(settings, fake):
     """用户 @ 了某个币：Router 只能把话转给被 @ 的 Worker，转给别的币会被打回；没 @ 但点名了币，以点名的为准而不是正在看的品种。"""
     from ouy.agent.watcher import coins_in
@@ -1816,3 +1848,18 @@ def test_turn_is_one_algorithm_with_stages():
     assert turn_state(shift, None, {"ts": 400_000, "level": 90.0, "value": 1, "text": "上一次转折的"})["stage"] == "confirmed"  # 别的转折位的失守不算
     against = turn_state(shift, {**radar, "side": "short", "ts": 300})
     assert against["stage"] == "early" and against["side"] == "short" and "102.5" in against["text"]  # 确认之后出现反方向的苗头
+
+
+async def test_builtin_strategies_are_listed_and_a_new_look_period_reschedules_the_next_look(client):
+    """策略库面板里列出知识库的内置打法；改了定时看盘周期，已排好的下一次看盘按新周期重排。"""
+    rows = (await client.get("/api/playbooks/builtin")).json()
+    assert len(rows) >= 20 and all(r["name"] and r["when"] and r["score"] == "" and r["losing"] is False for r in rows)
+    assert any(r["name"].startswith("趋势回踩") for r in rows)
+
+    rt = client.rt
+    st = rt.watcher._state(BTC)
+    st.had_position, st.next_due_ts = False, time.time() + 4 * 3600
+    await rt.apply_config(rt.config().model_copy(update={"look_minutes": 5}))
+    assert 0 < st.next_due_ts - time.time() <= 610
+    with pytest.raises(ValueError):
+        AgentConfig(look_minutes=7)

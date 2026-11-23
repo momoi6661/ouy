@@ -147,9 +147,13 @@ class RiskLimits(BaseModel):
     emergency_exit_loss_pct: float = Field(2.5, gt=0, le=50, description="单个持仓浮亏达到权益该比例时不等 Agent，立即市价平仓")
 
 
+LookMinutes = Literal[0, 5, 15, 30, 60, 240]
+
+
 class WorkerOverride(BaseModel):
     """某个币种的 Worker 的单独设置；没填的沿用全局。"""
 
+    look_minutes: LookMinutes | None = Field(None, description="这个 Worker 定时看盘按哪个周期的 K 线收盘；留空跟全局走，0 = 按风格自动")
     wake: Wake | None = Field(None, description="定时看盘时：event 没变化就跳过 / always 每次都看；留空用全局设置")
     model: str = Field("", description="这个 Worker 用的模型；留空用全局的 Worker 模型")
     effort: Effort | None = Field(None, description="思考强度；留空用全局设置")
@@ -233,6 +237,7 @@ class AgentConfig(BaseModel):
     instruments: list[str] = Field(default_factory=lambda: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
     margin_mode: Literal["cross", "isolated"] = "cross"
     tick_seconds: int = Field(3, ge=1, le=60, description="盯盘轮询间隔（秒）；策略执行器也按这个间隔检查触发条件")
+    look_minutes: LookMinutes = Field(0, description="定时看盘按哪个周期的 K 线收盘（分钟）：0 = 按风格自动（空仓 超短线 15 / 日内 60 / 波段 240，有仓 5 / 15 / 60）；选了 5 / 15 / 30 / 60 / 240 就不分空仓有仓都按它")
     max_event_wakes: int = Field(6, ge=1, le=60, description="每个品种每小时最多被行情事件（触发线、转折、连续走线、新候选、价格波动、快判）叫醒几次；超过的先记着，并到下一次叫醒里，不丢")
     min_review_seconds: int = Field(45, ge=10, le=600, description="两次 Agent 复盘的最短间隔（秒），防止刷爆模型额度")
     setup_min_score: int = Field(3, ge=1, le=4, description="记录器算多空分数时用（四项：大方向、在关键位、收盘确认、量），保留给打分函数")
@@ -240,7 +245,7 @@ class AgentConfig(BaseModel):
     setup_near_pct: float = Field(0.15, ge=0.02, le=2, description="多空分数里「碰到关键线」这一项：K 线离关键线多近算碰到（百分比）")
     wake_move_pct: float = Field(0.6, gt=0, le=20, description="距上次复盘价格波动超过该百分比就立刻叫醒 Agent")
     reasoning_effort: Effort = Field("medium", description="Agent 盯盘复盘时的思考强度；default 表示不指定，用模型默认值")
-    router_effort: Effort = Field("medium", description="Router 回答你、分派任务时的思考强度")
+    router_effort: Effort = Field("low", description="已不用：Router 只分发任务，固定用最低思考强度（watcher.ROUTER_EFFORT）；留着是为了读得进旧设置")
     sub_effort: Effort = Field("low", description="子代理（情报 / 聪明钱 / 风险复核）干活时的思考强度")
     notes: str = Field("", max_length=2000, description="你给 Agent 的额外交代（风格、偏好、禁忌）")
     risk: RiskLimits = Field(default_factory=RiskLimits)
@@ -273,6 +278,10 @@ class AgentConfig(BaseModel):
     def trigger_effort_for(self, inst_id: str) -> str:
         """被行情事件叫醒时的思考强度：要快，默认比定时复盘低一档。"""
         return self.worker(inst_id).trigger_effort or self.trigger_effort
+
+    def look_for(self, inst_id: str) -> int:
+        own = self.worker(inst_id).look_minutes
+        return self.look_minutes if own is None else own
 
     def style_for(self, inst_id: str) -> str:
         return self.styles.get(inst_id, self.style)
@@ -493,7 +502,7 @@ class PlanLine(BaseModel):
 
     price: float = Field(gt=0)
     when: Literal["price_touch", "close_above", "close_below"] = Field(
-        "price_touch", description="怎么算到了：price_touch 报价碰到；close_above / close_below 指定周期的 K 线收盘站上 / 跌破这个价")
+        "price_touch", description="怎么算到了：price_touch 报价碰到；close_above / close_below 指定周期的 K 线收盘站上 / 跌破这个价（只有 do=enter / cancel 能用，叫醒线一律碰到就叫）")
     bar: Literal["1m", "5m", "15m", "1H"] | None = Field(None, description="收盘确认周期，省略时用当前风格的结构周期")
     do: Literal["wake", "cancel", "enter"] = Field(
         "wake",
@@ -510,6 +519,8 @@ class PlanLine(BaseModel):
 
     @model_validator(mode="after")
     def _entry_fields(self) -> "PlanLine":
+        if self.do == "wake":  # 叫醒线碰到就叫：等收盘的话价格过了线 Worker 还不知道，写了收盘条件也按碰到算
+            self.when, self.bar = "price_touch", None
         if self.do != "enter":
             return self
         if not (self.side and self.stop_loss and self.take_profit):
