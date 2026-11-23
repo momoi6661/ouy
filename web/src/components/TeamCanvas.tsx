@@ -469,7 +469,7 @@ export function TeamCanvas({ state, account, ticks, activity, sel, onSelect }: P
                 >
                   <div className="tc-h">
                     <i className="tc-light" />
-                    <b>{s.params.recorder ? "记录器" : `策略 · ${s.label}`}</b>
+                    <b>{s.params.recorder ? "触发线 · 算法读数" : `策略 · ${s.label}`}</b>
                     <span className="tc-s">
                       {s.params.recorder ? (s.params.off ? "已关" : s.status === "proposed" ? "等你同意" : s.state.runs ? `在记 · 到过 ${s.state.runs} 次` : "在记") : STRATEGY_STATE[s.status] ?? s.status}
                     </span>

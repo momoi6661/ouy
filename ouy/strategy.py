@@ -27,9 +27,9 @@ KINDS: dict[str, dict[str, str]] = {
     "martingale": {"label": "程序马丁（补仓保本）", "does": "逆向每走一段就按倍数补一层，把均价拉近现价，回到均价上方一点（保本位）整组平掉；空仓时自己开第一层，已有亏损仓位时接手解套；有层数上限和整组止损"},
     "reverse": {"label": "止损后反手", "does": "现在这笔仓被止损之后，价格继续走到触发价就自动开反方向的单；原仓位是止盈走的、或者等太久没到，就作废"},
     "grid": {"label": "网格", "does": "在区间里等距分格，跌一格买一份、涨一格卖一份"},
-    "trigger": {"label": "触发器", "does": "预先写好「条件 → 操作」，条件满足时程序直接执行这个操作，不经过模型思考"},
+    "trigger": {"label": "触发线", "does": "预先写好「条件 → 操作」，条件满足时程序直接执行这个操作，不经过模型思考"},
 }
-# 触发器的条件和操作。条件由程序每个节拍核对；操作是参数已经写死的一次工具调用，照样过权限和硬性风控
+# 触发线的条件和操作。条件由程序每个节拍核对；操作是参数已经写死的一次工具调用，照样过权限和硬性风控
 TRIGGER_WHEN = {
     "price_above": "价格 ≥ {level:g}", "price_below": "价格 ≤ {level:g}",
     "price_touch": "价格触及盯盘价位 {level:g}",
@@ -42,7 +42,7 @@ TRIGGER_WHEN = {
     "data_above": "{data} ≥ {level:g}", "data_below": "{data} ≤ {level:g}",
 }
 TRIGGER_NO_LEVEL = ("has_position", "no_position")
-# 程序持续记录的数据（每 10 秒更新，按最近一根收盘的 5 分钟 K 线算）：触发器的条件可以直接用，数值随时能改
+# 程序持续记录的数据（每 10 秒更新，按最近一根收盘的 5 分钟 K 线算）：触发线的条件可以直接用，数值随时能改
 DATA = {
     "shift_failure": "转折位状态",
     "vol_ratio": "量比", "chg_pct": "最近一根 5 分钟涨跌幅%", "score_long": "做多分数", "score_short": "做空分数",
@@ -64,13 +64,13 @@ RECORDER_MAX_CONDS = 4
 
 
 def label_of(row: dict[str, Any]) -> str:
-    return "记录器" if row["kind"] == "trigger" and row["params"].get("recorder") else KINDS[row["kind"]]["label"]
+    return KINDS[row["kind"]]["label"]  # 按算法读数的（以前叫记录器，params.recorder）也是触发线
 
 
 def recorder_params(conds: list[dict[str, Any]]) -> dict[str, Any]:
-    """记录器的条件：一项或几项程序记录的数据，全部满足才算到了。"""
+    """按算法读数的触发线的条件：一项或几项程序一直在算的读数，全部满足才算到了。"""
     if not 1 <= len(conds) <= RECORDER_MAX_CONDS:
-        raise Rejected(f"记录器要看 1~{RECORDER_MAX_CONDS} 项数据。")
+        raise Rejected(f"按算法读数的触发线要看 1~{RECORDER_MAX_CONDS} 项读数。")
     conds = [{"data": str(c["data"]), "op": "below" if c["op"] == "below" else "above", "level": float(c["level"])} for c in conds]
     return {"conds": conds, "when": f"data_{conds[0]['op']}", "data": conds[0]["data"], "level": conds[0]["level"], "recorder": True, "repeat": True}
 MANUAL_EXIT = ("{ids} 是用户手动开的仓：什么时候止盈、减仓、平仓由用户定，程序不替他自动了结。"
@@ -119,9 +119,9 @@ def describe_action(side: str, p: dict[str, Any]) -> str:
 
 
 def trigger_conds(p: dict[str, Any]) -> list[tuple[str, float, str]]:
-    """触发器的条件：一个，或者两个同时满足。"""
+    """触发线的条件：一个，或者两个同时满足。"""
     # 第三项：按 K 线收盘判断的是周期；按程序记录的数据判断的是看哪项数据
-    if p.get("conds"):  # 记录器：几项数据同时满足
+    if p.get("conds"):  # 按算法读数的：几项读数同时满足
         return [(f"data_{c['op']}", c["level"], c["data"]) for c in p["conds"]]
     conds = [(p["when"], p.get("level") or 0, (p.get("data") if p["when"].startswith("data") else p.get("bar")) or "")]
     if p.get("and_when"):
@@ -135,7 +135,7 @@ def describe_when(p: dict[str, Any]) -> str:
 
 
 def rule_parts(row: dict[str, Any]) -> tuple[str, str]:
-    """把一条策略拆成「等什么 → 做什么」两半，给界面的触发器清单用。"""
+    """把一条策略拆成「等什么 → 做什么」两半，给界面的触发线清单用。"""
     p, kind, text = row["params"], row["kind"], describe(row)
     if kind == "trigger":
         return describe_when(p), describe_action(row["side"], p)
@@ -202,7 +202,7 @@ class StrategyEngine:
         from .playbook import Playbooks  # 策略库在执行器上面一层；放这里导入，避免两个模块互相导入
 
         self.store, self.trader, self.emit = store, trader, emit
-        self.on_task: Callable[[str, str, int, str, str, bool], None] | None = None  # 触发器到了要做任务时，由盯盘那一层接手
+        self.on_task: Callable[[str, str, int, str, str, bool], None] | None = None  # 触发线到了要做任务时，由盯盘那一层接手
         self.metrics: dict[str, dict[str, Any]] = {}  # 每个币程序记录的最新数据：{"ts", "values": {名字: 数值}, "levels": {线名: 价位}}，由盯盘那一层不断更新
         self.playbooks = Playbooks(store)
         self.scores: Any = None  # 按打法记战绩（scoreboard.Scoreboard），由盯盘那一层接上
@@ -315,18 +315,20 @@ class StrategyEngine:
         return row
 
     def edit(self, strategy_id: int, changes: dict[str, Any], why: str = "", side: str | None = None, replace: bool = False, *, env: str | None = None, require_approval: bool = False) -> dict[str, Any]:
-        """直接改一条还没触发的触发器 / 入场策略的价位（条件价、挂单价、止损止盈、有效期），不用撤掉重写。改完重新开始等条件。"""
+        """直接改一条还没触发的触发线 / 入场策略的价位（条件价、挂单价、止损止盈、有效期），不用撤掉重写。改完重新开始等条件。"""
         row = self.store.get_strategy(strategy_id)
         if not row or (env is not None and row["env"] != env):
             raise Rejected("当前交易环境没有这条规则。")
         row = self.expire(row)
         if row["kind"] not in ("trigger", "breakout", "pullback") or row["status"] not in ("proposed", "armed"):
-            raise Rejected("只能修改还没触发的触发器或入场策略；已经触发、结束的改不了。")
+            raise Rejected("只能修改还没触发的触发线或入场策略；已经触发、结束的改不了。")
         changes = {k: v for k, v in changes.items() if v is not None}
         if row["kind"] != "trigger" and "level" in changes:
             changes["trigger"] = changes.pop("level")
         if not changes:
             raise Rejected("没有给出要改的内容。")
+        if "level" in changes and not changes.get("conds") and len(row["params"].get("conds") or []) == 1:  # 只看一项读数的：改 level 就是改那一项的数值
+            changes["conds"] = [{**row["params"]["conds"][0], "level": changes["level"]}]
         if changes.get("conds"):
             changes.update(recorder_params(changes["conds"]))
         base = {k: row["params"][k] for k in ("by", "recorder", "repeat", "expires_ts") if k in row["params"]} if replace else row["params"]  # replace：条件和操作整套换掉
@@ -393,10 +395,10 @@ class StrategyEngine:
                 raise Rejected("计划线的条件只能是触价或确认收盘越线。")
             need("when", "do")
             if p["do"] not in TRIGGER_DO:
-                raise Rejected(f"触发器的操作只能是 {' / '.join(TRIGGER_DO)}。")
+                raise Rejected(f"触发线的操作只能是 {' / '.join(TRIGGER_DO)}。")
             for when, level, bar in trigger_conds(p):
                 if when not in TRIGGER_WHEN:
-                    raise Rejected(f"触发器的条件只能是 {' / '.join(TRIGGER_WHEN)}。")
+                    raise Rejected(f"触发线的条件只能是 {' / '.join(TRIGGER_WHEN)}。")
                 if when.startswith("data"):
                     if bar not in DATA and not bar.startswith("dist:"):
                         raise Rejected(f"按程序记录的数据判断要指定 data：{' / '.join(DATA)}，或 dist:线名（现价高出这条线百分之几）。")
@@ -408,7 +410,7 @@ class StrategyEngine:
             if p["do"].startswith("open"):
                 need(*(() if p.get("stop_line") else ("stop_loss",)), *(("price",) if p["do"] == "open_limit" and not p.get("price_line") else ()))
                 if side not in ("long", "short"):
-                    raise Rejected("开仓的触发器要指定方向 long 或 short。")
+                    raise Rejected("开仓的触发线要指定方向 long 或 short。")
                 ref = p.get("price") if p["do"] == "open_limit" else p.get("level") if p["when"].startswith(("price", "close")) else None
                 if ref and p.get("stop_loss") and not p.get("stop_line") and not p.get("price_line") and (side == "long") != (p["stop_loss"] < ref):
                     raise Rejected("止损放错边了：做多的止损要低于入场价，做空的要高于入场价。")
@@ -419,7 +421,7 @@ class StrategyEngine:
             if any(w == "every_minutes" for w, _, _ in trigger_conds(p)) and p["do"] not in TRIGGER_TALK:
                 raise Rejected("「每隔多久」会反复执行，只能用来叫醒 Worker 或派任务，不能用来反复下单。")
             elif p["do"] == "set_stops" and not (p.get("stop_loss") or p.get("take_profit")):
-                raise Rejected("移止盈止损的触发器要给新的 stop_loss 或 take_profit。")
+                raise Rejected("移止盈止损的触发线要给新的 stop_loss 或 take_profit。")
         elif kind in ("breakout", "pullback"):
             need("trigger", "stop_loss")
             if side not in ("long", "short"):
@@ -481,7 +483,7 @@ class StrategyEngine:
         return m["levels"].get(name) if m and now_ms() - m["ts"] <= DATA_STALE_MS else None
 
     def wants_data(self, env: str, inst_id: str) -> bool:
-        """这个币上有没有在等的触发器要用程序记录的数据或者线。"""
+        """这个币上有没有在等的触发线要用程序记录的数据或者线。"""
         keys = ("price_line", "stop_line", "tp_line")
         return any(r["kind"] == "trigger" and r["status"] in ("proposed", "armed") and (any(w.startswith("data") for w, _, _ in trigger_conds(r["params"])) or any(r["params"].get(k) for k in keys))
                    for r in self.store.strategies(env, inst_id))
@@ -493,7 +495,7 @@ class StrategyEngine:
     def snapshot(self, inst_id: str, env: str) -> str:
         m = self.fresh_metrics(env, inst_id)
         if not m:
-            return "没有当前环境的有效记录器采样，不能据此判断走势。"
+            return "没有当前环境的有效算法读数采样，不能据此判断走势。"
         why = "分数的依据：" + "；".join(f"{k}：{v}" for k, v in m["why"].items()) + "。" if m.get("why") else ""
         reads = [f"{DATA[k]} {v:g}" for k in m["values"] if k in DATA and (v := self.data(inst_id, k)) is not None]
         return f"采样于 {time.strftime('%H:%M:%S', time.localtime(m['ts'] / 1000))}；程序记录的数据：" + "，".join(reads) + "。" + why + "现在的线：" + "，".join(f"{k} {v:g}" for k, v in m["levels"].items()) + "。"
@@ -685,7 +687,7 @@ class StrategyEngine:
         return None
 
     async def _cond(self, cfg: AgentConfig, account: AccountState, row: dict[str, Any], state: dict[str, Any], px: float, when: str, level: float, bar: str, key: str) -> bool | None:
-        """触发器的一个条件现在满不满足。全部由程序用手上的数据算，不问模型。"""
+        """触发线的一个条件现在满不满足。全部由程序用手上的数据算，不问模型。"""
         inst, pos = row["inst_id"], account.position(row["inst_id"])
         if when in ("price_above", "price_below"):
             return px >= level if when == "price_above" else px <= level
@@ -731,7 +733,7 @@ class StrategyEngine:
         return pos.upl >= level if when == "profit_above" else pos.upl <= -level
 
     async def _trigger(self, cfg: AgentConfig, account: AccountState, row: dict[str, Any], state: dict[str, Any], px: float) -> tuple[str, str]:
-        """触发器：条件先不满足、后满足时，直接执行预先写死的那个操作。只执行一次，执行不成也不重试，结果回报给 Worker。"""
+        """触发线：条件先不满足、后满足时，直接执行预先写死的那个操作。只执行一次，执行不成也不重试，结果回报给 Worker。"""
         p, inst = row["params"], row["inst_id"]
         if p.get("expires_ts") and now_ms() > p["expires_ts"]:
             return "expired", "到时间条件还没满足，作废"
@@ -797,7 +799,7 @@ class StrategyEngine:
             state["ready"], state["cool_until"] = False, now_ms() + cool
             self.emit(cfg.env, inst, "strategy", "action", f"{cond} 已满足，但没执行成：{exc}", None, {"strategy_id": row["id"], "notify_worker": True})
             return "armed", f"这次没执行成：{exc}"
-        reason = f"触发器 #{row['id']}：{cond}（现价 {px:g}）"
+        reason = f"触发线 #{row['id']}：{cond}（现价 {px:g}）"
         if p["do"].startswith("open"):
             action = TradeAction(
                 kind="open", inst_id=inst, side=row["side"], order_type="limit" if p["do"] == "open_limit" else "market",
@@ -810,7 +812,7 @@ class StrategyEngine:
         if cfg.permission_for(action.kind, inst) == "off":
             return "cancelled", f"{cond} 已满足，但你把这类操作关掉了，没有执行"
         try:
-            result = await self._order(cfg, row, action, "触发器执行")
+            result = await self._order(cfg, row, action, "触发线执行")
             state["last_result"] = result.model_dump(mode="json")
             verb = "订单已提交，成交以交易所为准" if action.kind in ("open", "add") else "已执行"
             ok, text = True, f"{cond} 已满足，{verb}：{result.message}"

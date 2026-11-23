@@ -76,7 +76,7 @@ async def test_an_unauthorized_signal_wakes_the_worker_with_the_numbers_already_
     events = [event for event in rt.store.algo_events("demo", BTC) if event["algo"] == "fast"]
     assert len(events) == 1 and "你没有授权这个方向" in events[0]["effect"]
     values = w.strategies.metrics[BTC]["values"]
-    assert values["sig_long"] == 3 and values["sig_short"] == 0 and values["vol_1m"] == 4.0  # 快判的分数也记进数据，记录器 / 触发器的条件能用
+    assert values["sig_long"] == 3 and values["sig_short"] == 0 and values["vol_1m"] == 4.0  # 快判的分数也记进数据，触发线的条件能用
     assert await w._fast(rt.config(), BTC, st, time.time() + 10) is None  # 同一根 K 线只处理一次
     assert w.status()["instruments"][BTC]["fast"]["last"]["kind"] == "breakout"
 

@@ -9,7 +9,7 @@ import { ErrorDetails } from "../components/ErrorDetails";
 import { Positions } from "../components/Positions";
 import { AlgoPanel } from "../components/AlgoPanel";
 import { LineForm } from "../components/LineForm";
-import { Recorders } from "../components/Recorders";
+import { AlgoReadings, ReadingConds } from "../components/Recorders";
 import { AssetsPanel } from "../components/AssetsPanel";
 import { lineCond, lineKind, useLevelLines } from "../components/LevelLines";
 import { OrderTicket, PositionCard } from "../components/OrderTicket";
@@ -227,7 +227,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
   const [goalText, setGoalText] = useState("");
   const [goalLoss, setGoalLoss] = useState<number | "">("");
   const [goalHours, setGoalHours] = useState<number | "">("");
-  // 右边按标签页分：总览 / 任务 / 触发器 / 持仓 / K 线
+  // 右边按标签页分：总览 / 任务 / 触发线 / 持仓 / K 线
   const [sideRaw, setSideTab] = useStored("ouy.ws.sidetab", "overview");
   const sideTab = SIDE_TABS.some(([id]) => id === sideRaw) ? sideRaw : "overview"; // 存下来的值不认识就打开总览
   const [trgFilter, setTrgFilter] = useStored("ouy.ws.trg", "live");
@@ -243,7 +243,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     window.addEventListener("ouy:work", load);
     return () => window.removeEventListener("ouy:work", load);
   }, [coin]);
-  // 触发器清单：已经不在的挂单，它的撤单条件不再列出
+  // 触发线清单：已经不在的挂单，它的撤单条件不再列出
   const allRules = (st?.rules ?? []).filter((r) => !r.ord_id || account?.orders.some((o) => o.ord_id === r.ord_id));
   const stForNode = (node: string) => {
     const [instrument, suffix] = node.split(":");
@@ -251,11 +251,11 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     return agent.instruments[instrument]?.rules?.find((r) => r.strategy_id === Number(suffix.slice(1)));
   };
   // 触发线：只叫醒 Worker 的线和到了直接下单、撤单的线放在同一页，用「到了做什么」筛
-  const rules = allRules.filter((r) => !r.recorder);
+  const rules = allRules; // 条件是算法读数的（以前的记录器）也是触发线，列在同一页
   const actions = [...new Set(rules.flatMap((r) => r.action ? [r.action] : []))];
   const actionFilter = actions.includes(trgAction) ? trgAction : "";
   const shownRules = rules.filter((r) => trgShown(r, trgFilter) && (!actionFilter || r.action === actionFilter));
-  const liveTriggers = allRules.filter((r) => !r.recorder && RULE_LIVE.includes(r.status)).length;
+  const liveTriggers = allRules.filter((r) => RULE_LIVE.includes(r.status)).length;
   const openWork = work.filter((w) => w.status === "running" || w.status === "queued" || w.status === "waiting");
   const pastWork = work.filter((w) => w.status === "done" || w.status === "failed").slice(0, 4);
 
@@ -476,7 +476,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             setTab("chat");
           } else {
             const rule = stForNode(v);
-            setSideTab(v.endsWith(":pos") ? "positions" : rule ? (rule.recorder ? "overview" : "triggers") : v.includes(":") && !v.endsWith(":quant") ? "tasks" : "overview");
+            setSideTab(v.endsWith(":pos") ? "positions" : rule ? "triggers" : v.includes(":") && !v.endsWith(":quant") ? "tasks" : "overview");
             if (rule) {
               setTrgFilter("all");
               setTrgAction("");
@@ -825,7 +825,6 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             <Chart instId={coin} bar={bar} lines={lines} tick={ticks[coin]} redUp={redUp} entries={held.entries} position={held.position} shiftMark={lv.shiftMark} algoMarks={lv.algoMarks} mark={algoMark} />
           </div>
         )}
-        {sideTab === "overview" && <Recorders coin={coin} st={st} rules={allRules} last={last} busy={!!acting} run={(fn, ok) => act("recorder", fn, ok)} own={own} onSaveWorker={saveWorker} />}
         <div className="ws-card" hidden={sideTab !== "overview"}>
           <h5>
             {shortInst(coin)} Worker 的结论
@@ -937,6 +936,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             </div>
           )}
         </div>
+        {sideTab === "algo" && <AlgoReadings coin={coin} st={st} last={last} busy={!!acting} own={own} onSaveWorker={saveWorker} />}
         {sideTab === "algo" && (
           <AlgoPanel
             coin={coin}
@@ -983,7 +983,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             <div>
               <b>触发线</b>
               <span className="muted small">
-                一行一条：到了什么条件 → 做什么。「提醒 Worker」的只叫它来看；其余的由程序直接下单、撤单或平仓（照样过风控），做完再告诉 Worker
+                一行一条：到了什么条件 → 做什么。条件可以是价位，也可以是一项算法读数（读数在「算法」页）。「提醒 Worker」的只叫它来看；其余的由程序直接下单、撤单或平仓（照样过风控），做完再告诉 Worker
               </span>
             </div>
             <button
@@ -1004,7 +1004,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               ))}
             </div>
           </div>
-          <LineForm coin={coin} last={last} busy={!!acting} run={(fn, ok) => act("line", fn, ok)} />
+          <LineForm coin={coin} last={last} lines={Object.keys(st?.data?.levels ?? {})} busy={!!acting} run={(fn, ok) => act("line", fn, ok)} />
           {actions.length > 1 && (
             <select aria-label="按到了做什么筛选" value={actionFilter} onChange={(e) => setTrgAction(e.target.value)}>
               <option value="">到了做什么：全部</option>
@@ -1017,13 +1017,13 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             </p>
           )}
           {shownRules.map((r) => (
-            <div key={r.id} className={`trg-row ${RULE_LIVE.includes(r.status) ? "" : "ended"}`}>
-              <em className={`trg-state s-${r.status}`}>{RULE_STATE[r.status] ?? r.status}</em>
+            <div key={r.id} className={`trg-row ${RULE_LIVE.includes(r.status) && !r.off ? "" : "ended"}`}>
+              <em className={`trg-state s-${r.status}`}>{r.off && RULE_LIVE.includes(r.status) ? "已关掉" : RULE_STATE[r.status] ?? r.status}</em>
               <div className="trg-main">
                 <div className="trg-flow">
                   <span className="trg-when">
                     <i>当</i>
-                    {r.when}
+                    {r.recorder && r.conds?.length ? <ReadingConds rule={r} st={st} last={last} busy={!!acting} run={(fn, ok) => act(`e${r.id}`, fn, ok)} /> : r.when}
                   </span>
                   <span className="trg-arrow">→</span>
                   <span className="trg-do">{r.do}</span>
@@ -1033,6 +1033,7 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                   <span>{r.by}写的{r.ts ? ` · ${fmtTime(r.ts)}` : ""}</span>
                   {r.level && last && RULE_LIVE.includes(r.status) ? <span>距现价 {(((r.level - last) / last) * 100).toFixed(2)}%</span> : null}
                   {r.expires_ts && RULE_LIVE.includes(r.status) ? <span>{r.type === "order" || r.type === "stop" ? "时间" : "有效到"} {fmtTime(r.expires_ts)}</span> : null}
+                  {r.repeat ? <span>反复生效，间隔 {r.cooldown_minutes ?? 15} 分钟{r.runs ? ` · 已触发 ${r.runs} 次${r.last_run ? `（上次 ${fmtTime(r.last_run)}）` : ""}` : ""}</span> : null}
                   {r.note ? <span className="trg-note" title={r.note}>{r.note}</span> : null}
                 </div>
               </div>
@@ -1043,6 +1044,11 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
                 {r.strategy_id && r.status === "proposed" && (
                   <button className="btn xs primary" disabled={!!acting} onClick={() => act(`a${r.id}`, () => api.strategyAct(r.strategy_id!, "approve"), "已启用")}>
                     同意
+                  </button>
+                )}
+                {r.strategy_id && r.repeat && r.status === "waiting" && (
+                  <button className="btn xs" disabled={!!acting} title="先关掉不删，之后可以再打开" onClick={() => act(`o${r.id}`, () => api.editStrategy(r.strategy_id!, { off: !r.off }), r.off ? "已打开" : "已关掉")}>
+                    {r.off ? "打开" : "关掉"}
                   </button>
                 )}
                 {r.strategy_id && RULE_LIVE.includes(r.status) && (

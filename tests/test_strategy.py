@@ -302,7 +302,7 @@ async def test_thesis_review_uses_only_the_lot_timeframe_and_notifies_once(rt, f
 
 
 async def test_rule_bound_to_a_closed_lot_retires_quietly_and_algo_events_are_checked(rt, fake):
-    """绑在某一笔仓上的触发器：那笔仓平掉以后跟着作废，不当成出错报警。算法事件带方向的，15 分钟后核对对错。"""
+    """绑在某一笔仓上的触发线：那笔仓平掉以后跟着作废，不当成出错报警。算法事件带方向的，15 分钟后核对对错。"""
     engine = rt.watcher.strategies
     opened = await rt.trader.execute(TradeAction(kind="open", inst_id=BTC, side="long", stop_loss=59_700, leverage=5), "demo", source="agent")
     lot = opened.detail["lot_id"]

@@ -488,20 +488,23 @@ async def cancel_pending_orders(ctx: RunContext[Deps], inst_id: str, reason: str
     return await _act(ctx, TradeAction(kind="cancel_orders", inst_id=inst_id, reason=f"{reason}（新情况：{changed.strip()}）" if changed.strip() else reason))
 
 
+TriggerWhen = Literal["price_above", "price_below", "close_above", "close_below", "data_above", "data_below", "has_position", "no_position", "after_minutes"]
+
+
 @toolset.tool
 async def add_trigger(
     ctx: RunContext[Deps],
     inst_id: str,
-    when: Literal["price_above", "price_below", "close_above", "close_below", "rise_pct", "fall_pct", "after_minutes", "at_time", "every_minutes", "profit_above", "loss_above", "giveback_pct", "has_position", "no_position", "data_above", "data_below"],
-    do: Literal["open_limit", "open_market", "cancel_orders", "close", "reduce", "set_stops", "wake", "task", "router_task"],
+    when: TriggerWhen,
+    do: Literal["open_limit", "open_market", "cancel_orders", "close", "reduce", "set_stops", "wake"],
     reason: str,
     level: float | None = None,
-    at_time: str | None = None,
-    task: str | None = None,
     bar: Literal["1m", "5m", "15m", "1H"] | None = None,
-    and_when: Literal["price_above", "price_below", "close_above", "close_below", "rise_pct", "fall_pct", "after_minutes", "at_time", "every_minutes", "profit_above", "loss_above", "giveback_pct", "has_position", "no_position", "data_above", "data_below"] | None = None,
+    data: str | None = None,
+    and_when: TriggerWhen | None = None,
     and_level: float | None = None,
     and_bar: Literal["1m", "5m", "15m", "1H"] | None = None,
+    and_data: str | None = None,
     side: Literal["long", "short"] | None = None,
     price: float | None = None,
     stop_loss: float | None = None,
@@ -515,85 +518,63 @@ async def add_trigger(
     lot_id: int | None = None,
     wake_note: str | None = None,
     expires_minutes: int | None = None,
-    data: str | None = None,
-    and_data: str | None = None,
-    repeat: bool = False,
+    repeat: bool | None = None,
     cooldown_minutes: int | None = None,
     max_runs: int | None = None,
-    price_line: str | None = None,
-    price_offset_pct: float | None = None,
-    stop_line: str | None = None,
-    stop_offset_pct: float | None = None,
-    tp_line: str | None = None,
-    tp_offset_pct: float | None = None,
 ) -> str:
-    """写一条触发器：「条件 → 确定动作」。条件满足时程序直接执行这个动作（挂单、开仓、平仓、减仓、移止损、撤单），不再叫醒你思考。
-    注意：常规单笔开仓计划直接填在结论的 plan 里即可（程序会自动在欧易挂真实限价单并布置 1R 保本与分批止盈），不需要再重复写触发器！
-    触发器专门用于 plan 表达不了的条件动作（例如「15m 收盘站上某价才挂单」「持仓浮盈回吐 40% 平仓」「数据指标达标开仓」）。
-    到价或收盘越线之后进场、撤单、叫醒你，直接写进结论的 lines（计划线），不用在这里写。
-    条件 when（+ level）：
-    - price_above / price_below：价格 ≥ / ≤ level。
-    - close_above / close_below：bar 周期的 K 线收盘在 level 上方 / 下方（要填 bar；只认写下之后才收盘的 K 线）。
-    - rise_pct / fall_pct：价格比写下这条时上涨 / 下跌 ≥ level %。
-    - after_minutes：过了 level 分钟。at_time：到某个钟点（at_time 填 "HH:MM"，本地时间；已经过了就是明天这个点，不用填 level）。
-    - every_minutes：每隔 level 分钟反复执行一次，直到撤销或 expires_minutes 到期；只能配 wake / task / router_task。
-    - profit_above / loss_above：这个币的仓位浮盈 / 浮亏 ≥ level U。
-    - giveback_pct：这个币的仓位浮盈从最高点回吐 ≥ level %。
-    - has_position：这个币有了持仓（比如挂单成交了）；no_position：这个币的仓位平掉了。这两个不用填 level。
-    - data_above / data_below：程序一直在记的数据 ≥ / ≤ level（要反复盯着数据、到了就做的，用 set_recorder 写成记录器更合适）。data 填看哪一项：
-      vol_ratio 量比（最近一根收盘的 5 分钟 K 线的量 ÷ 前 20 根平均）、chg_pct 最近一根 5 分钟涨跌幅 %（跌是负数）、
-      score_long / score_short 做多 / 做空凑了几分（0~4：顺 1 小时方向、碰到关键线、收盘确认、放量）、trend 1 小时方向（上涨 1、震荡 0、下跌 -1）、
-      range_pos 现价在区间里的位置 %（0 下沿、100 上沿）、dist:线名 现价高出这条线百分之几（在线下方是负数，例如 dist:区间下沿）。level 可以是 0 或负数。
-    repeat=true：反复生效——每次条件从不满足变成满足就执行一次，两次之间至少隔 cooldown_minutes（默认 15）分钟；max_runs 最多执行几次（开仓类默认 3 次）。
-      反复生效的开仓，这个币已经有持仓或挂单时那一次自动跳过。不填 repeat 就是只执行一次。
-    价位可以跟着线走，不用写死：price_line / stop_line / tp_line 填线的名字（区间上沿、区间下沿、支撑 1、支撑 2、阻力 1、阻力 2、
-      上一个 30m 高点、上一个 30m 低点、上一个 1H 高点、上一个 1H 低点、上一个 4H 高点、上一个 4H 低点），再用 price_offset_pct / stop_offset_pct / tp_offset_pct 上下挪百分之几
-      （例如 price_line="区间下沿"、price_offset_pct=0.05、stop_line="区间下沿"、stop_offset_pct=-0.3）。执行那一刻按线的最新位置算，线移动了触发器不会过时。
-      回踩、区间这类位置会跟着行情变的入场，优先用线来写。
-    要两个条件同时满足，再填 and_when（+ and_level、and_bar），例如「有持仓 且 过了 30 分钟 → 平仓」。
+    """写一条触发线：「条件 → 确定动作」。条件满足时程序直接执行（不再问你），做完把结果告诉你。
+    到价或收盘越线后进场、撤单、叫醒，写进结论的 lines（计划线）就行；这里写 lines 表达不了的：按算法读数、按持仓或时间，以及减仓、移止损、平仓。
+    条件 when 三类：
+    - 价位：price_above / price_below 价格 ≥ / ≤ level（盘中碰到就算）；close_above / close_below 一根 K 线收在 level 上方 / 下方（bar 填周期）。
+    - 算法读数：data_above / data_below 程序一直在算的读数 ≥ / ≤ level，data 填看哪一项：
+      turn_stage 转折走到第几步（看涨为正、看跌为负：1 扫流动性 / 2 加动能背离 / 3 收盘确认）、shift_failure 转折位盘中状态（1 向上突破后失守、-1 向下突破后收回、0 没有）、
+      score_long / score_short 做多 / 做空凑了几分（0~4：顺 1 小时方向、碰到关键线、收盘确认、放量）、sig_long / sig_short 快判分数、
+      vol_ratio 5 分钟量比、chg_pct 最近一根 5 分钟涨跌幅 %（跌是负数）、vol_1m / move_1m 1 分钟的量比和涨跌幅、trend 1 小时方向（上涨 1、震荡 0、下跌 -1）、
+      range_pos 现价在区间里的位置 %（0 下沿、100 上沿）、spread_pct 点差 %、book_bias 盘口买卖偏向（-100 ~ 100）、
+      dist:线名 现价高出这条线百分之几（在线下方是负数，例如 dist:区间下沿 ≤ 0.1 就是贴近或跌破区间下沿）。level 可以是 0 或负数。读数缺失或过期时不触发。
+      线名：区间上沿、区间下沿、支撑 1、支撑 2、阻力 1、阻力 2、上一个 30m / 1H / 4H 高点 / 低点。
+    - 仓位和时间：has_position 这个币有了持仓、no_position 仓位没了、after_minutes 过了 level 分钟。
+    要两个条件同时满足，再填 and_when（+ and_level、and_bar、and_data），例如「有持仓 且 过了 30 分钟 → 平仓」。
     写的时候条件就已经满足的不会立刻执行，要等它先不满足、再次满足。
-    操作 do：
+    动作 do：
     - open_limit 挂限价单：side、price（挂单价）、stop_loss；可选 take_profit、cancel_px（撤单线）、order_expires_minutes（挂多久没成交就撤）。
     - open_market 市价开仓：side、stop_loss；可选 take_profit。
     - cancel_orders 撤掉这个币的全部挂单；close 市价平仓（可带 lot_id 只平一笔）；reduce 减仓（fraction，可带 lot_id）；
       set_stops 移止损 / 止盈（stop_loss、take_profit，可带 lot_id）。
-    - task 你自己做一项任务：task 里写清楚到时要做什么（例如「重新评估 4H 结构，决定是否把剩余仓位的止盈上移」），到了这项任务直接交给你做。
-    - router_task 交给 Router 派任务：task 里写要 Router 安排什么（例如「让通用 Worker 查一下这条消息的来源」「告诉 BTC Worker SOL 已经破位」）。
-    - wake 什么都不自动做，只叫醒你（wake_note 写到时要判断什么）：只有确实没法事先定下动作时才用。
-    仓位：margin_usdt 或 risk_pct，都不填用风控上限；leverage 不填沿用当前杠杆。expires_minutes：这条触发器多久没触发就作废。
-    每个操作执行时照样过权限和硬性风控；需要用户同意的权限下，这条触发器要用户同意后才启用。"""
+    - wake 什么都不自动做，只叫醒你：wake_note 写到时要判断什么、要做什么。
+    repeat：反复生效——条件每次从不满足变成满足就执行一次，两次之间至少隔 cooldown_minutes（默认 15）分钟，max_runs 最多几次（开仓类默认 3 次）；
+      反复生效的开仓，这个币已有持仓或挂单时那一次跳过。不填时：只看算法读数的默认反复生效，其余只执行一次。
+    仓位：margin_usdt 或 risk_pct，都不填用风控上限；leverage 不填沿用当前杠杆。expires_minutes：多久没触发就作废。
+    每个动作执行时照样过权限和硬性风控；需要用户同意的权限下，这条触发线要用户同意后才启用。改价位用 edit_trigger，不要了用 cancel_strategy。"""
+    from ..strategy import recorder_params
+
     engine = ctx.deps.strategy
     if engine is None:
-        return "[不可用] 现在不能写触发器。"
+        return "[不可用] 现在不能写触发线。"
+    reading = when.startswith("data") and (and_when is None or and_when.startswith("data"))  # 只看算法读数：程序一直盯着，默认反复生效
     close_review = do == "wake" and when in ("close_above", "close_below") and not repeat
-    if ctx.deps.plan_check is not None and not ctx.tool_call_approved and do in ("task", "wake") and not close_review:
+    if ctx.deps.plan_check is not None and not ctx.tool_call_approved and do == "wake" and not close_review and not reading:
         return (
-            "[不用写复核触发器] 盯盘复盘时不要用 add_trigger(do=task / wake) 推迟决定："
+            "[不用写复核触发线] 盯盘复盘时不要用 add_trigger(do=wake) 推迟决定："
             "等价格回踩进场直接写进本轮结论的 plan（entry_type='pullback'，程序会在欧易直接挂出真实限价单）；"
             "到条件要直接执行的动作选 open_limit / open_market / close / reduce / set_stops / cancel_orders；"
             "到价或收盘越线后要叫醒你、进场、撤单的，写进结论的 lines（计划线）。"
         )
     if ctx.tool_call_approved:  # 之前挂起等用户同意，现在同意了
         row = engine.store.get_strategy((ctx.tool_call_metadata or {}).get("strategy_id") or 0)
-        return f"[用户已同意，触发器 #{row['id']} 已启用] {engine.describe(row)}" if row else "[用户已同意] 但没找到这条触发器，请重新写。"
-    clock = None
-    if "at_time" in (when, and_when):
-        try:
-            hh, mm = (int(x) for x in (at_time or "").split(":"))
-            now = time.localtime()
-            clock = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, hh, mm, 0, 0, 0, -1)) * 1000
-            clock += 86_400_000 if clock <= time.time() * 1000 else 0
-        except ValueError:
-            return '[没写成] 条件 at_time 要在 at_time 参数里填钟点，格式 "HH:MM"。'
-    level, and_level = (clock if when == "at_time" else level), (clock if and_when == "at_time" else and_level)
+        return f"[用户已同意，触发线 #{row['id']} 已启用] {engine.describe(row)}" if row else "[用户已同意] 但没找到这条触发线，请重新写。"
     params = {
         "when": when, "level": level, "do": do, "bar": bar, "and_when": and_when, "and_level": and_level, "and_bar": and_bar, "price": price, "stop_loss": stop_loss, "take_profit": take_profit, "margin_usdt": margin_usdt,
         "risk_pct": risk_pct, "leverage": leverage, "cancel_px": cancel_px, "order_expires_minutes": order_expires_minutes, "fraction": fraction,
-        "lot_id": lot_id, "wake_note": (wake_note or "")[:200] or None, "task": (task or "").strip()[:400] or None, "expires_minutes": expires_minutes,
+        "lot_id": lot_id, "wake_note": (wake_note or (reason if reading else ""))[:200] or None, "expires_minutes": expires_minutes,
         "data": data, "and_data": and_data, "repeat": repeat or None, "cooldown_minutes": cooldown_minutes, "max_runs": max_runs,
-        "price_line": price_line, "price_offset_pct": price_offset_pct, "stop_line": stop_line, "stop_offset_pct": stop_offset_pct, "tp_line": tp_line, "tp_offset_pct": tp_offset_pct,
     }
     try:
+        if reading:  # 存成「几项读数同时满足」的写法（和以前的记录器同一种），页面上能直接改数值、开关
+            if data is None or level is None or (and_when and (and_data is None or and_level is None)):
+                return "[没写成] 按算法读数判断要填 data 和 level（第二个条件填 and_data 和 and_level）。"
+            conds = [{"data": data, "op": when[5:], "level": level}] + ([{"data": and_data, "op": and_when[5:], "level": and_level}] if and_when else [])
+            params = {**{k: v for k, v in params.items() if not k.startswith("and_")}, **recorder_params(conds), "repeat": None if repeat is False else True}
         row = engine.deploy(ctx.deps.config, _inst(inst_id), "trigger", side or "", params, note=reason[:300], require_approval=ctx.deps.propose_only)
     except Exception as exc:  # noqa: BLE001 - 参数不对就告诉模型怎么改
         return f"[没写成] {exc}"
@@ -604,93 +585,10 @@ async def add_trigger(
                 engine.store.update_strategy(row["id"], state={"ready": True})
         except Exception:  # noqa: BLE001 - 查不到现价就按第一次核对时的情况算
             pass
+    row = engine.store.get_strategy(row["id"])
     if row["status"] == "proposed":  # 要用户同意才启用：这次调用挂起
         raise ApprovalRequired(metadata={"strategy_id": row["id"]})
-    return f"[触发器 #{row['id']} 已启用，程序开始盯] {engine.describe(row)}"
-
-
-class RecorderCond(BaseModel):
-    data: str = Field(description="看哪项数据：vol_ratio / chg_pct / score_long / score_short / trend / range_pos / spread_pct / book_bias / turn_stage / shift_failure / dist:线名")
-    op: Literal["above", "below"] = Field(description="above：≥ level；below：≤ level")
-    level: float
-
-
-@toolset.tool
-async def set_recorder(
-    ctx: RunContext[Deps],
-    inst_id: str,
-    conditions: list[RecorderCond],
-    reason: str,
-    recorder_id: int | None = None,
-    cooldown_minutes: int | None = None,
-    do: Literal["wake", "open_limit", "open_market", "cancel_orders", "close", "reduce", "set_stops"] = "wake",
-    side: Literal["long", "short"] | None = None,
-    price: float | None = None,
-    price_line: str | None = None,
-    price_offset_pct: float | None = None,
-    stop_loss: float | None = None,
-    stop_line: str | None = None,
-    stop_offset_pct: float | None = None,
-    take_profit: float | None = None,
-    tp_line: str | None = None,
-    tp_offset_pct: float | None = None,
-    margin_usdt: float | None = None,
-    risk_pct: float | None = None,
-    leverage: int | None = None,
-    cancel_px: float | None = None,
-    order_expires_minutes: int | None = None,
-    fraction: float | None = None,
-    wake_note: str | None = None,
-) -> str:
-    """新建或修改你小组里的一个记录器。记录器是程序替你一直盯着的东西：程序每 10 秒记一次这个币的 K 线和盘口，
-    conditions 里的几项数据全部满足时，程序当场执行你在这里设好的操作（do），做完马上叫醒你并把结果告诉你——代码比你快，来得及。
-    do=wake（默认）就是只叫醒你；设成 open_limit / open_market 等就是「先做、再叫醒你」，你醒来接着管这笔单。
-    记录器反复生效：条件每次从不满足变成满足就执行一次，两次之间至少隔 cooldown_minutes（默认 15）分钟；开仓类的，这个币已有持仓或挂单时那一次跳过，最多执行 3 次。
-    能记的数据（conditions 里 1~4 项，全部满足才算到）：
-    - turn_stage：转折算法的苗头，看涨转折走到第几步为正（1 扫流动性 / 2 加动能背离 / 3 收盘反向越过摆动点），看跌为负。例：turn_stage ≥ 3 叫醒你复核做多回踩。
-    - shift_failure：最近 5m 结构的盘中状态；1 = 向上突破后失守，-1 = 向下突破后收回，0 = 尚未失守或已恢复。未知不触发。怀疑假突破时优先复核，不把预警当作反手依据。
-    - score_long / score_short：做多 / 做空凑了几分（0~4：顺 1 小时方向、这根 5 分钟 K 线碰到关键线、在线上收盘确认、放量）。
-    - vol_ratio：量比（最近一根收盘的 5 分钟 K 线的量 ÷ 前 20 根平均）。chg_pct：最近一根 5 分钟 K 线的涨跌幅 %（跌是负数）。
-    - trend：1 小时方向（上涨 1、震荡 0、下跌 -1）。range_pos：现价在区间里的位置 %（0 下沿、100 上沿）。
-    - spread_pct：盘口点差 %。book_bias：盘口前 20 档买卖盘谁多（-100 全是卖盘 ~ 100 全是买盘）。
-    - dist:线名：现价高出这条线百分之几（在线下方是负数），例如 dist:区间下沿 ≤ 0.1 就是「贴近或跌破区间下沿」。
-    线名：区间上沿、区间下沿、支撑 1、支撑 2、阻力 1、阻力 2、上一个 30m 高点 / 低点、上一个 1H 高点 / 低点、上一个 4H 高点 / 低点。
-    开仓的价位优先跟着线走，不要写死：price_line / stop_line / tp_line 填线名，再用 price_offset_pct / stop_offset_pct / tp_offset_pct 上下挪百分之几，
-    执行那一刻按线的最新位置算。例：做多分数 ≥ 3 且 dist:区间下沿 ≤ 0.15 → open_limit，side=long，price_line=区间下沿、price_offset_pct=0.05，
-    stop_line=区间下沿、stop_offset_pct=-0.3，tp_line=区间上沿、tp_offset_pct=-0.1。也可以用固定的 price / stop_loss / take_profit。
-    基础走势采样不用布置规则。只有需要“达到条件后提醒或执行”时才创建记录器规则；缺失或过期的读数不能触发。
-    recorder_id 填了就是修改那一个（conditions 和操作整套换成这次写的），不填是新建。仓位：margin_usdt 或 risk_pct，都不填用风控上限。"""
-    from ..strategy import TRIGGER_DO, recorder_params
-
-    engine = ctx.deps.strategy
-    if engine is None:
-        return "[不可用] 现在不能设记录器。"
-    if ctx.tool_call_approved:  # 之前挂起等用户同意，现在同意了
-        row = engine.store.get_strategy((ctx.tool_call_metadata or {}).get("strategy_id") or 0)
-        return f"[用户已同意，记录器 #{row['id']} 已启用] {engine.describe(row)}" if row else "[用户已同意] 但没找到这个记录器，请重新设。"
-    inst = _inst(inst_id)
-    plan = {"do": do, "price": price, "price_line": price_line, "price_offset_pct": price_offset_pct, "stop_loss": stop_loss, "stop_line": stop_line, "stop_offset_pct": stop_offset_pct,
-            "take_profit": take_profit, "tp_line": tp_line, "tp_offset_pct": tp_offset_pct, "margin_usdt": margin_usdt, "risk_pct": risk_pct, "leverage": leverage, "cancel_px": cancel_px,
-            "order_expires_minutes": order_expires_minutes, "fraction": fraction, "wake_note": (wake_note or reason)[:200], "cooldown_minutes": cooldown_minutes}
-    permission = "observe" if do == "wake" else ctx.deps.config.permission_for(TRIGGER_DO[do], inst)
-    try:
-        params = {**recorder_params([c.model_dump() for c in conditions]), **plan}
-        if recorder_id:
-            old = engine.store.get_strategy(recorder_id)
-            if not old or not old["params"].get("recorder") or old["inst_id"] != inst:
-                return f"[没改成] 这个币上没有记录器 #{recorder_id}。"
-            if permission == "off":
-                return "[没改成] 用户把这类操作设成了不允许 Agent 做，记录器不能设成直接执行它。"
-            row = engine.edit(recorder_id, params, reason[:300], side=side or "", replace=True, env=ctx.deps.config.env,
-                              require_approval=permission == "confirm" or (ctx.deps.propose_only and do != "wake"))
-        else:
-            row = engine.deploy(ctx.deps.config, inst, "trigger", side or "", params, note=reason[:300], require_approval=ctx.deps.propose_only)
-    except Exception as exc:  # noqa: BLE001 - 参数不对就告诉模型怎么改
-        return f"[没设成] {exc}"
-    row = engine.store.get_strategy(row["id"])
-    if row["status"] == "proposed":  # 直接执行的操作要用户同意才启用：这次调用挂起
-        raise ApprovalRequired(metadata={"strategy_id": row["id"]})
-    return f"[记录器 #{row['id']} 已{'修改' if recorder_id else '启用'}，程序在盯] {engine.describe(row)}"
+    return f"[触发线 #{row['id']} 已启用，程序开始盯] {engine.describe(row)}"
 
 
 @toolset.tool
@@ -734,13 +632,13 @@ async def edit_trigger(
     order_expires_minutes: int | None = None,
     expires_minutes: int | None = None,
 ) -> str:
-    """直接修改一条还没触发的触发器或入场策略（breakout / pullback）的价位，不用撤掉重写。只填要改的项：
-    level 条件价（入场策略的触发价）、price 限价单的挂单价、stop_loss、take_profit、cancel_px、order_expires_minutes、expires_minutes。
+    """直接修改一条还没触发的触发线或入场策略（breakout / pullback）的价位，不用撤掉重写。只填要改的项：
+    level 条件价（入场策略的触发价；只看一项算法读数的触发线是那项读数的数值）、price 限价单的挂单价、stop_loss、take_profit、cancel_px、order_expires_minutes、expires_minutes。
     行情走了、原来的价位已经够不着或被走过时就用它把价位挪到现在的结构上——这是跟着行情调整，不算反复推翻自己，不需要填 changed。
     方向和要做的操作不能改；要换方向或换操作就撤掉重写。"""
     engine = ctx.deps.strategy
     if engine is None:
-        return "[不可用] 现在不能修改触发器。"
+        return "[不可用] 现在不能修改触发线。"
     if ctx.tool_call_approved:
         row = engine.store.get_strategy(strategy_id)
         return f"[用户已同意，规则 #{strategy_id} 已更新] {engine.describe(row)}" if row else "[找不到规则]"
@@ -1443,7 +1341,7 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
 
 # 三层职责分工：算法算、记录盯、你拍板
 1. **走势与候选算法（程序自动完成）**：大方向、前高前低突破/假突破、最近一次结构转折（BOS/CHoCH）、旧线是否已甩在后方过时，以及【算法算好的结构候选位】（已按真实结构位扣除手续费与点差算出净盈亏比），全部由代码毫秒级算好喂给你。不要自己拿计算器重算净盈亏比，也禁止凭印象编造价位。
-2. **记录器与执行器（程序秒级盯盘）**：记录器持续采样量比、涨跌幅、盘口偏向、结构评分与快判信号；执行器负责把你的 plan 挂上欧易、盯撤单线/有效期/变盘自动撤单、成交后自动 1R 移保本与分批止盈。
+2. **算法读数与执行器（程序秒级盯盘）**：程序持续采样量比、涨跌幅、盘口偏向、结构评分与快判信号；执行器负责把你的 plan 挂上欧易、盯撤单线/有效期/变盘自动撤单、成交后自动 1R 移保本与分批止盈。
 3. **你的职责（交易决策）**：看大盘（BTC）共振、多周期位置真伪、盘口拥挤度，在【算法算好的结构候选位】里选定最合理的一条（或按盘口微调）输出为 `plan`，并在 `plan.strategy` 写明所选策略名。
 
 # 每一轮按这个顺序做决定
@@ -1496,7 +1394,7 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
 - 仓位被套、但结构没破、行情是震荡（不是单边）：可以改用程序马丁来解套——deploy_strategy(kind="martingale", side=持仓方向, stop_loss=整组止损)，
   之后补仓、挪保本止盈、回到保本位平仓都由程序自动做，你只要盯着整组止损所依据的结构还在不在。输入的【运行设置】写着「禁止亏损加仓」时不能用。
   单边趋势里逆着方向被套，不要用马丁，按止损认错。
-- 在 lot_verdicts 里对每一笔给结论。到了某个位置要做的事（减仓、移止损、平仓）用 add_trigger 写成触发器，程序到了直接执行。
+- 在 lot_verdicts 里对每一笔给结论。到了某个位置要做的事（减仓、移止损、平仓）用 add_trigger 写成触发线，程序到了直接执行。
 
 # 工具和信息
 - 报价 last 带 ticker_ts_ms；各周期 last_closed_price 才是最近确认收盘。复盘先给本品种各周期已收盘历史，再给最新快照；
@@ -1529,7 +1427,7 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
   when=price_touch 是报价碰到。叫醒线只有这一种，写了收盘条件也按碰到算；进场线、撤单线要等收盘确认才动手，用 close_above / close_below 和 bar（默认当前风格的结构周期）。
   上一轮的线还合适就照原样再写一遍（价位和动作不变就不会被重设）；到过一次的线在有效期内不会再触发，要再用就换一个价位。
 - 定时看盘由程序按 K 线收盘安排（空仓：超短线每 15 分钟、日内每小时、波段每 4 小时一次；有仓：每根结构周期 K 线一次），你不用也不能要求「过一会儿再看」。
-  两次看盘之间只有事件会叫醒你：计划线和触发器到了、转折、连续走线、成交和持仓变化。
+  两次看盘之间只有事件会叫醒你：计划线和触发线到了、转折、连续走线、成交和持仓变化。
 """
 
 _CHAT = """你是用户的加密货币永续合约交易助手，也是一名纪律严明的交易员。用户正在盯盘页面上直接和你说话，

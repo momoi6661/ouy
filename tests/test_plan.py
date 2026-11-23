@@ -362,7 +362,7 @@ async def test_procrastinating_tools_steer_into_real_limit_orders_and_shift_clea
     def run(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         returns = [p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)]
         if len(returns) == 0:
-            return ModelResponse(parts=[ToolCallPart("add_trigger", {"inst_id": BTC, "when": "price_below", "level": 59_800, "do": "task", "task": "到时复核", "reason": "拖延"})])
+            return ModelResponse(parts=[ToolCallPart("add_trigger", {"inst_id": BTC, "when": "price_below", "level": 59_800, "do": "wake", "wake_note": "到时复核", "reason": "拖延"})])
         if len(returns) == 1:
             replies.append(str(returns[-1].content))
             return ModelResponse(parts=[ToolCallPart("deploy_strategy", {"inst_id": BTC, "kind": "pullback", "side": "long", "trigger": 59_700, "stop_loss": 59_200, "reason": "回踩"})])
@@ -371,7 +371,7 @@ async def test_procrastinating_tools_steer_into_real_limit_orders_and_shift_clea
 
     rt = make_rt(settings, fake, FunctionModel(run))
     record = await rt.watcher.review(BTC, "定时复盘")
-    assert "[不用写复核触发器]" in replies[0] and "[请直接写进 plan 挂真实限价单]" in replies[1]
+    assert "[不用写复核触发线]" in replies[0] and "[请直接写进 plan 挂真实限价单]" in replies[1]
     assert len(fake.orders) == 1 and float(fake.orders[0]["px"]) == 59_700 and record["plan_order"]["status"] == "armed"
 
     # 走势发生向上强转折，把旧挂单 59700 远远甩在起动点后方：_shift_watch 自动撤掉欧易上的旧限价单并生成叫醒说明

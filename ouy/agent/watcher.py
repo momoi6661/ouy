@@ -357,7 +357,7 @@ _TOOL_LABEL = {
     "okx_list_tools": "查欧易功能列表", "okx_query": "查欧易数据", "open_position": "开仓", "add_to_position": "加仓",
     "reduce_position": "减仓", "close_position": "平仓", "move_stops": "改止盈止损", "set_leverage": "调杠杆", "cancel_pending_orders": "撤单",
     "write_lesson": "记经验", "judge_lesson": "验证经验", "read_skill": "翻技能", "install_skill": "装技能", "delete_skill": "删技能",
-    "ask_worker": "交给 Worker", "ask_intel": "让情报 Worker 去查", "intel_query": "查情报", "workers_board": "看 Worker 总览", "set_worker": "设置 Worker", "get_candles": "看 K 线走势", "stop_watching": "按交代的条件停下", "edit_trigger": "修改触发器", "set_recorder": "设记录器", "add_trigger": "写触发器", "write_strategy": "写策略", "delete_strategy": "删策略", "spawn_subagent": "开子代理", "close_subagent": "关掉子代理", "close_helper": "关掉子代理", "ask_general": "交给通用 Worker", "spawn_helper": "开子代理", "remember": "记入工作记忆", "ask_subagent": "派子代理", "deploy_strategy": "布置策略", "tell_worker": "对 Worker 插话", "assign_goal": "给 Worker 定目标", "cancel_strategy": "撤销策略",
+    "ask_worker": "交给 Worker", "ask_intel": "让情报 Worker 去查", "intel_query": "查情报", "workers_board": "看 Worker 总览", "set_worker": "设置 Worker", "get_candles": "看 K 线走势", "stop_watching": "按交代的条件停下", "edit_trigger": "修改触发线", "add_trigger": "写触发线", "write_strategy": "写策略", "delete_strategy": "删策略", "spawn_subagent": "开子代理", "close_subagent": "关掉子代理", "close_helper": "关掉子代理", "ask_general": "交给通用 Worker", "spawn_helper": "开子代理", "remember": "记入工作记忆", "ask_subagent": "派子代理", "deploy_strategy": "布置策略", "tell_worker": "对 Worker 插话", "assign_goal": "给 Worker 定目标", "cancel_strategy": "撤销策略",
     "app_status": "看项目设置", "show_instrument": "切换图表", "edit_watchlist": "改盯盘列表", "set_watching": "启停盯盘",
     "set_trading_style": "改交易风格", "set_preference": "记下你的偏好", "set_permission": "改权限", "update_risk": "改风控参数", "open_order_window": "打开下单窗",
     "set_quant_mode": "切换量化档位", "read_strategy": "读策略手册",
@@ -390,8 +390,7 @@ def _permissions_text(cfg: AgentConfig, inst_id: str | None = None) -> str:
     return "你的权限：" + "，".join(f"{name}{label[cfg.permission_for(kind, inst_id)]}" for kind, name in names.items())
 
 
-ROUTER_EFFORT = "low"  # Router 只分发任务、收尾，不做分析：固定用最低的思考强度；对话框里选的强度只交给接手的 Worker
-ROUTER_KEEP = 16  # Router 带进上下文的最近消息条数：分发用不着长对话，更早的不带（Worker 有自己的上下文和记忆）
+ROUTER_KEEP = 40  # Router 带进上下文的最近消息条数：对话长一点没关系，省的是思考，不是上下文
 
 
 def _effort(level: str, key: str) -> ModelSettings:
@@ -812,7 +811,7 @@ class Watcher:
             inst,
             f"用户刚在下单窗手动下了单：{message}。现在就看这笔仓位：核对止损位置合不合理（放在结构外、不会被正常波动扫掉），不合理就调整并说明原因；"
             "这是用户自己的单：进场、目标和拿多久由他定。你只做保护——没有止损先补上，浮盈后可以把止损往盈利方向收紧；"
-            "不要替他设止盈、减仓、平仓或写到价 / 超时离场的触发器。你认为该走，就写明价位和依据建议他。限价单还没成交的，判断挂单价合不合理并告诉他。"
+            "不要替他设止盈、减仓、平仓或写到价 / 超时离场的触发线。你认为该走，就写明价位和依据建议他。限价单还没成交的，判断挂单价合不合理并告诉他。"
             + ("这是用户手动开的仓：你的改动要等用户确认。" if cfg.hands_off_manual else ""),
             who="用户下单",
         )
@@ -882,9 +881,9 @@ class Watcher:
                     return
                 self._algo(env, inst_id, "rule", text, "程序已按规则处理，并通知 Worker")
                 feedback = f"策略 #{data['strategy_id']} 的执行回报（不是新的交易指令）：{text}"
-                if data.get("recorder"):  # 记录器到了：顺带告诉它现在的线和挂着的东西还合不合适
+                if data.get("recorder"):  # 按算法读数的触发线到了：顺带告诉它现在的线和挂着的东西还合不合适
                     rec = self.states.get(inst_id)
-                    feedback = f"记录器 #{data['strategy_id']} 到了（条件命中不等于成交，这不是新的交易指令）：{text}" + (self._stale_lines(self.get_config(), inst_id, rec, rec.last_px) if rec and rec.last_px else "")
+                    feedback = f"触发线 #{data['strategy_id']} 的算法读数到了（条件命中不等于成交，这不是新的交易指令）：{text}" + (self._stale_lines(self.get_config(), inst_id, rec, rec.last_px) if rec and rec.last_px else "")
                 run = self.states.get(inst_id)
                 if run and run.run is not None and self.get_config().env == env:
                     try:
@@ -944,25 +943,25 @@ class Watcher:
         ]
 
     def _trigger_task(self, env: str, inst_id: str, strategy_id: int, cond: str, task: str, router: bool) -> None:
-        """触发器的条件到了、动作是「做一项任务」：给这个币的 Worker 自己做，或者交给 Router 去派。任务是 Worker 当时写下的，不带用户的启停权限。"""
+        """触发线的条件到了、动作是「做一项任务」：给这个币的 Worker 自己做，或者交给 Router 去派。任务是 Worker 当时写下的，不带用户的启停权限。"""
         if env != self.get_config().env:
             return
         if not router:
             self.interject(
                 inst_id,
-                f"触发器 #{strategy_id} 的条件到了（{cond}）。现在做你当时写下的这项任务：{task}\n"
+                f"触发线 #{strategy_id} 的条件到了（{cond}）。现在做你当时写下的这项任务：{task}\n"
                 "（任务是你之前写给自己的备忘，不是用户的要求：里面的开仓门槛如果比现在的【出手尺度】和程序核对的净盈亏比更严，以现在的为准。"
                 "条件到了就落到一个决定上：能做就给 plan，让程序去下单。）",
-                who="触发器",
+                who="触发线",
             )
             return
         job = asyncio.get_running_loop().create_task(
-            self.chat(f"触发器 #{strategy_id} 的条件到了（{cond}）。{inst_id} 的 Worker 当时写下，到这时请你安排这项任务：{task}", inst_id=inst_id, origin=f"触发器 #{strategy_id}"))
+            self.chat(f"触发线 #{strategy_id} 的条件到了（{cond}）。{inst_id} 的 Worker 当时写下，到这时请你安排这项任务：{task}", inst_id=inst_id, origin=f"触发线 #{strategy_id}"))
         self._trigger_jobs.add(job)
         job.add_done_callback(self._trigger_jobs.discard)
 
     def rules(self, env: str, inst_id: str) -> list[dict[str, Any]]:
-        """这个币上所有「等什么 → 做什么」排成一张清单：触发器和到价策略、挂单的撤单条件、交代的停止条件、Worker 每轮划的计划线。
+        """这个币上所有「等什么 → 做什么」排成一张清单：触发线和到价策略、挂单的撤单条件、交代的停止条件、Worker 每轮划的计划线。
         mode：auto 条件到了程序直接执行；wake 只叫醒 Worker；worker 由 Worker 自己对照。"""
         st, out = self._state(inst_id), []
         status = {"proposed": "proposed", "armed": "waiting", "active": "running"}
@@ -987,7 +986,7 @@ class Watcher:
                 "status": status.get(row["status"], row["status"]), "by": p.get("by") or "Worker", "ts": row["ts"], "updated_ts": row["updated_ts"], "note": row["note"],
                 "level": level, "strategy_id": row["id"], "expires_ts": p.get("expires_ts"),
                 "cond": p.get("when") if row["kind"] == "trigger" else None, "bar": p.get("bar") or None,
-                # 记录器：Worker 小组里的节点，条件是程序记录的数据，数值可以直接改
+                # 按算法读数的触发线：条件是程序记录的数据，数值可以直接改
                 "recorder": bool(p.get("recorder")), "conds": p.get("conds"),
                 "repeat": bool(p.get("repeat")), "cooldown_minutes": p.get("cooldown_minutes"), "off": bool(p.get("off")), "runs": row["state"].get("runs", 0), "last_run": row["state"].get("last_run"),
             })
@@ -1098,7 +1097,7 @@ class Watcher:
         cfg = self.get_config()
         goal = self.goal(cfg.env, inst_id)
         if not goal or goal["status"] != "active" or not goal.get("stop_when"):
-            return "[不能停] 用户和 Router 都没有交代过停止条件。没机会就继续观望，把要等的情况写成触发器（add_trigger），到了要进场、撤单或再判断的价位都写成计划线（lines）。"
+            return "[不能停] 用户和 Router 都没有交代过停止条件。没机会就继续观望，把要等的情况写成触发线（add_trigger），到了要进场、撤单或再判断的价位都写成计划线（lines）。"
         if (await self.trader.account(cfg.env)).position(inst_id):
             return "[不能停] 这个币还有持仓，先管好仓位。"
         self._park(cfg, inst_id, f"交代的停止条件「{goal['stop_when']}」已达到：{evidence}")
@@ -1533,7 +1532,7 @@ class Watcher:
                 else:
                     await self._tick(cfg)
                     if auth_failures:
-                        self._note("system", "欧易账户读取已恢复，已继续检查订单、持仓和触发器")
+                        self._note("system", "欧易账户读取已恢复，已继续检查订单、持仓和触发线")
                     failures = auth_failures = 0
                     self._auth_retry_at = 0.0
                     self.last_error = ""
@@ -1760,7 +1759,7 @@ class Watcher:
         self._note("system", alert + "，正在检查所有持仓", {"move_pct": round(move, 3)})
         return alert
 
-    ALGOS = {"regime": "行情判断", "run": "连续走线", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发线 / 记录器"}
+    ALGOS = {"regime": "行情判断", "run": "连续走线", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发线"}
 
     def _algo(self, env: str, inst: str, algo: str, text: str, effect: str, side: str = "", px: float = 0.0, atr: float | None = None) -> None:
         """记一条算法事件：哪个算法在什么价位算出了什么、触发了什么。带方向的会在 15 分钟和 1 小时后核对价格有没有照它说的走。"""
@@ -1775,7 +1774,7 @@ class Watcher:
     ALGO_LAYERS = {
         "read": "看行情 · 不下单；连续走线会叫醒 Worker 核对计划，其余只记录",
         "turn": "找转折 · 一个算法分三个阶段（苗头 → 确认 → 盘中失守 / 收回），不下单",
-        "entry": "给入场位 · 候选只是参考；快判和触发器按你的设置才会下单",
+        "entry": "给入场位 · 候选只是参考；快判和触发线按你的设置才会下单",
         "hold": "管持仓 · 只移止损和叫醒 Worker，不开仓",
     }
     # 以前分开记的「结构转折」「盘中转折位」现在都算「转折」这一个算法的不同阶段；库里的旧记录读出来时归过去
@@ -1856,7 +1855,7 @@ class Watcher:
             row("fast", "快判", watching and fast_on, (st.fast_last or {}).get("ts"),
                 f"{st.fast_last['text']} → {st.fast_last.get('result') or st.fast_last['status']}" if st.fast_last else "还没有信号",
                 fast_does if fast_on else "已关闭，或这个风格不看 1 分钟"),
-            row("rule", "触发线 / 记录器", watching and bool(rules), max((r["ts"] for r in rules), default=0),
+            row("rule", "触发线", watching and bool(rules), max((r["ts"] for r in rules), default=0),
                 f"{len(rules)} 条在等条件" if rules else "没有在等的规则", "条件满足时程序直接执行预设操作"),
             row("lock", "持仓轨迹 / 保盈线", watching and bool(tracks), max((t.get("peak_ts", 0) for t in tracks.values()), default=0),
                 "；".join(f"#{k} " + self.track_text(v) for k, v in tracks.items()) or "没有持仓",
@@ -2032,7 +2031,7 @@ class Watcher:
         return f"挂单已经 {int(max(ages))} 分钟没成交（上限 {limit} 分钟）：改用市价进场或撤单，不要原价重挂"
 
     def _stale_lines(self, cfg: AgentConfig, inst_id: str, st: InstState, px: float) -> str:
-        """Worker 现在的限价挂单、触发器、计划入场位、计划线离现价多远；结合结构转折（shift）和波动率可达性标出过时的线。"""
+        """Worker 现在的限价挂单、触发线、计划入场位、计划线离现价多远；结合结构转折（shift）和波动率可达性标出过时的线。"""
         if not px or px <= 0:
             return ""
 
@@ -2072,8 +2071,8 @@ class Watcher:
             if w.get("price"):
                 rows.append(f"计划线 {far(w['price'])}" + ("【过时：离现价太远】" if abs(w["price"] / px - 1) * 100 >= max(spec["limit_dist_pct"] * 2, 1.5) else ""))
         if not rows:
-            return "你现在没有等着的入场触发器、计划和计划线：空仓时直接给出 plan（程序会在欧易挂真实限价单），并把现价上下的计划线（lines）划出来。"
-        tail = "标了【过时】的不要再沿用：本轮直接按最新结构给出新的 plan（程序会自动撤旧挂新），触发器用 edit_trigger / cancel_strategy 清理。" if any("过时" in r for r in rows) else ""
+            return "你现在没有等着的入场触发线、计划和计划线：空仓时直接给出 plan（程序会在欧易挂真实限价单），并把现价上下的计划线（lines）划出来。"
+        tail = "标了【过时】的不要再沿用：本轮直接按最新结构给出新的 plan（程序会自动撤旧挂新），触发线用 edit_trigger / cancel_strategy 清理。" if any("过时" in r for r in rows) else ""
         return "你的线离现价：" + "；".join(rows) + "。" + tail
 
     # 超短线的 Worker 默认带的记录器：看哪些数据、到多少、两次之间至少隔几分钟。到了只叫醒 Worker；Worker 可以给它们设上直接执行的操作
@@ -2191,7 +2190,7 @@ class Watcher:
         closed = [c for c in m5 if c.confirmed]
         if len(closed) < 25:
             return
-        # 开盘以来怎么走的、上一日的价值区间：算出来的价位并进关键线表，快判、记录器、触发器都能用（dist:价值区间下沿 这样写）
+        # 开盘以来怎么走的、上一日的价值区间：算出来的价位并进关键线表，快判、记录器、触发线都能用（dist:价值区间下沿 这样写）
         asset = await self.market.asset_class(inst_id, cfg.env)
         session = day_profile({"5m": m5, "1H": h1}, px, *session_anchor(asset))
         day = int(now // 86_400)
@@ -3264,7 +3263,7 @@ class Watcher:
                 if blocked or remaining or not updated.ok or (updated.how, updated.limit) != (check.how, check.limit):
                     return {"status": "skipped", "text": f"撤旧后没有换单：{blocked or '挂单状态、行情或执行条件已变化'}，等待重新评估。"}
                 check = updated
-            for old_t in self.store.strategies(cfg.env, inst_id):  # 顺手清理旧版遗留的递归 task 触发器，防止反复打扰
+            for old_t in self.store.strategies(cfg.env, inst_id):  # 顺手清理旧版遗留的递归 task 触发线，防止反复打扰
                 if old_t["kind"] == "trigger" and not old_t["params"].get("recorder") and old_t["params"].get("do") == "task" and old_t["status"] in ("proposed", "armed"):
                     self.strategies.cancel(old_t["id"], "已由直接挂单的交易计划替代")
             style, side = cfg.style_for(inst_id), ("做多" if plan.direction == "long" else "做空")
@@ -3647,7 +3646,7 @@ class Watcher:
                          "最近分钟仅为轮询采到的首/高/低/末价，并非逐笔或收盘确认；缺字段表示无可靠数据。\n"
                          + json.dumps({"quote": opening, "sampled_minutes": minutes}, ensure_ascii=False))
         if rec_snap:
-            lines.append(f"【记录器实时读数（算法持续采样）】{rec_snap}")
+            lines.append(f"【算法读数（程序持续采样）】{rec_snap}")
         turn = metrics.get("shift")
         state = turn_state(turn, metrics.get("turn"), self._state(inst_id).last_retest)
         if state and state["stage"] == "early":
@@ -3715,7 +3714,7 @@ class Watcher:
                     f"止损 {l['stop_loss'] or '无'}，止盈 {l['take_profit'] or '无'}，{state}"
                     + ("（不是在本项目里开的仓）" if l["source"] == "external" else "")
                     + (
-                        ("（用户手动开的：你只能给建议，减仓 / 平仓 / 改止损都会变成等用户确认的方案）" if cfg.hands_off_manual else "（用户手动开的：你负责保护——没有止损先补上，浮盈后可收紧止损；止盈、减仓、平仓由用户定，你调用会变成等他确认的卡片，不要写到价或超时平仓的触发器）")
+                        ("（用户手动开的：你只能给建议，减仓 / 平仓 / 改止损都会变成等用户确认的方案）" if cfg.hands_off_manual else "（用户手动开的：你负责保护——没有止损先补上，浮盈后可收紧止损；止盈、减仓、平仓由用户定，你调用会变成等他确认的卡片，不要写到价或超时平仓的触发线）")
                         if l["source"] in MANUAL_SOURCES else ""
                     )
                 )
@@ -3863,7 +3862,7 @@ class Watcher:
             lines.append(
                 "【这些线到了只会叫醒你】上一轮这几条计划线是 do=wake，说明里却写了要做的动作，程序到了不会替你做："
                 + "；".join(f"{w['price']:g}：{str(w.get('note'))[:60]}" for w in loose[:6])
-                + "。仍然有效的，这一轮把这条线改成 do=enter（进场）或 do=cancel（撤单）；减仓、移止损这类用 add_trigger。已经有触发器或挂单在管的就不用重复写。"
+                + "。仍然有效的，这一轮把这条线改成 do=enter（进场）或 do=cancel（撤单）；减仓、移止损这类用 add_trigger。已经有触发线或挂单在管的就不用重复写。"
             )
         lines.append(
             "【什么时候停】你不能因为没行情、空仓、觉得今天不适合就停，也不要让 Router 代停：现在进不了就把单挂在结构位上等（plan 的 pullback / breakout），到了要进场、撤单或再判断的价位都写成计划线（lines）。"
@@ -3960,7 +3959,7 @@ class Watcher:
                 prompt = f"{brief}\n当前查看品种：{inst_id or '未指定'}\n最近只读问答：{json.dumps(context, ensure_ascii=False)}\n用户问题：{message}"
                 result = await self._run(reader, [prompt, *self._images(images)] if images else prompt, None, REVIEW_TIMEOUT,
                                          live=LiveText(self.bus.publish, "router", ""), usage_limits=UsageLimits(request_limit=1),
-                                         model_settings=_effort(ROUTER_EFFORT, "ouy-consult"))
+                                         model_settings=_effort(cfg.router_effort, "ouy-consult"))
                 reply = result.output
             self._emit(cfg.env, inst_id or "", "router", "done", reply, None, data)
         except Exception:
@@ -4213,7 +4212,7 @@ class Watcher:
         deps = Deps(
             trader=self.trader, market=self.market, gateway=self.gw, config=cfg, kb=self.kb, skills=self.skills, lessons=self.lessons, propose_only=True, control=self.control,
             dispatch=self._dispatch, board=self._board, intel=self.intel, effort=effort,
-            general=lambda task, skill=None: self._general(task, skill, effort), only=at or None, user_request=message if origin == "用户" else "",  # 触发器派来的不是用户本人的话：不能启停盯盘
+            general=lambda task, skill=None: self._general(task, skill, effort), only=at or None, user_request=message if origin == "用户" else "",  # 触发线派来的不是用户本人的话：不能启停盯盘
             emit=self._emitter(cfg.env, inst_id or "", "router", None), goal=self.set_goal,
             images=pics, image_names=list(images or []) if pics else [],
         )
@@ -4234,7 +4233,7 @@ class Watcher:
             result = await self._run(
                 agent, [prompt, *pics] if pics else prompt, None, REVIEW_TIMEOUT * 3, live=LiveText(self.bus.publish, "router", ""),
                 deps=deps, message_history=_trim_history(self._history(thread), ROUTER_KEEP), usage_limits=UsageLimits(request_limit=20),
-                model_settings=_effort(ROUTER_EFFORT, "ouy-router"),
+                model_settings=_effort(cfg.router_effort, "ouy-router"),
             )
         except BaseException as exc:
             kind, why = _fail_text(exc)

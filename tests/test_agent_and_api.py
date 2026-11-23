@@ -173,7 +173,7 @@ async def test_manual_positions_are_only_advised_on(settings, fake):
     assert any(e["kind"] == "alert" and "手动开的仓" in e["title"] for e in rt.store.journal("demo"))
 
     rt.save_config(rt.config().model_copy(update={"hands_off_manual": False}))
-    # 开关关着：Worker 可以保护（收紧止损），但不能替用户了结——平仓、减仓、设止盈仍要他确认，也不能写成触发器绕过去
+    # 开关关着：Worker 可以保护（收紧止损），但不能替用户了结——平仓、减仓、设止盈仍要他确认，也不能写成触发线绕过去
     fake.prices[BTC] = 60_300
     moved = await rt.trader.submit(TradeAction(kind="set_stops", inst_id=BTC, stop_loss=59_700), source="agent")
     assert moved.status == "executed", moved.message
@@ -449,7 +449,7 @@ async def test_router_returns_workers_trigger_approval_in_the_shared_conversatio
         if router:
             assert not any(tool.name == "tell_worker" for tool in info.function_tools)
             if not answered:
-                return ModelResponse(parts=[ToolCallPart("ask_worker", {"inst_id": BTC, "task": "准备突破入场触发器"})])
+                return ModelResponse(parts=[ToolCallPart("ask_worker", {"inst_id": BTC, "task": "准备突破入场触发线"})])
             return ModelResponse(parts=[TextPart("等你同意。")])
         return ModelResponse(parts=[ToolCallPart("add_trigger", {
             "inst_id": BTC, "when": "price_above", "level": 60_250, "do": "open_market",
@@ -457,7 +457,7 @@ async def test_router_returns_workers_trigger_approval_in_the_shared_conversatio
         })])
 
     rt = make_rt(settings, fake, FunctionModel(run))
-    result = await rt.watcher.chat("@BTC 准备突破入场触发器", inst_id=BTC)
+    result = await rt.watcher.chat("@BTC 准备突破入场触发线", inst_id=BTC)
     [card] = result["actions"]
     assert card == rt.watcher.chat_log("general")[-1]["actions"][0]
     assert card["pending_status"] == "waiting"
@@ -1224,10 +1224,10 @@ async def test_router_hands_general_questions_to_the_general_worker(settings, fa
     assert all(not st.adhoc for st in rt.watcher.states.values())
 
 
-async def test_router_only_dispatches_at_the_lowest_effort_and_the_worker_gets_the_chosen_one(settings, fake):
-    """Router 是分发台：不管设置和对话框里选了什么思考强度，它自己固定用最低的，带进上下文的旧对话也只留最近一小段；
-    对话框里选的强度交给接手的通用 Worker。"""
-    from ouy.agent.watcher import ROUTER_EFFORT, ROUTER_KEEP
+async def test_router_dispatches_at_low_effort_by_default_and_the_worker_gets_the_chosen_one(settings, fake):
+    """Router 是分发台：思考强度默认低（用户可以在设置里改），对话框里选的强度不给它、交给接手的通用 Worker；
+    带进上下文的旧对话有上限（ROUTER_KEEP）。"""
+    from ouy.agent.watcher import ROUTER_KEEP
 
     efforts: dict[str, list[object]] = {"router": [], "general": []}
     carried: list[int] = []
@@ -1243,17 +1243,22 @@ async def test_router_only_dispatches_at_the_lowest_effort_and_the_worker_gets_t
         return ModelResponse(parts=[TextPart("通用 Worker 查过了。")])
 
     rt = make_rt(settings, fake, FunctionModel(run))
-    rt.save_config(rt.config().model_copy(update={"router_effort": "xhigh", "reasoning_effort": "medium"}))
+    assert rt.config().router_effort == "low"  # 默认低
+    rt.save_config(rt.config().model_copy(update={"reasoning_effort": "medium"}))
     run_model = rt.watcher._run
     async def spy(agent, prompt, st, timeout, **kw):
         efforts["router" if agent.name == "ouy-router" else "general"].append((kw.get("model_settings") or {}).get("thinking"))
         return await run_model(agent, prompt, st, timeout, **kw)
     rt.watcher._run = spy
-    for _ in range(8):
+    for _ in range(14):
         await rt.watcher.chat("帮我比较一下 BTC 和 ETH", effort="high")
-    assert set(efforts["router"]) == {ROUTER_EFFORT} and ROUTER_EFFORT == "low"
+    assert set(efforts["router"]) == {"low"}
     assert set(efforts["general"]) == {"high"}
-    assert max(carried) <= ROUTER_KEEP + 1  # 每问一次进 4 条消息：8 次是 32 条，带进去的不超过最近 16 条再加这一句
+    assert 30 < max(carried) <= ROUTER_KEEP + 1  # 每问一次进 4 条消息：14 次是 56 条，带进去的是最近 40 条以内再加这一句
+    efforts["router"].clear()
+    rt.save_config(rt.config().model_copy(update={"router_effort": "high"}))  # 用户自己调高：照用户的
+    await rt.watcher.chat("帮我比较一下 BTC 和 ETH", effort="high")
+    assert set(efforts["router"]) == {"high"}
 
 
 async def test_at_mention_makes_router_forward_to_exactly_that_worker(settings, fake):

@@ -1,4 +1,4 @@
-"""触发器：Worker 预先写好「条件 → 操作」，条件满足时程序直接执行，不叫醒模型思考；只执行一次，结果回报给 Worker。"""
+"""触发线：Worker 预先写好「条件 → 操作」，条件满足时程序直接执行，不叫醒模型思考；只执行一次，结果回报给 Worker。"""
 from __future__ import annotations
 
 import asyncio
@@ -215,7 +215,7 @@ async def test_worker_writes_a_trigger_and_code_places_the_limit_order_without_t
     await rt.watcher.review(BTC, "测试")
     thought = calls["n"]
     row = next(r for r in rt.watcher.strategy_rows("demo", BTC) if r["params"].get("do") == "open_limit")
-    assert row["label"] == "触发器" and row["status"] == "armed"
+    assert row["label"] == "触发线" and row["status"] == "armed"
     await tick(rt, fake, 60_000)
     await tick(rt, fake, 59_980)
     assert not fake.orders  # 条件没到
@@ -249,7 +249,7 @@ async def test_trigger_conditions_actions_and_safety(settings, fake, monkeypatch
     # 按 K 线收盘：只认布置之后才收盘的那根
     b = add(rt, when="close_below", level=59_800, bar="5m", do="close")["id"]
     w = add(rt, when="price_above", level=60_600, do="wake", wake_note="看要不要加仓")["id"]
-    assert all(rt.store.get_strategy(i)["status"] == "armed" for i in (b, w))  # 几条触发器并存，互不替换
+    assert all(rt.store.get_strategy(i)["status"] == "armed" for i in (b, w))  # 几条触发线并存，互不替换
     born = rt.store.get_strategy(b)["ts"]
     bars = [Candle(born - 600_000, 60_000, 60_000, 59_700, 59_750, 1, True)]
 
@@ -269,7 +269,7 @@ async def test_trigger_conditions_actions_and_safety(settings, fake, monkeypatch
     assert BTC not in fake.positions and "已执行" in rt.store.get_strategy(b)["note"]
     assert "收盘 59760" in rt.store.get_strategy(b)["note"] and "盘中报价 60070" in rt.store.get_strategy(b)["note"]
 
-    await tick(rt, fake, 60_650)  # 只叫醒的触发器
+    await tick(rt, fake, 60_650)  # 只叫醒的触发线
     assert rt.store.get_strategy(w)["status"] == "done" and "看要不要加仓" in rt.watcher.inbox("demo", BTC)[-1]["text"]
 
     # 执行不成不重试；关掉权限的不执行；要确认的权限下先等用户同意
@@ -314,11 +314,11 @@ async def test_trigger_can_wait_on_anything_the_program_can_see_and_on_two_thing
     await tick(rt, fake, 60_250)  # 仓位没了：叫醒 Worker
     assert rt.store.get_strategy(flat)["status"] == "done" and "重新找机会" in rt.watcher.inbox("demo", BTC)[-1]["text"]
 
-    # 触发器页的清单：每条都是「等什么 → 做什么」，带谁写的、是自动执行还是只叫醒
+    # 触发线页的清单：每条都是「等什么 → 做什么」，带谁写的、是自动执行还是只叫醒
     rules = {r["id"]: r for r in rt.watcher.rules("demo", BTC)}
     extra = ("recorder", "conds", "repeat", "cooldown_minutes", "off", "runs", "last_run")
     assert {k: v for k, v in rules[f"s{late}"].items() if k not in extra} | {"ts": 0, "updated_ts": 0, "note": ""} == {
-        "id": f"s{late}", "type": "trigger", "label": "触发器", "when": "这个币有了持仓（挂单成交） 且 过了 30 分钟", "do": "市价平掉这个币的仓位", "mode": "auto",
+        "id": f"s{late}", "type": "trigger", "label": "触发线", "when": "这个币有了持仓（挂单成交） 且 过了 30 分钟", "do": "市价平掉这个币的仓位", "mode": "auto",
         "status": "waiting", "by": "Worker", "ts": 0, "updated_ts": 0, "note": "", "level": None, "strategy_id": late, "expires_ts": None, "action": "close", "cond": "has_position", "bar": None}
     assert rules[f"s{flat}"]["mode"] == "wake" and rules[f"s{flat}"]["status"] == "done"
 
@@ -346,12 +346,12 @@ async def test_time_triggers_and_task_actions(settings, fake, monkeypatch):
     await tick(rt, fake, 60_000)
     import asyncio
     await asyncio.sleep(0)
-    assert rt.store.get_strategy(clock)["status"] == "done" and "查今晚的数据公布" in sent[0][0] and sent[0][1]["origin"] == f"触发器 #{clock}"
-    mail = [m for m in rt.watcher.inbox("demo", BTC) if m["who"] == "触发器"]
+    assert rt.store.get_strategy(clock)["status"] == "done" and "查今晚的数据公布" in sent[0][0] and sent[0][1]["origin"] == f"触发线 #{clock}"
+    mail = [m for m in rt.watcher.inbox("demo", BTC) if m["who"] == "触发线"]
     assert len(mail) == 1 and "重新评估 4H 结构" in mail[0]["text"]
     assert rt.store.get_strategy(loop)["status"] == "armed" and "已执行 1 次" in rt.store.get_strategy(loop)["note"]  # 反复的不结束
     await tick(rt, fake, 60_000)
-    assert len([m for m in rt.watcher.inbox("demo", BTC) if m["who"] == "触发器"]) == 1  # 还没到下一个 15 分钟
+    assert len([m for m in rt.watcher.inbox("demo", BTC) if m["who"] == "触发线"]) == 1  # 还没到下一个 15 分钟
     rules = {r["strategy_id"]: r for r in rt.watcher.rules("demo", BTC) if r["strategy_id"]}
     assert rules[loop]["when"] == "每隔 15 分钟" and rules[loop]["do"] == "Worker 自己做一项任务：重新评估 4H 结构" and rules[loop]["mode"] == "task"
 
@@ -451,7 +451,7 @@ async def test_recorder_data_is_kept_when_needed_and_old_default_recorders_are_r
     rows = rt.store.strategies("demo", BTC)
     assert [r["params"]["data"] for r in rows] == ["vol_ratio"] and rows[0]["params"]["by"] == "你"  # 开着快判的币自动记数据，不再带默认记录器
     status = w.status()["instruments"][BTC]
-    assert status["data"]["values"]["vol_ratio"] == 1.0 and status["data"]["levels"]["区间下沿"] == 59_900 and status["strategies"][0]["label"] == "记录器"
+    assert status["data"]["values"]["vol_ratio"] == 1.0 and status["data"]["levels"]["区间下沿"] == 59_900 and status["strategies"][0]["label"] == "触发线"
     assert status["data"]["values"]["atr"] > 0 and status["fast"] == {"mode": "verify", "on": True, "on_signal": "verify", "last": None, "shift": None}
     rule = next(r for r in status["rules"] if r["recorder"] and r["conds"][0]["data"] == "vol_ratio")
     assert rule["conds"] == [{"data": "vol_ratio", "op": "above", "level": 2.5}] and rule["repeat"] and rule["mode"] == "wake"
@@ -463,7 +463,7 @@ async def test_recorder_data_is_kept_when_needed_and_old_default_recorders_are_r
     assert eng.metrics[BTC]["values"]["vol_ratio"] == 3.0 and len(st.data_log) == 2
     await tick(rt, fake, 60_010)
     mail = next(m["text"] for m in rt.watcher.inbox("demo", BTC) if "量比 ≥ 2.5" in m["text"])
-    assert mail.startswith("记录器 #") and "量比 ≥ 2.5" in mail and "程序记录的数据：量比 3" in mail and "现在的线" in mail and "你现在没有等着的入场触发器" in mail
+    assert mail.startswith("触发线 #") and "的算法读数到了" in mail and "量比 ≥ 2.5" in mail and "程序记录的数据：量比 3" in mail and "现在的线" in mail and "你现在没有等着的入场触发线" in mail
 
 
 async def test_worker_sets_a_recorder_that_opens_first_then_wakes_it(settings, fake):
@@ -472,10 +472,10 @@ async def test_worker_sets_a_recorder_that_opens_first_then_wakes_it(settings, f
     def model(messages, info):
         returns = [p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)]
         if not returns:
-            return ModelResponse(parts=[ToolCallPart("set_recorder", {
+            return ModelResponse(parts=[ToolCallPart("add_trigger", {  # 条件是算法读数的触发线（以前要用单独的 set_recorder）
                 "inst_id": BTC, "reason": "分数够、贴近下沿就先挂单", "cooldown_minutes": 1, "do": "open_limit", "side": "long", "risk_pct": 0.3,
-                "conditions": [{"data": "score_long", "op": "above", "level": 3}, {"data": "dist:区间下沿", "op": "below", "level": 0.3}],
-                "price_line": "区间下沿", "price_offset_pct": 0.05, "stop_line": "区间下沿", "stop_offset_pct": -0.3})])
+                "when": "data_above", "data": "score_long", "level": 3, "and_when": "data_below", "and_data": "dist:区间下沿", "and_level": 0.3,
+                "price": 59_830, "stop_loss": 59_600})])
         assert "已启用" in str(returns[-1].content) and "当 做多分数 ≥ 3 且 现价高出「区间下沿」的幅度% ≤ 0.3" in str(returns[-1].content)
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {**REPORT, "plan": None})])
 
@@ -484,6 +484,11 @@ async def test_worker_sets_a_recorder_that_opens_first_then_wakes_it(settings, f
     await rt.watcher.review(BTC, "测试")
     rec = next(r for r in rt.store.strategies("demo", BTC) if r["params"].get("recorder"))
     assert rec["params"]["recorder"] and rec["params"]["repeat"] and len(rec["params"]["conds"]) == 2 and rec["side"] == "long"
+    assert rec["params"]["wake_note"] == "分数够、贴近下沿就先挂单" and "and_when" not in rec["params"] and "挂限价买单 @ 59830，止损 59600" in eng.describe(rec)
+    # 库里旧的记录器有「价位跟着线走」的写法（工具里已经不给了）：照常执行
+    moving = {k: v for k, v in rec["params"].items() if k not in ("price", "stop_loss")} | {"price_line": "区间下沿", "price_offset_pct": 0.05, "stop_line": "区间下沿", "stop_offset_pct": -0.3}
+    rt.store._exec("UPDATE strategies SET params=? WHERE id=?", (__import__("json").dumps(moving, ensure_ascii=False), rec["id"]))
+    rec = rt.store.get_strategy(rec["id"])
     assert "挂限价买单 @ 「区间下沿」+0.05%，止损 「区间下沿」-0.3%" in eng.describe(rec)
 
     def record(levels=None, **values):
@@ -503,7 +508,7 @@ async def test_worker_sets_a_recorder_that_opens_first_then_wakes_it(settings, f
     row = rt.store.get_strategy(rec["id"])
     assert row["status"] == "armed" and row["state"]["runs"] == 1
     mail = rt.watcher.inbox("demo", BTC)[-1]["text"]
-    assert mail.startswith(f"记录器 #{rec['id']} 到了") and "订单已提交" in mail and "不是新的交易指令" in mail
+    assert mail.startswith(f"触发线 #{rec['id']} 的算法读数到了") and "订单已提交" in mail and "不是新的交易指令" in mail
     assert "做多分数实测 3" in mail and "盘中报价 59950" in mail
     rt.store.update_strategy(rec["id"], state={**row["state"], "cool_until": 0})
     record(score_long=1)
@@ -512,7 +517,7 @@ async def test_worker_sets_a_recorder_that_opens_first_then_wakes_it(settings, f
     await tick(rt, fake, 59_950)
     assert len(fake.orders) == 1 and "已经有持仓或挂单" in rt.store.get_strategy(rec["id"])["note"]  # 已有挂单：这次跳过
     rule = next(r for r in rt.watcher.rules("demo", BTC) if r["strategy_id"] == rec["id"])
-    assert rule["recorder"] and rule["runs"] == 1 and rule["mode"] == "auto" and rule["label"] == "记录器"
+    assert rule["recorder"] and rule["runs"] == 1 and rule["mode"] == "auto" and rule["label"] == "触发线"
     eng.metrics[BTC]["ts"] -= 600_000  # 数据太久没更新：不拿来判断
     assert eng.data(BTC, "score_long") is None and eng.line(BTC, "区间下沿") is None
     assert not eng.fresh_metrics("demo", BTC) and "现在的线" not in eng.snapshot(BTC, "demo")
@@ -573,6 +578,17 @@ async def test_user_can_draw_a_line_that_wakes_cancels_closes_or_opens(rt, fake)
         assert bad.status_code == 400 and "止损放错边" in bad.json()["detail"]
         assert (await line(when="price_touch", level=60_300, do="open", stop_loss=59_900)).status_code == 400  # 开仓要给方向
         assert (await line(when="price_touch", level=60_300, do="close", stop_loss=59_900)).status_code == 400
+        # 条件也可以是一项算法读数（以前的记录器）：反复生效，只能叫醒、撤单、平仓
+        turn = (await line(when="data_above", data="turn_stage", level=3, do="wake", note="转折确认")).json()
+        assert turn["params"]["recorder"] and turn["params"]["repeat"] and turn["params"]["conds"] == [{"data": "turn_stage", "op": "above", "level": 3.0}]
+        assert "转折" in watcher.strategies.describe(turn)
+        assert (await line(when="data_below", data="dist:区间下沿", level=-0.2, do="cancel_orders")).status_code == 200  # 读数可以是负数
+        assert (await line(when="data_above", level=3, do="wake")).status_code == 400  # 没选读数
+        assert (await line(when="data_above", data="score_long", level=3, do="open", side="long", stop_loss=59_900)).status_code == 400  # 读数条件不让直接开仓
+        assert (await line(when="data_above", data="没有这项", level=3, do="wake")).status_code == 400
+        assert (await line(when="price_touch", level=0, do="wake")).status_code == 400
+        r = (await client.post(f"/api/strategies/{turn['id']}/edit", json={"level": 2})).json()  # 只看一项读数的：改数值
+        assert r["params"]["conds"][0]["level"] == 2 and r["params"]["level"] == 2
 
         watcher._state(BTC).report = {"ts": 9, "price": 60_000, "lines": []}
         watcher._sync_observation_rules(rt.config(), BTC)  # Worker 这一轮一条线都没划：用户的线不受影响

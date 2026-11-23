@@ -423,7 +423,7 @@ export interface Strategy {
   text: string;
 }
 
-/** 触发器清单里的一行：等什么 → 做什么 */
+/** 触发线清单里的一行：等什么 → 做什么 */
 export interface RecorderCond {
   data: string;
   op: "above" | "below";
@@ -451,7 +451,7 @@ export interface Rule {
   strategy_id: number | null;
   expires_ts: number | null;
   ord_id?: string;
-  /** 记录器：Worker 小组里的节点，条件是程序记录的几项数据，数值可以直接改 */
+  /** 条件是算法读数的触发线（以前叫记录器）：几项读数同时满足，数值可以直接改 */
   recorder?: boolean;
   conds?: RecorderCond[] | null;
   repeat?: boolean;
@@ -897,9 +897,8 @@ export const api = {
     post<{ id: number }>(`/api/lots/${id}/profit-guard`, rules),
   strategyAct: (id: number, verb: "approve" | "cancel") => post<Strategy>(`/api/strategies/${id}/${verb}`),
   editStrategy: (id: number, patch: { conds?: RecorderCond[]; level?: number; cooldown_minutes?: number; off?: boolean }) => post<Strategy>(`/api/strategies/${id}/edit`, patch),
-  addLine: (body: { inst_id: string; when: "price_touch" | "close_above" | "close_below"; level: number; bar?: string; do: "wake" | "cancel_orders" | "close" | "open"; side?: "long" | "short"; stop_loss?: number; take_profit?: number; note?: string }) =>
+  addLine: (body: { inst_id: string; when: "price_touch" | "close_above" | "close_below" | "data_above" | "data_below"; level: number; data?: string; bar?: string; do: "wake" | "cancel_orders" | "close" | "open"; side?: "long" | "short"; stop_loss?: number; take_profit?: number; note?: string }) =>
     post<Strategy>("/api/lines", body),
-  addRecorder: (body: { inst_id: string; conds: RecorderCond[]; note: string; cooldown_minutes: number }) => post<Strategy>("/api/recorders", body),
   interject: (inst: string, message: string) => post<{ delivered: boolean; message: string }>("/api/agent/interject", { inst_id: inst, message }),
   standby: (inst: string, on: boolean) => post<AgentStatus>("/api/agent/standby", { inst_id: inst, on }),
   setGoal: (inst: string, goal: string, max_loss_usdt?: number, hours?: number, target_usdt?: number, stop_when?: string) =>
@@ -966,7 +965,7 @@ export const api = {
   testProxy: () => post<{ ok: boolean; message: string }>("/api/proxy/test"),
   clearChat: (thread: string) => request(`/api/chat?thread=${thread}`, { method: "DELETE" }),
   chatLog: (thread: string) => get<{ messages: ChatMessage[] }>(`/api/chat?thread=${thread}`),
-  /** 清除记录：tasks 已完成的任务；triggers 已结束的触发器；talk 对话区。inst 为空 = 所有币 */
+  /** 清除记录：tasks 已完成的任务；triggers 已结束的触发线；talk 对话区。inst 为空 = 所有币 */
   clearHistory: (inst: string, what: "tasks" | "triggers" | "talk") => post<{ cleared: number }>("/api/history/clear", { inst_id: inst, what }),
   chatClear: (thread: string) => request(`/api/chat?thread=${thread}`, { method: "DELETE" }),
   okxTools: () => get<OkxTool[]>("/api/okx/tools"),

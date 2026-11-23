@@ -563,7 +563,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
         busyText={`${to === "worker" ? `${name} Worker` : "Router"} 正在忙`}
         onSend={(t, images) => send(t, images)}
         left={
-          <label className="muted small" title="接手这件事的 Worker 的思考强度：越高想得越细，但越慢、越费 token。Router 只负责分发，固定用最低强度">
+          <label className="muted small" title="接手这件事的 Worker 的思考强度：越高想得越细，但越慢、越费 token。Router 只负责分发，它的强度在设置里（默认低）">
             思考强度
             <select value={effort} onChange={(e) => setEffort(e.target.value as Effort)}>
               {EFFORTS.map((e) => (

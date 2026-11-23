@@ -170,7 +170,7 @@ def detect(bars: Sequence[Candle], px: float, levels: dict[str, float], *, atr5:
 
 
 def strengths(sig: Signal | None) -> dict[str, Any]:
-    """给记录器 / 触发器用的两项数据：现在做多、做空的快判各有几分（没有信号是 0）。"""
+    """给触发线用的两项读数：现在做多、做空的快判各有几分（没有信号是 0）。"""
     return {"sig_long": sig.strength if sig and sig.side == "long" else 0, "sig_short": sig.strength if sig and sig.side == "short" else 0}
 
 

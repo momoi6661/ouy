@@ -473,6 +473,7 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
           <div className="form-grid">
             {(
               [
+                ["router_effort", "Router 的思考强度（分发、收尾）"],
                 ["reasoning_effort", "Worker 的思考强度（复盘、下单）"],
                 ["sub_effort", "子代理的思考强度"],
               ] as const
@@ -490,7 +491,7 @@ export function AgentSettings({ state, journal, redUp, setRedUp, refresh }: Prop
             ))}
           </div>
           <p className="muted small">思考强度越高判断越细，但越慢、越费 token。超短线建议 Worker 用「低」或「中」；每个币还可以在 Worker 总览里单独设。</p>
-          <p className="muted small">思考强度越高，Agent 分析越细，但每次复盘更慢、更费 token。对话框里可以单独选。Router 只负责把事情分给 Worker 和收尾，固定用最低强度，不用设。</p>
+          <p className="muted small">思考强度越高，Agent 分析越细，但每次复盘更慢、更费 token。对话框里可以单独选。Router 只负责把事情分给 Worker 和收尾，默认用「低」就够，调高只会让分发变慢。</p>
           <p className="muted small">每次复盘会调用一次 模型（当前：{state.ai.model}）。间隔越短、品种越多，模型费用越高。</p>
         </div>
 

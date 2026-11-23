@@ -21,7 +21,7 @@ export const RECORD_DATA: [string, string, string][] = [
 export const dataLabel = (name: string) => (name.startsWith("dist:") ? `现价高出「${name.slice(5)}」%` : RECORD_DATA.find(([id]) => id === name)?.[1] ?? name);
 const num = (v: number | null | undefined) => (v === null || v === undefined ? "—" : String(Math.round(v * 1000) / 1000));
 
-/** 一个记录器某项数据现在是多少 */
+/** 某项算法读数现在是多少 */
 export function recordNow(st: InstStatus | undefined, name: string, last?: number): number | null | undefined {
   const d = st?.data;
   if (!d || Date.now() - d.ts > 180_000) return undefined;
@@ -38,16 +38,14 @@ export function recordNow(st: InstStatus | undefined, name: string, last?: numbe
 interface Props {
   coin: string;
   st?: InstStatus;
-  rules: Rule[];
   last?: number;
   busy: boolean;
-  run: (fn: () => Promise<unknown>, ok: string) => void;
   own?: WorkerOverride;
   onSaveWorker?: (patch: Partial<WorkerOverride>, ok: string) => void;
 }
 
-/** 算法引擎与记录器面板：展示 4 档量化模式切换、白话走势诊断、实时结构转折、快判信号与条件触发规则 */
-export function Recorders({ coin, st, rules, last, busy, run, own, onSaveWorker }: Props) {
+/** 算法读数面板：程序一直在算的东西——量化档位、白话走势诊断、转折、快判信号和各项读数。要「读数到了就做什么」去触发线页加 */
+export function AlgoReadings({ coin, st, last, busy, own, onSaveWorker }: Props) {
   const data = st?.data;
   const shift = st?.fast?.shift;
   const turn = st?.turn;
@@ -55,15 +53,11 @@ export function Recorders({ coin, st, rules, last, busy, run, own, onSaveWorker 
   const qt = st?.quant;
   const qmode: QuantMode = own?.quant_mode ?? qt?.mode ?? "auto";
   const qbias: QuantBias = own?.quant_bias ?? qt?.bias ?? "both";
-  const rows = rules.filter((r) => r.recorder && ["waiting", "proposed"].includes(r.status));
-  const [edits, setEdits] = useState<Record<string, string>>({});
-  const [form, setForm] = useState({ data: "vol_ratio", op: "above", level: "2", cooldown: "15", note: "" });
-  const lines = Object.keys(data?.levels ?? {});
 
   return (
     <div className="ws-card wide rec">
       <h5>
-        量化雷达与记录器 <span className="muted small">Worker 可随行情自动换挡，你也随时可手动切档</span>
+        算法读数 <span className="muted small">程序一直在算；Worker 可随行情自动换挡，你也随时可手动切档。要「读数到了就做什么」，去「触发线」页加一条</span>
       </h5>
       {onSaveWorker && (
         <div className="rec-modes">
@@ -112,7 +106,7 @@ export function Recorders({ coin, st, rules, last, busy, run, own, onSaveWorker 
           ))}
         </div>}
         {qt?.opening_quote && <div className="rec-narrative">
-          <b>开盘记录器 {fmtTime(qt.opening_quote.ts)}</b>　采样价 {fmtPx(qt.opening_quote.price)}
+          <b>开盘对比 {fmtTime(qt.opening_quote.ts)}</b>　采样价 {fmtPx(qt.opening_quote.price)}
           <div>开盘前 1 小时 {num(qt.opening_quote.pre_open?.change_pct)}%　场开 {num(qt.opening_quote.session_open)}（{num(qt.opening_quote.session_pct)}%）</div>
           <div>当前 5 分钟开 {num(qt.opening_quote.bar_open)}（盘中 {num(qt.opening_quote.bar_pct)}%）</div>
         </div>}
@@ -160,74 +154,37 @@ export function Recorders({ coin, st, rules, last, busy, run, own, onSaveWorker 
       {!!data?.log.some((r) => r.reading) && <details><summary>最近的走势判断（按 5 分钟 K 线）</summary>
         {data.log.filter((r) => r.reading).slice().reverse().map((r) => <p key={r.ts}><b>{fmtTime(r.ts)}</b> · {r.reading}</p>)}
       </details>}
-      {rows.length === 0 && <p className="muted small rec-empty">未设指标触发规则；这不影响基础观察。</p>}
-      {rows.map((r) => {
-        const conds = r.conds ?? [];
-        const drafts = conds.map((c, i) => edits[`${r.id}:${i}`] ?? String(c.level));
-        const dirty = drafts.some((d, i) => d !== String(conds[i].level));
-        const ok = drafts.every((d) => d.trim() !== "" && !Number.isNaN(Number(d)));
-        return (
-          <div key={r.id} className={`rec-row ${r.off ? "off" : ""}`}>
-            <input type="checkbox" title="开 / 关这个记录器" checked={!r.off} disabled={busy} onChange={(e) => run(() => api.editStrategy(r.strategy_id!, { off: !e.target.checked }), e.target.checked ? "记录器已打开" : "记录器已关掉")} />
-            <div className="rec-main">
-              <div className="rec-flow">
-                {conds.map((c, i) => (
-                  <span key={i} className="rec-cond">
-                    {i > 0 ? <i>且</i> : null}
-                    {dataLabel(c.data)} {c.op === "above" ? "≥" : "≤"}
-                    <input value={drafts[i]} inputMode="decimal" onChange={(e) => setEdits((m) => ({ ...m, [`${r.id}:${i}`]: e.target.value }))} />
-                    <em>当前 {num(recordNow(st, c.data, last))}</em>
-                  </span>
-                ))}
-                {dirty && (
-                  <button
-                    className="btn xs primary"
-                    disabled={busy || !ok}
-                    onClick={() => run(() => api.editStrategy(r.strategy_id!, { conds: conds.map((c, i) => ({ ...c, level: Number(drafts[i]) })) }).then(() => setEdits({})), "数值已改")}
-                  >
-                    保存
-                  </button>
-                )}
-                <span className="trg-arrow">→</span>
-                <span className="trg-do">{r.mode === "wake" ? r.do : `先${r.do}，再叫醒 Worker`}</span>
-              </div>
-              <div className="trg-meta">
-                <span>#{r.strategy_id}</span>
-                <span>{r.by === "默认" ? "系统预设" : `${r.by}设定`}</span>
-                <span>间隔 {r.cooldown_minutes ?? 15} 分钟</span>
-                <span>{r.runs ? `触发 ${r.runs} 次（上次 ${r.last_run ? fmtTime(r.last_run) : ""}）` : "尚未触发"}</span>
-                {r.status === "proposed" ? <span>待同意启用</span> : null}
-              </div>
-            </div>
-            <button className="btn xs" disabled={busy} onClick={() => window.confirm("删掉这个记录器？") && run(() => api.strategyAct(r.strategy_id!, "cancel"), "记录器已删掉")}>
-              删除
-            </button>
-          </div>
-        );
-      })}
-      <div className="rec-new">
-        <span className="muted small">新增指标唤醒规则（需达标直接落单可让 Worker 用 set_recorder 设定）</span>
-        <select value={form.data} onChange={(e) => setForm({ ...form, data: e.target.value })}>
-          {RECORD_DATA.map(([id, label]) => (
-            <option key={id} value={id}>{label}</option>
-          ))}
-          {lines.map((name) => (
-            <option key={name} value={`dist:${name}`}>现价高出「{name}」%</option>
-          ))}
-        </select>
-        <select value={form.op} onChange={(e) => setForm({ ...form, op: e.target.value })}>
-          <option value="above">≥</option>
-          <option value="below">≤</option>
-        </select>
-        <input value={form.level} inputMode="decimal" title="数值" onChange={(e) => setForm({ ...form, level: e.target.value })} />
-        <button
-          className="btn xs"
-          disabled={busy || form.level.trim() === "" || Number.isNaN(Number(form.level))}
-          onClick={() => run(() => api.addRecorder({ inst_id: coin, conds: [{ data: form.data, op: form.op as "above" | "below", level: Number(form.level) }], note: "", cooldown_minutes: 15 }), "记录器已加上")}
-        >
-          加上
-        </button>
-      </div>
     </div>
+  );
+}
+
+/** 触发线页里，条件是算法读数的那一条：数值可以直接改，旁边是这项读数现在的值 */
+export function ReadingConds({ rule, st, last, busy, run }: { rule: Rule; st?: InstStatus; last?: number; busy: boolean; run: (fn: () => Promise<unknown>, ok: string) => void }) {
+  const [edits, setEdits] = useState<Record<number, string>>({});
+  const conds = rule.conds ?? [];
+  const drafts = conds.map((c, i) => edits[i] ?? String(c.level));
+  const dirty = drafts.some((d, i) => d !== String(conds[i].level));
+  const ok = drafts.every((d) => d.trim() !== "" && !Number.isNaN(Number(d)));
+  const live = ["waiting", "proposed"].includes(rule.status);
+  return (
+    <>
+      {conds.map((c, i) => (
+        <span key={i} className="rec-cond">
+          {i > 0 ? <i>且</i> : null}
+          {dataLabel(c.data)} {c.op === "above" ? "≥" : "≤"}
+          {live ? <input aria-label={`${dataLabel(c.data)} 的数值`} value={drafts[i]} inputMode="decimal" onChange={(e) => setEdits((m) => ({ ...m, [i]: e.target.value }))} /> : ` ${c.level}`}
+          {live && <em>现在 {num(recordNow(st, c.data, last))}</em>}
+        </span>
+      ))}
+      {live && dirty && (
+        <button
+          className="btn xs primary"
+          disabled={busy || !ok}
+          onClick={() => run(() => api.editStrategy(rule.strategy_id!, { conds: conds.map((c, i) => ({ ...c, level: Number(drafts[i]) })) }).then(() => setEdits({})), "数值已改")}
+        >
+          保存
+        </button>
+      )}
+    </>
   );
 }

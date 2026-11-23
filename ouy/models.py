@@ -245,7 +245,7 @@ class AgentConfig(BaseModel):
     setup_near_pct: float = Field(0.15, ge=0.02, le=2, description="多空分数里「碰到关键线」这一项：K 线离关键线多近算碰到（百分比）")
     wake_move_pct: float = Field(0.6, gt=0, le=20, description="距上次复盘价格波动超过该百分比就立刻叫醒 Agent")
     reasoning_effort: Effort = Field("medium", description="Agent 盯盘复盘时的思考强度；default 表示不指定，用模型默认值")
-    router_effort: Effort = Field("low", description="已不用：Router 只分发任务，固定用最低思考强度（watcher.ROUTER_EFFORT）；留着是为了读得进旧设置")
+    router_effort: Effort = Field("low", description="Router 的思考强度：它只分发任务和收尾，默认用低；要想、要查的事交给 Worker")
     sub_effort: Effort = Field("low", description="子代理（情报 / 聪明钱 / 风险复核）干活时的思考强度")
     notes: str = Field("", max_length=2000, description="你给 Agent 的额外交代（风格、偏好、禁忌）")
     risk: RiskLimits = Field(default_factory=RiskLimits)

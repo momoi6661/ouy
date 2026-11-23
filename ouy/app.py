@@ -118,7 +118,12 @@ class Runtime:
 
     def config(self) -> AgentConfig:
         if self._config is None:
-            self._config = AgentConfig.model_validate(self.store.get("config") or {})
+            raw = self.store.get("config") or {}
+            if raw and not self.store.get("router_effort_low"):  # 旧版 Router 默认「中」：改成只分发之后默认「低」，存着的旧值跟着改一次，之后你自己设的不动
+                raw = {**raw, "router_effort": "low"}
+                self.store.set("config", raw)
+            self.store.set("router_effort_low", True)
+            self._config = AgentConfig.model_validate(raw)
         return self._config
 
     def save_config(self, cfg: AgentConfig) -> None:
@@ -207,8 +212,9 @@ class RecorderIn(BaseModel):
 class LineIn(BaseModel):
     """用户自己划的一条触发线：到了什么条件 → 做什么。"""
     inst_id: str = Field(..., max_length=40)
-    when: Literal["price_touch", "close_above", "close_below"] = "price_touch"
-    level: float = Field(..., gt=0)
+    when: Literal["price_touch", "close_above", "close_below", "data_above", "data_below"] = "price_touch"
+    level: float
+    data: str | None = Field(None, max_length=60, description="条件是算法读数时：看哪一项（turn_stage、vol_ratio、dist:线名 ……）")
     bar: Literal["5m", "15m", "1H"] = "15m"
     do: Literal["wake", "cancel_orders", "close", "open"] = "wake"
     side: Literal["long", "short"] | None = None
@@ -873,7 +879,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/api/history/clear")
     async def clear_history(request: Request, body: ClearIn):
-        """清除记录：已完成的任务、已结束的触发器、对话区。只删记录，不碰进行中的任务、等待中的触发器、持仓和挂单。"""
+        """清除记录：已完成的任务、已结束的触发线、对话区。只删记录，不碰进行中的任务、等待中的触发线、持仓和挂单。"""
         rt = rt_of(request)
         inst = body.inst_id.upper()
         cleared = rt.store.clear_history(rt.config().env, inst, body.what)
@@ -933,12 +939,12 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/api/recorders")
     async def recorder_add(request: Request, body: RecorderIn):
-        """用户给某个 Worker 加一个记录器：程序记录的几项数据都到了，就叫醒这个 Worker（反复生效）。要「到了直接执行」的由 Worker 来设。"""
+        """旧入口，留给还没刷新的页面：按算法读数的触发线，几项读数都到了就叫醒这个 Worker（反复生效）。新页面走 /api/lines。"""
         from .strategy import recorder_params
 
         rt = rt_of(request)
         try:
-            params = {**recorder_params([c.model_dump() for c in body.conds]), "do": "wake", "wake_note": body.note or "用户设的记录器到了，按现在的行情判断要不要做", "cooldown_minutes": body.cooldown_minutes}
+            params = {**recorder_params([c.model_dump() for c in body.conds]), "do": "wake", "wake_note": body.note or "你设的算法读数到了，按现在的行情判断要不要做", "cooldown_minutes": body.cooldown_minutes}
             row = rt.watcher.strategies.deploy(rt.config(), body.inst_id.upper(), "trigger", "", params, source="user", note=body.note)
         except Rejected as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -947,10 +953,17 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/api/lines")
     async def line_add(request: Request, body: LineIn):
-        """用户划一条触发线：价格到了、或者 K 线收盘越过这个价位时，叫醒 Worker、撤掉这个币的挂单、平掉这个币的仓位，
-        或者按写好的止损止盈市价进场。只执行一次，照样过权限和硬性风控。"""
+        """用户划一条触发线：价格到了、K 线收盘越过这个价位、或者某项算法读数到了某个值时，叫醒 Worker、撤掉这个币的挂单、平掉这个币的仓位，
+        或者按写好的止损止盈市价进场。按价位的只执行一次；按算法读数的反复生效（两次之间至少隔 15 分钟）、不能用来开仓。照样过权限和硬性风控。"""
+        from .strategy import recorder_params
+
         rt = rt_of(request)
         opening = body.do == "open"
+        reading = body.when.startswith("data")
+        if reading and (not body.data or opening):
+            raise HTTPException(400, "按算法读数的触发线要选一项读数，而且只能叫醒 Worker、撤挂单或平仓；要开仓请用价位条件。")
+        if not reading and not body.level > 0:
+            raise HTTPException(400, "价位要大于 0。")
         if not opening and (body.side or body.stop_loss or body.take_profit):
             raise HTTPException(400, "方向、止损、止盈只在「到了就开仓」时填。")
         params = {
@@ -959,7 +972,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             "stop_loss": body.stop_loss, "take_profit": body.take_profit,
             "wake_note": (body.note or "你划的线到了，按现在的行情判断要不要做") if body.do == "wake" else None,
         }
+        if reading:
+            params = {"do": body.do, "wake_note": params["wake_note"], "cooldown_minutes": 15}
         try:
+            if reading:
+                params.update(recorder_params([{"data": body.data, "op": body.when[5:], "level": body.level}]))
             row = rt.watcher.strategies.deploy(rt.config(), body.inst_id.upper(), "trigger", (body.side or "") if opening else "", params, source="user", note=body.note)
         except Rejected as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -968,7 +985,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     @app.post("/api/strategies/{strategy_id}/edit")
     async def strategy_edit(request: Request, strategy_id: int, body: RecorderEdit):
-        """用户直接改一个记录器 / 触发器的数值、间隔，或者把它关掉、打开。"""
+        """用户直接改一条触发线的数值、间隔，或者把它关掉、打开。"""
         rt = rt_of(request)
         try:
             changes = body.model_dump(exclude_none=True)
