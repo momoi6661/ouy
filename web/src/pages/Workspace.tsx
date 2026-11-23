@@ -439,10 +439,10 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             策略库{bookCount ? ` ${bookCount}` : ""}
           </button>
           {booksOpen && <PlaybookPanel env={cfg.env} onClose={() => setBooksOpen(false)} onCount={setBookCount} />}
-          <button className="btn xs" onClick={() => setMemOpen(true)} title="每笔平仓后 Agent 自动复盘写下的经验：模拟盘和实盘各一套，能看、改、删">
-            经验{memCount ? ` ${memCount}` : ""}
+          <button className="btn xs" onClick={() => setMemOpen(true)} title="透视本轮发给大模型的完整上下文，查看并开关工作记忆、目标令、全局偏好与长期经验（暂停保留不丢数据）">
+            记忆与上下文{memCount ? ` ${memCount}` : ""}
           </button>
-          {memOpen && <MemoryPanel coins={cfg.instruments} onClose={() => setMemOpen(false)} onCount={setMemCount} />}
+          {memOpen && <MemoryPanel coins={cfg.instruments} config={cfg} defaultInst={coin} onClose={() => setMemOpen(false)} onCount={setMemCount} onChanged={refresh} />}
           <button className={`btn xs ${permOpen ? "on" : ""}`} onClick={() => setPermOpen(!permOpen)}>
             每类操作单独设 ▾
           </button>

@@ -227,6 +227,8 @@ export interface Lesson {
   source: "review" | "worker" | "user";
   trade?: { side: string; pnl: number; pnl_pct: number; minutes: number; how: string; playbook?: string | null } | null;
   stale?: boolean;
+  /** false = 你暂停了这条经验，保留不删，但不喂给 Worker */
+  enabled?: boolean;
   note?: string;
 }
 export interface LessonList {
@@ -235,6 +237,44 @@ export interface LessonList {
   lessons: Lesson[];
   /** 你定的规矩，两边共用 */
   shared: Lesson[];
+}
+
+export interface WorkerMemoryItem {
+  id: number;
+  ts: number;
+  note: string;
+  enabled?: boolean;
+  pinned?: boolean;
+  price?: number | null;
+  status: "active" | "paused" | "expired";
+  status_reason: string;
+}
+
+export interface PromptBlock {
+  index: number;
+  title: string;
+  tier: number;
+  cached: boolean;
+  chars: number;
+  text: string;
+  truncated?: boolean;
+}
+
+export interface ContextInspect {
+  env: "demo" | "live";
+  inst_id: string;
+  coins: string[];
+  prefs: string[];
+  goals: Record<string, Goal>;
+  memories: Record<string, WorkerMemoryItem[]>;
+  briefs: Record<string, { label: string; enabled: boolean; summary: string; points?: string[]; ts: number }>;
+  prompt: {
+    ts?: number | null;
+    preview_only?: boolean;
+    stats: { prompt_chars?: number; stable_chars?: number };
+    usage?: { input_tokens?: number; output_tokens?: number; cached_tokens?: number; model?: string | null } | null;
+    blocks: PromptBlock[];
+  };
 }
 
 /** 装给 Worker 用的技能：项目 skills 文件夹里的一个子文件夹（里面是 SKILL.md） */
@@ -955,9 +995,14 @@ export const api = {
   levels: (inst: string, bar: string) => get<ChartLevels>(`/api/market/levels?inst_id=${inst}&bar=${bar}`),
   llmModels: () => get<{ models: string[]; default: string }>("/api/llm/models"),
   lessons: () => get<LessonList>("/api/lessons"),
-  saveLesson: (body: { id?: number; scope: "env" | "shared"; inst_id: string; text: string; grade?: "observe" | "rule" }) =>
+  saveLesson: (body: { id?: number; scope: "env" | "shared"; inst_id?: string; text?: string; grade?: "observe" | "rule"; enabled?: boolean }) =>
     request<LessonList>("/api/lessons", { method: "PUT", body: JSON.stringify(body) }),
   deleteLesson: (scope: "env" | "shared", id: number) => request<LessonList>(`/api/lessons/${scope}/${id}`, { method: "DELETE" }),
+  agentContext: (inst = "") => get<ContextInspect>(`/api/agent/context${inst ? `?inst_id=${encodeURIComponent(inst)}` : ""}`),
+  saveWorkerMemory: (body: { inst_id: string; id?: number; note?: string; enabled?: boolean; pinned?: boolean }) =>
+    request<{ inst_id: string; items: WorkerMemoryItem[] }>("/api/agent/memory", { method: "PUT", body: JSON.stringify(body) }),
+  deleteWorkerMemory: (inst: string, id: number) =>
+    request<{ inst_id: string; items: WorkerMemoryItem[] }>(`/api/agent/memory/${encodeURIComponent(inst)}/${id}`, { method: "DELETE" }),
   skills: () => get<SkillList>("/api/skills"),
   readSkill: (id: string) => get<Skill & { content: string }>(`/api/skills/${encodeURIComponent(id)}`),
   installSkill: (body: { name: string; content: string; url: string }) => post<SkillList>("/api/skills", body),

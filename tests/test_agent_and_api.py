@@ -1731,6 +1731,49 @@ async def test_lessons_api_lets_the_user_view_edit_delete_and_keep_shared_rules(
     assert (await client.delete(f"/api/lessons/shared/{r.json()['shared'][0]['id']}")).json()["shared"] == []
 
 
+async def test_context_center_inspects_prompt_and_archives_without_wiping_memory(settings, fake):
+    """记忆与上下文中心：经验与工作记忆均可单条暂停/置顶而不删数据；超 12h 或价格偏离 >5% 的临时笔记自动归档不注入；真实分段提示词可直接透视。"""
+    rt = make_rt(settings, fake, FunctionModel(lambda _m, info: ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, REPORT)])))
+    app = create_app(rt)
+    async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8899") as client:
+        # 1. 长期经验暂停：保留在列表里，但不再注入 brief
+        r = await client.put("/api/lessons", json={"scope": "env", "inst_id": BTC, "text": "支撑刺穿收回时可现价顺势试多", "grade": "rule"})
+        lid = r.json()["lessons"][0]["id"]
+        assert "支撑刺穿收回" in rt.watcher.lessons.brief("demo", BTC)
+        r = await client.put("/api/lessons", json={"id": lid, "scope": "env", "enabled": False})
+        assert r.json()["lessons"][0]["enabled"] is False
+        assert "支撑刺穿收回" not in rt.watcher.lessons.brief("demo", BTC)
+        await client.put("/api/lessons", json={"id": lid, "scope": "env", "enabled": True})
+        assert "支撑刺穿收回" in rt.watcher.lessons.brief("demo", BTC)
+
+        # 2. 工作记忆：记录时带价格，偏离 >5% 自动归档保留（不删库、不喂入），点置顶则常驻生效
+        st = rt.watcher._state(BTC)
+        st.last_px = 60_000.0
+        rt.watcher._remember("demo", BTC, "60000 附近缩量横盘，等突破方向")
+        assert "60000 附近" in rt.watcher._memory_text("demo", BTC)
+        st.last_px = 64_000.0  # 偏离 +6.6% > 5%：自动归档，不删但不再喂给 Worker
+        items = rt.watcher.memory_items("demo", BTC, st.last_px)
+        assert len(items) == 1 and items[0]["status"] == "expired" and rt.watcher._memory_text("demo", BTC) == ""
+        mid = items[0]["id"]
+        r = await client.put("/api/agent/memory", json={"inst_id": BTC, "id": mid, "pinned": True})
+        assert r.status_code == 200 and r.json()["items"][0]["status"] == "active"
+        assert "60000 附近" in rt.watcher._memory_text("demo", BTC)
+
+        # 3. 真实分段上下文透视接口 + Router app_status 工具无过期字段
+        from pydantic_ai import RunContext
+        from pydantic_ai.usage import RunUsage
+        from ouy.agent.core import Deps, app_status
+
+        status_text = await app_status(RunContext(deps=Deps(trader=rt.trader, market=rt.market, gateway=rt.gateway, config=rt.config(), kb=rt.kb, control=rt), model=rt.watcher._model(""), usage=RunUsage()))
+        assert "最短复盘间隔秒" in status_text and "按风格自动" in status_text
+        await rt.watcher.review(BTC, "定时复盘")
+        ctx = (await client.get(f"/api/agent/context?inst_id={BTC}")).json()
+        titles = [b["title"] for b in ctx["prompt"]["blocks"]]
+        assert ctx["inst_id"] == BTC and not ctx["prompt"]["preview_only"]
+        assert "你的工作记忆" in titles and any("长期经验" in t for t in titles) and ctx["prompt"]["stats"]["prompt_chars"] > 100
+        assert (await client.delete(f"/api/agent/memory/{BTC}/{mid}")).json()["items"] == []
+
+
 async def test_router_replaces_outdated_preferences_and_keeps_them_short(settings, fake):
     """用户改口时，Router 把过时的偏好换掉，不让新旧两种说法同时留着；太长的偏好不收（界面上显示不全）。"""
     replies: list[str] = []

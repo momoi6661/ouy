@@ -75,7 +75,7 @@ class Lessons:
         now = now_ms()
         row = {
             "id": seq, "inst_id": inst_id, "text": text, "grade": "rule" if scope == SHARED else grade, "confirms": 0, "refutes": 0,
-            "ts": now, "used_ts": now, "source": source, "trade": trade, "stale": False, "note": "",
+            "ts": now, "used_ts": now, "source": source, "trade": trade, "stale": False, "enabled": True, "note": "",
         }
         self._save(scope, [*rows, row])
         return row, True
@@ -103,8 +103,10 @@ class Lessons:
         self._save(scope, rows)
         return row
 
-    def edit(self, scope: str, lesson_id: int, *, text: str | None = None, grade: str | None = None, inst_id: str | None = None) -> dict[str, Any] | None:
-        """用户在界面上改一条经验：改写、手动升成规矩 / 降回观察。"""
+    def edit(
+        self, scope: str, lesson_id: int, *, text: str | None = None, grade: str | None = None, inst_id: str | None = None, enabled: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """用户在界面上改一条经验：改写、手动升成规矩 / 降回观察、或者暂停 / 恢复启用（不删记忆）。"""
         rows = self.all(scope)
         row = next((r for r in rows if r["id"] == lesson_id), None)
         if row is None:
@@ -115,7 +117,11 @@ class Lessons:
             row["grade"] = grade
         if inst_id is not None:
             row["inst_id"] = inst_id
-        row.update(used_ts=now_ms(), stale=False, note="你手动改过")
+        if enabled is not None:
+            row["enabled"] = bool(enabled)
+            row["note"] = "已恢复启用" if enabled else "已手动暂停，暂不喂给 Worker"
+        else:
+            row.update(used_ts=now_ms(), stale=False, note="你手动改过")
         self._save(scope, rows)
         return row
 
@@ -127,14 +133,30 @@ class Lessons:
         self._save(scope, left)
         return True
 
-    def brief(self, env: str, inst_id: str, rules: int = 8, observes: int = 8) -> str:
-        """给 Worker 看的经验：共用的规矩 + 这个环境里这个币（和不分币种）的规矩、最近的观察。带编号，方便它印证 / 推翻。"""
-        mine = [r for r in self.all(env) if r["inst_id"] in ("", inst_id) and not r.get("stale")]
+    def brief(self, env: str, inst_id: str, rules: int = 8, observes: int = 6) -> str:
+        """给 Worker 看的经验：只取启用中（enabled=True）且未过期的条目；未获印证的零散观察最多带 4 条，防止刷屏淹没核心规矩。"""
+        mine = [r for r in self.all(env) if r["inst_id"] in ("", inst_id) and not r.get("stale") and r.get("enabled", True)]
         by_recent = lambda rows: sorted(rows, key=lambda r: r.get("used_ts", r["ts"]), reverse=True)  # noqa: E731
-        out = [f"- [你定的规矩] {r['text']}" for r in self.all(SHARED)[-rules:]]
+        shared_on = [r for r in self.all(SHARED) if r.get("enabled", True)]
+        out = [f"- [你定的规矩] {r['text']}" for r in shared_on[-rules:]]
         out += [f"- #{r['id']} [规矩，印证 {r['confirms']} 次] {r['text']}" for r in by_recent([r for r in mine if r["grade"] == "rule"])[:rules]]
+        obs_all = sorted(
+            [r for r in mine if r["grade"] == "observe"],
+            key=lambda r: (r.get("confirms", 0) > 0, r.get("used_ts", r["ts"])),
+            reverse=True,
+        )
+        picked_obs: list[dict[str, Any]] = []
+        zero_cnt = 0
+        for r in obs_all:
+            if len(picked_obs) >= observes:
+                break
+            if r.get("confirms", 0) == 0:
+                if zero_cnt >= 4:
+                    continue
+                zero_cnt += 1
+            picked_obs.append(r)
         out += [
             f"- #{r['id']} [观察，印证 {r['confirms']} / 推翻 {r['refutes']}] {r['text']}"
-            for r in by_recent([r for r in mine if r["grade"] == "observe"])[:observes]
+            for r in picked_obs
         ]
         return "\n".join(out)

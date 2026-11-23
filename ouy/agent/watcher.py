@@ -202,6 +202,7 @@ class InstState:
     fast_last: dict[str, Any] | None = None  # 最近一次快判信号和程序怎么处理的（给界面和 Worker 看）
     kb_picks: dict[tuple[str, ...], tuple[float, list[Any]]] = field(default_factory=dict)  # 行情状态对应的查询 → (什么时候查的, 查到的条目)
     prompt_stats: dict[str, int] = field(default_factory=dict)  # 最近一次复盘的提示词有多长、前面不变的那段有多长（查缓存命中用）
+    last_prompt_blocks: list[dict[str, Any]] = field(default_factory=list)  # 最近一次发给大模型的分段真实提示词（供「记忆与上下文」面板透视）
     goal_checked: float = 0.0  # 上次核对目标盈亏的时间
     goal_realized: float = 0.0  # 目标开始以来这个币已实现的盈亏
     waiting: int = 0  # 排在后面等这个 Worker 的事有几件
@@ -1294,7 +1295,7 @@ class Watcher:
             f"【这笔交易（{'模拟盘' if env == 'demo' else '实盘'}）】{facts}",
             f"【用的策略库策略】{book}" if book else "",
             "【这段时间的操作记录】\n" + "\n".join(journal) if journal else "【这段时间的操作记录】没有记录（可能是手动下的单）",
-            "【持仓轨迹（程序记的）】" + "；".join(paths) + "。浮盈到过 0.5R 以上最后却亏了，要说清楚是哪一步没守住：目标太远、该锁没锁、还是入场理由早就失效。" if paths else "",
+            "【持仓轨迹（程序记的）】" + "；".join(paths) + "。浮盈到过 1.5R 以上最后却亏了，要说清楚是哪一步没守住：目标太远、结构反转没走、还是入场理由早就失效。" if paths else "",
             f"【Worker 最近一次的判断】{report.get('summary')}" if report.get("summary") else "",
             "【已有的经验】\n" + known if known else "【已有的经验】还没有",
         ]))
@@ -1312,8 +1313,12 @@ class Watcher:
             row = self.lessons.judge(env, lesson_id, False, facts[:120])
             if row:
                 notes.append(f"推翻了经验 #{lesson_id}" + ("，已删除" if row.get("dropped") else ""))
-        if review.lesson.strip():
-            row, created = self.lessons.add(env, inst_id, review.lesson, source="review", trade=trade)
+        lesson_txt = review.lesson.strip()
+        move_pct = abs(t.close_px - t.open_px) / t.open_px * 100 if t.open_px else 0.0
+        scratch = move_pct < 0.12 and abs(t.pnl) < 0.05  # 原价/保本附近点差手续费微摩擦，不往长期经验库里灌水写新教训
+        coward = bool(re.search(r"不开仓|不入场|观望等待|提高盈亏比门槛|不要把止盈挂到阻力之外", lesson_txt))
+        if lesson_txt and not scratch and not coward:
+            row, created = self.lessons.add(env, inst_id, lesson_txt, source="review", trade=trade)
             notes.append(f"{'新经验' if created else '又印证了经验'} #{row['id']}：{row['text']}")
         text = f"复盘：{facts}。{review.why}" + (" " + "；".join(notes) if notes else "")
         self._note("review", f"{coin} 平仓复盘：{t.pnl:+.2f} USDT", {"why": review.why, "lesson": review.lesson, "trade": trade}, inst_id=inst_id)
@@ -1384,18 +1389,107 @@ class Watcher:
         self._task_agents.clear()
         self._router_agent = self._gate_agent = self._review_agent = None
 
-    # ---------- Worker 的工作记忆（存在 Worker 之外，重启不丢） ----------
+    # ---------- Worker 的工作记忆（存在 Worker 之外，重启不丢，超期或盘面换挡自动归档不删库） ----------
+
+    WORK_MEM_TTL_MS = 12 * 3_600_000
+    WORK_MEM_DRIFT_PCT = 5.0
 
     def memory(self, env: str, inst_id: str) -> list[dict[str, Any]]:
-        return self.store.get(f"worker_mem:{env}:{inst_id}", [])
+        rows = self.store.get(f"worker_mem:{env}:{inst_id}", [])
+        changed = False
+        next_id = max((int(r.get("id") or 0) for r in rows), default=0) + 1
+        for r in rows:
+            if not r.get("id"):
+                r["id"] = next_id
+                next_id += 1
+                changed = True
+            if "enabled" not in r:
+                r["enabled"] = True
+                changed = True
+            if "pinned" not in r:
+                r["pinned"] = False
+                changed = True
+        if changed:
+            self.store.set(f"worker_mem:{env}:{inst_id}", rows)
+        return rows
+
+    def memory_items(self, env: str, inst_id: str, now_px: float = 0.0) -> list[dict[str, Any]]:
+        """带状态标签的工作记忆列表（active 注入中 / paused 已暂停 / expired 超 12h 或偏离 >5% 自动归档保留）。"""
+        now = now_ms()
+        out: list[dict[str, Any]] = []
+        for r in self.memory(env, inst_id):
+            enabled = bool(r.get("enabled", True))
+            pinned = bool(r.get("pinned", False))
+            rec_px = float(r.get("price") or 0.0)
+            age_ms = now - int(r.get("ts") or now)
+            if not enabled:
+                status, reason = "paused", "你已暂停，暂不喂给 Worker"
+            elif not pinned and age_ms > self.WORK_MEM_TTL_MS:
+                status, reason = "expired", "已超 12 小时自动归档（保留记录，不喂入本轮；点置顶可常驻）"
+            elif not pinned and now_px > 0 and rec_px > 0 and abs(now_px / rec_px - 1) * 100 > self.WORK_MEM_DRIFT_PCT:
+                status, reason = "expired", f"当时价 {rec_px:g} 与现价偏离超 5%，自动归档不喂入"
+            else:
+                status, reason = "active", "置顶常驻生效中" if pinned else "生效中（每轮注入上下文）"
+            out.append({**r, "status": status, "status_reason": reason})
+        return out
 
     def _remember(self, env: str, inst_id: str, note: str) -> None:
-        notes = distinct_notes([*self.memory(env, inst_id), {"ts": now_ms(), "note": note}])
-        self.store.set(f"worker_mem:{env}:{inst_id}", notes[-20:])
+        existing = self.memory(env, inst_id)
+        seq = max((int(r.get("id") or 0) for r in existing), default=0) + 1
+        px = self._state(inst_id).last_px if inst_id in self.states else 0.0
+        item = {"id": seq, "ts": now_ms(), "note": note, "enabled": True, "pinned": False, "price": px or None}
+        notes = distinct_notes([*existing, item])
+        self.store.set(f"worker_mem:{env}:{inst_id}", notes[-30:])
+
+    def save_memory(
+        self, env: str, inst_id: str, *, mem_id: int | None = None, note: str | None = None, enabled: bool | None = None, pinned: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = self.memory(env, inst_id)
+        px = self._state(inst_id).last_px if inst_id in self.states else 0.0
+        if mem_id is None:
+            text = " ".join((note or "").split())[:300]
+            if len(text) < 2:
+                raise ValueError("工作记忆内容不能为空")
+            seq = max((int(r.get("id") or 0) for r in rows), default=0) + 1
+            rows.append({
+                "id": seq, "ts": now_ms(), "note": text,
+                "enabled": True if enabled is None else bool(enabled),
+                "pinned": True if pinned is None else bool(pinned),
+                "price": px or None,
+            })
+        else:
+            target = next((r for r in rows if int(r.get("id") or 0) == mem_id), None)
+            if target is None:
+                raise KeyError("没有找到这条工作记忆")
+            if note is not None and " ".join(note.split()):
+                target["note"] = " ".join(note.split())[:300]
+                target["ts"] = now_ms()
+            if enabled is not None:
+                target["enabled"] = bool(enabled)
+                if enabled:
+                    target["ts"] = now_ms()  # 重新启用时刷新活跃时间
+            if pinned is not None:
+                target["pinned"] = bool(pinned)
+        self.store.set(f"worker_mem:{env}:{inst_id}", rows[-30:])
+        self.bus.publish("agent", self.status())
+        return self.memory_items(env, inst_id, px)
+
+    def delete_memory(self, env: str, inst_id: str, mem_id: int) -> bool:
+        rows = self.memory(env, inst_id)
+        left = [r for r in rows if int(r.get("id") or 0) != mem_id]
+        if len(left) == len(rows):
+            return False
+        self.store.set(f"worker_mem:{env}:{inst_id}", left)
+        self.bus.publish("agent", self.status())
+        return True
 
     def _memory_text(self, env: str, inst_id: str, keep: int = 6) -> str:
-        """给 Worker 看的工作记忆：说的是同一件事的只留最新一条，最多 keep 条——同一句话反复出现会让它越想越缩手。"""
-        return "；".join(n["note"] for n in distinct_notes(self.memory(env, inst_id))[-keep:])
+        """给 Worker 看的工作记忆：只注入 active（启用且未过期/或已置顶）的笔记，置顶优先 + 最近 keep 条。"""
+        px = self._state(inst_id).last_px if inst_id in self.states else 0.0
+        active = [n for n in distinct_notes(self.memory_items(env, inst_id, px)) if n.get("status") == "active"]
+        pinned = [n for n in active if n.get("pinned")]
+        recent = [n for n in active if not n.get("pinned")][-keep:]
+        return "；".join(n["note"] for n in [*pinned, *recent])
 
     async def start(self, *, recover_auth: bool = False) -> None:
         if self.running:
@@ -3965,7 +4059,7 @@ class Watcher:
                 "【这个币的各笔仓位】" + "；".join(rows) + "。\n每一笔按它自己的风格管理（周期、止损宽度、持仓时间都按那一笔的风格），操作时带上 lot_id；"
                 "在 lot_verdicts 里对每一笔各给一个结论：继续拿 / 收紧止损 / 调整止盈 / 减仓 / 加仓 / 平仓，并写明理由。"
                 "轨迹里的浮盈最高点按初始止损距离（R）算：浮盈到过一段又回吐，说明原目标可能太远或行情在走弱，要正面回答还拿不拿、目标要不要收近。"
-                "保盈线由程序执行（默认约 0.5R 时把止损移到入场价 + 往返成本），你不用重复做；想给这笔更多回撤空间，就用 deploy_strategy 的 manage 写 lot_id 和 lock_r=0，并说明理由。"
+                "保盈线由程序执行（默认浮盈冲出 1.5R~1.8R 高点后把止损移到入场价 + 往返成本，用户手动单不自动抢改止损），你不用重复做；想给这笔更多回撤空间，就用 deploy_strategy 的 manage 写 lot_id 和 lock_r=0，并说明理由。"
                 "已成交仓位每次复核原止盈是否仍符合本笔结构周期：顺势延续且收盘突破中间阻力/支撑、有新的真实目标，才考虑延伸；"
                 "遇到反向收回、原目标难以到达时，可收近到仍在现价盈利方向的结构位。单根未收影线不是理由。"
                 "有实质变化时用 move_stops(lot_id, take_profit) 只改止盈，保留止损；原目标仍合理就不改单。"
@@ -4130,10 +4224,26 @@ class Watcher:
         )
         lines = [x for x in lines if x]
         lines.sort(key=_cache_tier)  # 稳定排序：同一层里的先后不变
-        self._state(inst_id).prompt_stats = {
+        st_obj = self._state(inst_id)
+        st_obj.prompt_stats = {
             "prompt_chars": sum(len(x) + 1 for x in lines),
             "stable_chars": sum(len(x) + 1 for x in lines if _cache_tier(x) < len(CACHE_TIERS)),
         }
+        inspected: list[dict[str, Any]] = []
+        for idx, blk in enumerate(lines):
+            m_tag = re.match(r"^【([^】]+)】", blk)
+            tier_idx = _cache_tier(blk)
+            inspected.append({
+                "index": idx + 1,
+                "title": m_tag.group(1) if m_tag else ("收尾复盘指令" if blk.startswith("请完成本次复盘") else blk[:24]),
+                "tier": tier_idx,
+                "cached": tier_idx < len(CACHE_TIERS),
+                "chars": len(blk),
+                "text": blk[:4500],
+                "truncated": len(blk) > 4500,
+            })
+        st_obj.last_prompt_blocks = inspected
+        self.store.set(f"ctx_blocks:{cfg.env}:{inst_id}", {"ts": now_ms(), "stats": st_obj.prompt_stats, "blocks": inspected})
         out: list[str] = []
         for i, block in enumerate(lines):
             out.append(block)
@@ -4141,6 +4251,53 @@ class Watcher:
             if tier in STABLE_BREAK_AFTER and (i + 1 == len(lines) or _cache_tier(lines[i + 1]) > tier):
                 out.append(STABLE_MARK)
         return "\n".join(out)
+
+    def context_inspect(self, inst_id: str = "") -> dict[str, Any]:
+        """返回当前环境下 Agent 的完整记忆存储与指定币种最近一轮真实上下文分段透视。"""
+        cfg = self.get_config()
+        env = cfg.env
+        coins = list(cfg.instruments)
+        target = (inst_id.upper() if inst_id else (coins[0] if coins else "BTC-USDT-SWAP"))
+        all_coins = list(dict.fromkeys([*coins, *([target] if target else [])]))
+        st = self._state(target)
+        saved = self.store.get(f"ctx_blocks:{env}:{target}") or {}
+        blocks = st.last_prompt_blocks or saved.get("blocks") or []
+        stats = st.prompt_stats or saved.get("stats") or {}
+        ts = saved.get("ts")
+        if not blocks:  # 还没跑过首轮复盘时，实时拼一份当前静态记忆与规则预览，方便用户立刻核查
+            preview_raw = [
+                f"【品种】{target}（风格：{STYLES[cfg.style_for(target)]['label']}，出手尺度：{STANCES[cfg.stance_for(target)]['label']}）",
+                f"【用户偏好】{cfg.prefs_text()}" if cfg.prefs_text() else "",
+                f"【目标令】{json.dumps(self.goal(env, target), ensure_ascii=False)}" if self.goal(env, target) else "",
+                f"【你的工作记忆】{self._memory_text(env, target)}" if self._memory_text(env, target) else "",
+                self._lessons_text(env, target),
+            ]
+            blocks = [
+                {"index": i + 1, "title": re.match(r"^【([^】]+)】", b).group(1), "tier": _cache_tier(b), "cached": _cache_tier(b) < len(CACHE_TIERS), "chars": len(b), "text": b, "truncated": False}
+                for i, b in enumerate(x for x in preview_raw if x)
+            ]
+            stats = {"prompt_chars": sum(b["chars"] for b in blocks), "stable_chars": sum(b["chars"] for b in blocks if b["cached"])}
+        briefs = {}
+        for role, spec in SUBAGENTS.items():
+            b = self.brief(env, target, role)
+            if b:
+                briefs[role] = {**b, "label": spec["label"], "enabled": cfg.sub_enabled(role)}
+        return {
+            "env": env,
+            "inst_id": target,
+            "coins": all_coins,
+            "prefs": list(cfg.prefs),
+            "goals": {c: self.goal(env, c) for c in all_coins if self.goal(env, c)},
+            "memories": {c: self.memory_items(env, c, self._state(c).last_px) for c in all_coins},
+            "briefs": briefs,
+            "prompt": {
+                "ts": ts,
+                "preview_only": not bool(saved.get("blocks") or st.last_prompt_blocks),
+                "stats": stats,
+                "usage": (st.report or {}).get("usage"),
+                "blocks": blocks,
+            },
+        }
 
     @staticmethod
     def _cost_text(cfg: AgentConfig, min_rr: float, snapshot: dict[str, Any]) -> str:

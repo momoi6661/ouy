@@ -332,8 +332,17 @@ class LessonIn(BaseModel):
     id: int | None = None
     scope: Literal["env", "shared"] = "env"
     inst_id: str = Field("", max_length=40)
-    text: str = Field(min_length=6, max_length=300)
+    text: str | None = Field(None, max_length=300)
     grade: Literal["observe", "rule"] | None = None
+    enabled: bool | None = None
+
+
+class WorkerMemoryIn(BaseModel):
+    inst_id: str = Field(min_length=1, max_length=40)
+    id: int | None = None
+    note: str | None = Field(None, max_length=300)
+    enabled: bool | None = None
+    pinned: bool | None = None
 
 
 class SkillIn(BaseModel):
@@ -404,6 +413,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         yield
         keep_auth.cancel()
         warm.cancel()
+        await asyncio.gather(keep_auth, warm, return_exceptions=True)
         await rt.shutdown()
 
     app = FastAPI(title="Ouy", version=__version__, lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -764,10 +774,37 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         scope = "shared" if body.scope == "shared" else rt.config().env
         books = rt.watcher.lessons
         if body.id is None:
+            if not body.text or len(body.text.strip()) < 6:
+                raise HTTPException(422, "经验内容至少 6 个字")
             books.add(scope, body.inst_id.upper(), body.text, source="user", grade=body.grade or "rule")
-        elif books.edit(scope, body.id, text=body.text, grade=body.grade, inst_id=body.inst_id.upper()) is None:
+        elif books.edit(scope, body.id, text=body.text, grade=body.grade, inst_id=body.inst_id.upper() if body.text is not None else None, enabled=body.enabled) is None:
             raise HTTPException(404, "没有这条经验")
         return _lessons(rt)
+
+    @app.get("/api/agent/context")
+    async def agent_context_get(request: Request, inst_id: str = ""):
+        """透视 Agent 当前保存的全部记忆层（偏好、目标、各币工作记忆、子代理简报）及本轮真实分段上下文。"""
+        return rt_of(request).watcher.context_inspect(inst_id)
+
+    @app.put("/api/agent/memory")
+    async def agent_memory_put(request: Request, body: WorkerMemoryIn):
+        rt = rt_of(request)
+        inst = body.inst_id.upper()
+        try:
+            items = rt.watcher.save_memory(rt.config().env, inst, mem_id=body.id, note=body.note, enabled=body.enabled, pinned=body.pinned)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"inst_id": inst, "items": items}
+
+    @app.delete("/api/agent/memory/{inst_id}/{mem_id}")
+    async def agent_memory_delete(request: Request, inst_id: str, mem_id: int):
+        rt = rt_of(request)
+        inst = inst_id.upper()
+        if not rt.watcher.delete_memory(rt.config().env, inst, mem_id):
+            raise HTTPException(404, "没有这条工作记忆")
+        return {"inst_id": inst, "items": rt.watcher.memory_items(rt.config().env, inst, rt.watcher._state(inst).last_px)}
 
     @app.delete("/api/lessons/{scope}/{lesson_id}")
     async def lessons_delete(request: Request, scope: Literal["env", "shared"], lesson_id: int):
