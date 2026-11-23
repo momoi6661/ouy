@@ -39,7 +39,7 @@ from .core import SUBAGENTS, Deps, build_review_agent, build_adhoc_agent, build_
 from .early_watch import ShiftRetest
 from .signals import KIND as FAST_KIND, FastParams, describe_tape, detect, key_lines, line_status, strengths, structure_shift, trend_run, turn_state, turn_watch
 from .core import STABLE_MARK
-from .plan import REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, major_direction, market_regime, build_candidates, candidates_text, check_plan, far_target, plan_origin, manage_rules, order_params, plan_terms, safe_leverage, same_plan, trade_cost_pct
+from .plan import TURN_BY, REGIME_LABEL, REGIME_PLAYS, RETRY_MINUTES, candidate_rows, major_direction, market_regime, build_candidates, candidates_text, check_plan, far_target, plan_origin, manage_rules, order_params, plan_terms, safe_leverage, same_plan, trade_cost_pct
 
 log = logging.getLogger("ouy.watcher")
 
@@ -131,11 +131,11 @@ ADHOC_PER_10MIN = 6  # 一个币 10 分钟内最多开几个，免得空烧 toke
 MODE_LABEL = {"advise": "只建议不下单", "confirm": "下单前等用户确认", "auto": "全自动执行"}
 
 
-def _trend_text(style: str, snapshot: dict[str, Any]) -> str:
+def _trend_text(style: str, snapshot: dict[str, Any], shift: dict[str, Any] | None = None) -> str:
     """程序先把大方向算好告诉 Worker：按风格看哪两段时间的高低点对比，顺势是做多还是做空。"""
     windows = snapshot.get("windows") or {}
     seen = {name: str(w.get("trend", "")) for name, w in windows.items() if w.get("trend")}
-    major, name = major_direction(snapshot, style)
+    major, name = major_direction(snapshot, style, shift)
     if major:
         side = f"大方向向上（按 {name}）：做多是顺势，做空是逆势" if major == "long" else f"大方向向下（按 {name}）：做空是顺势，做多是逆势"
     else:
@@ -1617,7 +1617,8 @@ class Watcher:
                 broke = st.shift_retest.key[1]
                 self._algo(cfg.env, inst, "turn", ("盘中失守：" if st.shift_retest.stage % 2 else "盘中收回：") + message,
                            "叫醒 Worker 复核" if woke else "只记录（这次转折已经叫醒过一次）",
-                           ("short" if broke == "long" else "long") if st.shift_retest.stage % 2 else broke, prices[inst])
+                           ("short" if broke == "long" else "long") if st.shift_retest.stage % 2 else broke, prices[inst],
+                           sub="盘中失守" if st.shift_retest.stage % 2 else "盘中收回", data={"level": st.shift_retest.key[2], "broke": broke})
                 if woke:
                     retests[inst] = message
                     st.last_retest["wake_ts"] = ts
@@ -1761,12 +1762,15 @@ class Watcher:
 
     ALGOS = {"regime": "行情判断", "run": "连续走线", "cand": "算法候选位", "turn": "转折", "fast": "快判", "lock": "保盈线", "lot": "持仓提醒", "rule": "触发线"}
 
-    def _algo(self, env: str, inst: str, algo: str, text: str, effect: str, side: str = "", px: float = 0.0, atr: float | None = None) -> None:
-        """记一条算法事件：哪个算法在什么价位算出了什么、触发了什么。带方向的会在 15 分钟和 1 小时后核对价格有没有照它说的走。"""
+    def _algo(self, env: str, inst: str, algo: str, text: str, effect: str, side: str = "", px: float = 0.0, atr: float | None = None,
+              *, sub: str = "", data: dict[str, Any] | None = None, score: bool = True) -> None:
+        """记一条算法事件：哪个算法在什么价位算出了什么、触发了什么。带方向的会在 15 分钟和 1 小时后核对价格有没有照它说的走。
+        sub = 这个算法里的哪一类（准确率按它分开算）；data = 算出结论用到的数；score=False = 不是方向判断，不核对对错。"""
         try:
             m = self.strategies.metrics.get(inst) or {}
             st = self.states.get(inst)
-            self.store.add_algo_event(env, inst, algo, side, px or (st.last_px if st else 0.0), atr or (m.get("values") or {}).get("atr") or 0.0, text, effect)
+            self.store.add_algo_event(env, inst, algo, side, px or (st.last_px if st else 0.0), atr or (m.get("values") or {}).get("atr") or 0.0, text, effect,
+                                      {**(data or {}), **({"sub": sub} if sub else {})}, score)
         except Exception as exc:  # noqa: BLE001 - 记不上不能影响交易
             log.warning("算法事件没记上：%s", exc)
 
@@ -1802,15 +1806,40 @@ class Watcher:
             if checks != ev["checks"] or age >= 180:
                 self.store.check_algo_event(ev["id"], checks, "1h" in checks or age >= 180)
 
+    # 这两类不是方向判断（「方向打架」= 没有方向，「苗头」明说还不算转折）：只记录，不算对错
+    ALGO_UNSCORED = {"方向打架", "苗头"}
+    ALGO_FEW = 30  # 核对过的不到这么多条，准确率只能当线索
+
+    @classmethod
+    def algo_sub(cls, ev: dict[str, Any]) -> str:
+        """这条事件属于算法里的哪一类。新记录直接带着；旧记录从文字里认。"""
+        sub = (ev.get("data") or {}).get("sub")
+        if sub:
+            return str(sub)
+        algo, text = cls.ALGO_MERGED.get(ev["algo"], ev["algo"]), str(ev.get("text") or "")
+        if algo == "regime":
+            head = text.split("：", 2)[1] if text.startswith("启动后第一次判断：") else text.split("：", 1)[0].split(" → ")[-1]
+            return head if head in REGIME_LABEL.values() else ""
+        if algo == "cand":
+            return "回测亏的打法" if "亏" in str(ev.get("effect") or "") else "合格候选"
+        if algo == "turn":
+            return next((k for k in ("苗头", "确认", "盘中失守", "盘中收回") if text.startswith(k)), "")
+        return ""
+
     def algo_report(self, env: str, inst: str) -> dict[str, Any]:
         events = [{**ev, "algo": self.ALGO_MERGED.get(ev["algo"], ev["algo"])} for ev in self.store.algo_events(env, inst, 400)]
         stats: dict[str, dict[str, int]] = {}
+        subs: dict[str, dict[str, dict[str, int]]] = {}
         for ev in events:
+            ev["sub"] = self.algo_sub(ev)
+            ev["scored"] = ev["sub"] not in self.ALGO_UNSCORED
             got = (ev["checks"].get("15m") or {}).get("ok")
-            if got:
+            if got and ev["scored"]:
                 s = stats.setdefault(ev["algo"], {"right": 0, "wrong": 0, "flat": 0})
                 s[got] += 1
-        return {"events": events[:200], "stats": stats, "labels": self.ALGOS, "layers": self.ALGO_LAYERS}
+                if ev["sub"]:
+                    subs.setdefault(ev["algo"], {}).setdefault(ev["sub"], {"right": 0, "wrong": 0, "flat": 0})[got] += 1
+        return {"events": events[:200], "stats": stats, "subs": subs, "few": self.ALGO_FEW, "labels": self.ALGOS, "layers": self.ALGO_LAYERS}
 
     def _algo_rows(self, cfg: AgentConfig, inst: str, st: InstState) -> list[dict[str, Any]]:
         """每个算法现在在不在跑、上次算是什么时候、读数是什么：给界面的「算法」页。"""
@@ -2122,8 +2151,17 @@ class Watcher:
                      "candidates": candidate_rows(rows, style), "holding": bool(pos)}
         if (was.get("kind"), was.get("side")) != (regime["kind"], regime["side"]):
             plays = "、".join(REGIME_PLAYS[regime["kind"]]) or "不出候选"
-            head = f"{was['label']} → {REGIME_LABEL[regime['kind']]}" if was else f"启动后第一次判断：{REGIME_LABEL[regime['kind']]}"
-            self._algo(cfg.env, inst_id, "regime", f"{head}：{regime['why']}", f"候选改成：{plays}", regime["side"])
+            label, word = REGIME_LABEL[regime["kind"]], {"long": "向上", "short": "向下"}
+            seen = was or self._last_regime(cfg.env, inst_id)  # 刚启动：和重启前记的那一条比
+            if (seen.get("kind"), seen.get("side")) != (regime["kind"], regime["side"]):
+                if not seen:
+                    head = f"第一次判断：{label}"
+                elif seen.get("kind") == regime["kind"]:  # 状态没变，变的是方向：写明从哪边变到哪边
+                    head = f"{label}（方向由{word.get(seen.get('side') or '', '不明')}变{word.get(regime['side'], '不明')}）"
+                else:
+                    head = f"{seen.get('label') or REGIME_LABEL.get(seen.get('kind') or '', '')} → {label}"
+                self._algo(cfg.env, inst_id, "regime", f"{head}：{regime['why']}", f"候选改成：{plays}", regime["side"],
+                           sub=label, data=self._regime_basis(snapshot, style, regime, shift), score=regime["kind"] in ("trend", "reversal"))
         # 新出现的合格候选（同一条打法、同一个方向之前没有）：记下来，之后核对价格有没有照它的方向走
         had = {(c["strategy"], c["side"]) for c in was.get("candidates") or [] if c["ok"]}
         for c in st.regime["candidates"]:
@@ -2131,8 +2169,29 @@ class Watcher:
                 goals = " / ".join(f"{t:g}" for t in c["targets"])
                 self._algo(cfg.env, inst_id, "cand",
                            f"{c['strategy']}{'做多' if c['side'] == 'long' else '做空'}：入场 {c['entry']:g}，止损 {c['stop']:g}，目标 {goals}，扣费后盈亏比 {c['net_rr']:g}",
-                           "回测扣费后亏：只给 Worker 参考，它要写出额外依据才能用" if c["losing"] else "给 Worker 当候选，不下单", c["side"])
+                           "回测扣费后亏：只给 Worker 参考，它要写出额外依据才能用" if c["losing"] else "给 Worker 当候选，不下单", c["side"],
+                           sub="回测亏的打法" if c["losing"] else "合格候选",
+                           data={"strategy": c["strategy"], "how": c["how"], "regime": regime["kind"], "align": c["align"], "net_rr": c["net_rr"], "evidence": c["evidence"]})
         return rows
+
+    def _last_regime(self, env: str, inst_id: str) -> dict[str, Any]:
+        """库里这个品种最近一条行情判断：重启后的第一次判断和它一样就不再记一遍。"""
+        ev = next((e for e in self.store.algo_events(env, inst_id, 60) if e["algo"] == "regime"), None)
+        if not ev:
+            return {}
+        label = self.algo_sub(ev)
+        kind = (ev.get("data") or {}).get("kind") or next((k for k, v in REGIME_LABEL.items() if v == label), "")
+        return {"kind": kind, "side": ev["side"], "label": label} if kind else {}
+
+    @staticmethod
+    def _regime_basis(snapshot: dict[str, Any], style: str, regime: dict[str, Any], shift: dict[str, Any] | None = None) -> dict[str, Any]:
+        """行情判断用到的数：大方向按哪一段定的、比的是哪两段的高低点，结构周期的结构和 ADX。记进事件，事后能查。"""
+        major, by = major_direction(snapshot, style, shift)
+        win = (snapshot.get("windows") or {}).get(by) or {}
+        tf = (snapshot.get("timeframes") or {}).get(STYLES[style]["struct_bar"]) or {}
+        return {"kind": regime["kind"], "major": major, "major_by": by, "window_trend": win.get("trend"), **({"level": shift.get("level")} if by == TURN_BY and shift else {}),
+                "prev_high": win.get("prev_high"), "prev_low": win.get("prev_low"), "struct_bar": STYLES[style]["struct_bar"],
+                "structure": tf.get("structure"), "adx": tf.get("adx14")}
 
     async def _algo_tick(self, cfg: AgentConfig, inst_id: str, st: InstState, pos: Position | None = None, *, notify: bool = True) -> None:
         """算法自己的时钟：每走完一根结构周期 K 线重算一次行情判断和候选位，不等 Worker 复盘、不花模型调用。
@@ -2238,9 +2297,11 @@ class Watcher:
                 elif self._has_resting_plan(cfg, inst_id):
                     effect = "叫醒 Worker 复核已有计划"
                 self._algo(cfg.env, inst_id, "turn", f"确认（{shift_now['kind']}）：{shift_now['why']}" + (f"。之前{swept['why']}" if swept else ""),
-                           effect, shift_now["side"], px, atr5)
+                           effect, shift_now["side"], px, atr5, sub="确认",
+                           data={"kind": shift_now["kind"], "level": shift_now.get("level"), "origin": shift_now.get("origin"), "extreme": shift_now.get("extreme")})
             elif turn and turn["stage"] == 2 and (turn["side"], turn["stage"], turn["ts"]) != (was.get("side"), was.get("stage"), was.get("ts")):
-                self._algo(cfg.env, inst_id, "turn", f"苗头：{turn['text']}", "写进 Worker 的输入，不叫醒、不下单", turn["side"], px, atr5)
+                self._algo(cfg.env, inst_id, "turn", f"苗头：{turn['text']}", "写进 Worker 的输入，不叫醒、不下单", turn["side"], px, atr5,
+                           sub="苗头", data={"stage": turn["stage"]}, score=False)
         if shift_now and shift_now.get("ts") == (prior.get("shift") or {}).get("ts"):
             values["shift_failure"] = prior.get("values", {}).get("shift_failure")
         qmode, qbias = cfg.quant_mode_for(inst_id), cfg.quant_bias_for(inst_id)
@@ -3624,7 +3685,7 @@ class Watcher:
             f"{'允许' if r.allow_averaging_down else '禁止'}亏损加仓；当日亏损上限 {r.max_daily_loss_pct:g}%",
             f"【叫醒原因】{reason}",
             f"【现在时间】{time.strftime('%Y-%m-%d %H:%M:%S')}（本地时间）",
-            _trend_text(cfg.style_for(inst_id), snapshot),
+            _trend_text(cfg.style_for(inst_id), snapshot, self.strategies.fresh_metrics(cfg.env, inst_id).get("shift")),
             self._cost_text(cfg, stance["min_rr"], snapshot),
         ]
         qmode, qbias = cfg.quant_mode_for(inst_id), cfg.quant_bias_for(inst_id)

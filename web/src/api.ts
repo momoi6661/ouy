@@ -10,8 +10,17 @@ export function permissionFor(cfg: { mode: Mode; auto_exit: boolean; permissions
   if (cfg.mode === "confirm" && !(cfg.auto_exit && ["reduce", "close", "cancel_orders"].includes(kind))) return "confirm";
   return "auto";
 }
-export interface AlgoEvent { id: number; ts: number; algo: string; side: string; px: number; text: string; effect: string; checks: Record<string, { px: number; move: number; ok: "right" | "wrong" | "flat" }> }
-export interface AlgoReport { events: AlgoEvent[]; stats: Record<string, { right: number; wrong: number; flat: number }>; labels: Record<string, string>; layers?: Record<string, string> }
+export interface AlgoEvent {
+  id: number; ts: number; algo: string; side: string; px: number; text: string; effect: string;
+  checks: Record<string, { px: number; move: number; ok: "right" | "wrong" | "flat" }>;
+  /** 这条属于算法里的哪一类；scored=false 的不是方向判断，不算对错；data 是算出结论用到的数。 */
+  sub?: string; scored?: boolean; data?: Record<string, unknown>;
+}
+export interface AlgoTally { right: number; wrong: number; flat: number }
+export interface AlgoReport {
+  events: AlgoEvent[]; stats: Record<string, AlgoTally>; subs?: Record<string, Record<string, AlgoTally>>; few?: number;
+  labels: Record<string, string>; layers?: Record<string, string>;
+}
 /** 算法这一轮给 Worker 的一条入场候选（入场 / 止损 / 目标都核过算术），以及这条打法机械照做的回测成绩。 */
 export interface Candidate {
   strategy: string; basis: string; align: string; side: "long" | "short"; how: string; entry: number; stop: number; targets: number[];

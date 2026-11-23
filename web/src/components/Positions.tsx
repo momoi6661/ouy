@@ -419,7 +419,7 @@ function StopsModal({ pos, current, onClose, onSubmit }: { pos: Position; curren
   return (
     <Modal title={`${shortInst(pos.inst_id)} 整仓止盈止损`} onClose={onClose}>
       <p className="muted small">
-        {pos.side === "long" ? "多" : "空"}单均价 {fmtPx(pos.avg_px)}，现价 {fmtPx(pos.mark_px)}。止损只能收紧，放宽会被风控拒绝。
+        {pos.side === "long" ? "多" : "空"}单均价 {fmtPx(pos.avg_px)}，现价 {fmtPx(pos.mark_px)}。你手动改的不过风控，可以放宽；只查有没有放错边。
       </p>
       <StopsEditor inst={pos.inst_id} side={pos.side} entry={pos.avg_px} leverage={pos.leverage} contracts={pos.contracts} sl={sl} tp={tp} setSl={setSl} setTp={setTp} breakeven stack />
       <div className="modal-foot">

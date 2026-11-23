@@ -1,10 +1,10 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { api, EFFORTS, KIND_LABEL, fmtPx, fmtUsd, shortInst, shotUrl, STATUS_LABEL, type ActionResult, type Activity, type ChatMessage, type Effort, type PlanPreview, type AgentConfig, type AgentStatus, type UiCommand } from "../api";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { api, EFFORTS, KIND_LABEL, fmtPx, fmtTime, fmtUsd, shortInst, shotUrl, STATUS_LABEL, type ActionResult, type Activity, type ChatMessage, type Effort, type PlanPreview, type AgentConfig, type AgentStatus, type UiCommand } from "../api";
 import { Markdown } from "./Markdown";
 import { toast, useStored } from "./ui";
 import { Composer } from "./Composer";
 import { ErrorDetails } from "./ErrorDetails";
-import { Earlier, RunCard, liveKey, settleTurns, toTurns, useLiveText, useRecent, type Turn } from "./AgentRun";
+import { AVATAR, Earlier, NAME, RunCard, liveKey, settleTurns, toTurns, useLiveText, useRecent, type Turn } from "./AgentRun";
 
 /** 图上正在展示的那份方案 */
 export interface ShownPlan {
@@ -49,27 +49,149 @@ const PLAN_STATE: Record<string, string> = {
 };
 
 /** 盯盘页里的 Agent 对话区：每个币种一段独立的对话，开仓 / 加仓以方案卡片的形式给出，点确认才下单。 */
-/** 工具调用折叠成一排小卡片，点开才看参数和返回 */
-function StepChips({ steps }: { steps: { label: string; args?: Record<string, any>; result?: string; ok?: boolean }[] }) {
-  const [open, setOpen] = useState<number | null>(null);
-  const x = open == null ? null : steps[open];
+/** 回答里用到的工具：和 Worker 运行卡片同一种样子——收成一行「N 步：……」，点开一步一行，再点看参数和返回 */
+function MsgSteps({ steps }: { steps: { label: string; args?: Record<string, any>; result?: string; ok?: boolean }[] }) {
+  const [open, setOpen] = useState(false);
+  const [detail, setDetail] = useState<number | null>(null);
+  const name = (label: string) => label.replace(/（.*$/, "").replace("触发器", "触发线"); // 旧消息里存的名字还叫触发器
+  const names = [...new Set(steps.map((st) => name(st.label)))];
+  const brief = (args?: Record<string, any>) =>
+    Object.entries(args || {})
+      .filter(([, v]) => v != null && typeof v !== "object")
+      .slice(0, 3)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(" ");
   return (
-    <>
-      <div className="chips">
-        {steps.map((st, k) => (
-          <button key={k} type="button" className={`chip ${open === k ? "on" : ""} ${st.ok === false ? "bad" : ""}`} onClick={() => setOpen(open === k ? null : k)}>
-            {st.label}
-          </button>
-        ))}
+    <div className="run-steps">
+      <button type="button" className="run-fold" onClick={() => setOpen(!open)}>
+        {open ? "▾" : "▸"} {steps.length} 步{open ? "" : `：${names.slice(0, 5).join("、")}${names.length > 5 ? "…" : ""}`}
+      </button>
+      {open && (
+        <ol>
+          {steps.map((st, k) => (
+            <li key={k} className={`run-step ${st.ok === false ? "bad" : "ok"}`}>
+              <button type="button" onClick={() => setDetail(detail === k ? null : k)}>
+                <i className="dot" />
+                <b>{name(st.label)}</b>
+                <span>{brief(st.args)}</span>
+              </button>
+              {detail === k && (
+                <div className="step-detail">
+                  {Object.keys(st.args || {}).length > 0 && <p>参数：{JSON.stringify(st.args)}</p>}
+                  {st.result ? <pre>{st.result}</pre> : <p>没有记到返回</p>}
+                </div>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+/** Agent 的一条回答：和运行卡片同一种样子——左边头像，上面一行名字和时间，下面一个框；框里先是挂在它下面的 Worker，再是它自己的步骤和正文 */
+function AiCard({ m, brief, kids, children }: { m: ChatMessage; brief: boolean; kids?: ReactNode; children?: ReactNode }) {
+  const [full, setFull] = useState(false);
+  const worker = !!m.from && m.from !== "router";
+  const who = worker ? (m.from!.includes("-") ? `${shortInst(m.from!.replace(" Worker", ""))} Worker` : m.from!) : "Router";
+  const long = m.text.length > 220 || m.text.split("\n").length > 5;
+  return (
+    <div className={`msg agent ag-${worker ? "worker" : "router"}`}>
+      <i className="ava">{worker ? "W" : "R"}</i>
+      <div className="col">
+        <div className="meta">
+          <b>{who}</b>
+          {m.ts ? <time>{fmtTime(m.ts)}</time> : null}
+          {m.proactive && <span className="run-state">主动汇报</span>}
+        </div>
+        <div className="bub">
+          {kids}
+          {m.steps && m.steps.length > 0 && <MsgSteps steps={m.steps} />}
+          {m.text && (
+            <div className={`body ${brief && long && !full ? "clamp" : ""}`}>
+              <Markdown text={m.text} />
+            </div>
+          )}
+          {brief && long && (
+            <button type="button" className="run-fold" onClick={() => setFull(!full)}>
+              {full ? "收起" : "展开全文"}
+            </button>
+          )}
+          {children}
+        </div>
       </div>
-      {x && (
-        <div className="step-detail">
-          <b>{x.label}</b>
-          {Object.keys(x.args || {}).length > 0 && <p>{JSON.stringify(x.args)}</p>}
-          {x.result && <pre>{x.result}</pre>}
+    </div>
+  );
+}
+
+/** 挂在 Router 卡片里的一个 Worker：干完默认收成一行（头像、名字、时间、一句结论），点开就地看步骤和全文；↗ 去它自己的对话看详细 */
+function KidRow({ t, active, card, onJump }: { t: Turn; active: boolean; card: ReactNode; onJump?: () => void }) {
+  const [picked, setPicked] = useState<boolean | null>(null);
+  const waiting = t.asks.length > 0 && !t.done;
+  const open = picked ?? (active || waiting);
+  const who = `${t.inst && t.agent === "worker" ? `${shortInst(t.inst)} ` : ""}${NAME[t.agent] ?? t.agent}`;
+  const line = (t.error ? `出错：${t.error}` : t.body || t.trigger || "").split("\n").map((x) => x.replace(/[*#`>]/g, "").replace(/^\s*[-•]\s*/, "").trim()).find(Boolean) ?? "";
+  const jump = onJump && (
+    <button type="button" className="kid-jump" title={`去 ${who} 的对话看详细`} aria-label={`去 ${who} 的对话看详细`} onClick={onJump}>
+      ↗
+    </button>
+  );
+  if (!open) {
+    return (
+      <div className={`kid-row ${t.error ? "bad" : ""}`}>
+        <button type="button" className="kid-line" title="展开看步骤和全文" onClick={() => setPicked(true)}>
+          <i className="kid-caret">▸</i>
+          <i className="ava sm">{AVATAR[t.agent] ?? "W"}</i>
+          <b>{who}</b>
+          <time>{fmtTime(t.endTs ?? t.ts)}</time>
+          <span>{line}</span>
+        </button>
+        {jump}
+      </div>
+    );
+  }
+  return (
+    <div className="kid-open">
+      {card}
+      {!active && (
+        <div className="kid-bar">
+          <button type="button" className="run-fold" onClick={() => setPicked(false)}>
+            ▴ 收起
+          </button>
+          {jump}
         </div>
       )}
-    </>
+    </div>
+  );
+}
+
+/** 一张 Router 卡片，里面挂着同一批 Worker 干活的卡片。每个 Worker 默认收成一行；条数多了只摆最近 8 条，更早的点开再看 */
+function WorkerBox({ list, busy, card }: { list: Turn[]; busy: number; card: (t: Turn) => ReactNode }) {
+  const [all, setAll] = useState(false);
+  const keep = 8;
+  const shown = all ? list : list.slice(-keep);
+  return (
+    <div className={`msg agent ag-router ${busy ? "running" : ""}`}>
+      <i className="ava">R</i>
+      <div className="col">
+        <div className="meta">
+          <b>Router</b>
+          <time>{fmtTime(shown[0].ts)}</time>
+          <span className={`run-state ${busy ? "run" : ""}`}>
+            {busy > 0 && <i className="spin" />}
+            {busy ? `${busy} 个 Worker 在干活` : list.length > 1 ? `${list.length} 个 Worker 汇报` : "Worker 汇报"}
+          </span>
+        </div>
+        <div className="bub">
+          {list.length > keep && (
+            <button type="button" className="run-fold" onClick={() => setAll(!all)}>
+              {all ? "▾ 只看最近 8 条" : `▸ 更早的 ${list.length - keep} 条`}
+            </button>
+          )}
+          {shown.map(card)}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -113,6 +235,8 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const current = useRef(activeThread);
   current.current = activeThread;
   const readId = useRef(0);
+  // 已经发出去、回答还没回来的话：后端要等回答出来才把这一问一答存下来，中途重新读历史时得把它们接回去，不然这句话会从页面上消失
+  const outbox = useRef<(ChatMessage & { thread: string })[]>([]);
 
   const load = async (thread = current.current) => {
     if (thread !== current.current) return;
@@ -120,7 +244,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     try {
       const r = await api.chatLog(thread);
       if (current.current === thread && readId.current === id) {
-        setMsgs(r.messages);
+        setMsgs([...r.messages, ...outbox.current.filter((o) => o.thread === thread)]);
         return r.messages;
       }
     } catch {
@@ -199,21 +323,29 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     if (target !== to) setTo(target);
     if (content === text) setText("");
     followLatest.current = true;
-    setMsgs((m) => [...m, { role: "user", text: message, to: target, images }]);
+    // 带上发出的时间：不带的话它会排到这之后 Worker 自己那几轮的前面，看起来像没发出去
+    const sent = { role: "user" as const, text: message, to: target, images, ts: Date.now(), thread };
+    const settle = () => {
+      outbox.current = outbox.current.filter((o) => o !== sent);
+    };
+    outbox.current.push(sent);
+    if (current.current === thread) setMsgs((m) => [...m, sent]);
     setSending((n) => {
       if (n === 0) sentAfter.current = lastActivity.current;
       return n + 1;
     });
     try {
       const r = await api.chat(message, effort, thread, inst, target, false, images);
+      settle();
       if (r.steered) toast("它正在思考，这句话已直接送进它当前这一轮，回答随这一轮的结论发在这里", "ok");
-      else await load(thread);
+      await load(thread);
       if (r.ui?.length) {
         if (r.ui.some((c) => c.type === "select_inst" && c.inst_id !== chartInst)) pinned.current = true;
         onUi(r.ui);
       }
       onActed();
     } catch (e: any) {
+      settle();
       const history = await load(thread);
       if (current.current === thread && !history?.[history.length - 1]?.error) setMsgs((m) => [...m, { role: "ai", text: `出错了：${e.message}` }]);
     } finally {
@@ -372,16 +504,23 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
   const workerBusy = !!(agent?.instruments[inst]?.busy || agent?.instruments[inst]?.reviewing);
 
   // Agent 的运行过程直接显示在对话里。对 Worker 的这一段：它自己被叫醒的每一轮（定时看盘、计划线到了、算法事件）按时间插在对话中间；
-  // 对 Router 的这一段：只放正在跑的（Router 自己这一轮，以及此刻正在思考的 Worker），跑完由正式的回答接上
+  // 对 Router 的这一段：正在跑的（Router 自己这一轮，以及此刻正在思考的 Worker），加上各个 Worker 跑完的结论
   const live = useLiveText();
   const turns = useMemo(() => (activity && agent ? settleTurns(toTurns(activity), agent) : []), [activity, agent]);
   const mine = (t: Turn) => t.user === undefined && (to === "worker" ? t.agent === "worker" && t.inst === inst : t.agent === "router" || t.agent === "worker" || t.agent === "general");
   const latestOpen = new Map<string, string>();
   for (const t of turns) if (t.user === undefined && !t.done) latestOpen.set(liveKey(t), t.key);
   const isActive = (t: Turn) => !t.done && latestOpen.get(liveKey(t)) === t.key;
-  const running = turns.filter((t) => mine(t) && (isActive(t) || (busy && t.id > sentAfter.current && (to === "router" || t.byUser))));
+  const busyRun = (t: Turn) => busy && t.id > sentAfter.current;
+  const running = turns.filter((t) => mine(t) && (to === "router" ? t.agent === "router" : true) && (isActive(t) || (busyRun(t) && (to === "router" || t.byUser))));
+  // 对 Router 的这一段：Worker 干活挂在 Router 的卡片里面。Router 交出去的那几轮挂在它正在跑的这张卡片里，跑完挂到它那条回答里；
+  // Worker 自己被叫醒的（定时看盘、线到了、算法事件）收在一张「Worker 汇报」的 Router 卡片里，干完留着，不跟着「思考中」一起消失。没变化跳过的不放
+  const kid = (t: Turn) => to === "router" && mine(t) && t.agent !== "router";
+  const liveKids = turns.filter((t) => kid(t) && t.byRouter && busyRun(t));
+  const side = turns.filter((t) => kid(t) && !t.byUser && !liveKids.includes(t) && (isActive(t) || (t.done && !t.skipped && !!(t.body || t.error || t.asks.length)))).slice(-30);
+  // 对 Worker 的这一段：它自己被叫醒的每一轮按时间插在对话中间
   const past = to === "worker" ? turns.filter((t) => mine(t) && t.done && !t.byUser && !running.includes(t)).slice(-30) : [];
-  type Item = { ts: number; m?: ChatMessage; i: number; t?: Turn };
+  type Item = { ts: number; m?: ChatMessage; i: number; t?: Turn; group?: Turn[]; kids?: Turn[] };
   const items: Item[] = [];
   let lastTs = 0;
   msgs.forEach((m, i) => {
@@ -393,9 +532,38 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
     const k = items.findIndex((x) => x.ts > at);
     items.splice(k < 0 ? items.length : k, 0, { ts: at, t, i: -1 });
   }
+  const sameBatch = (g: Turn[], t: Turn) => g.some(isActive) || t.ts <= Math.max(...g.map((x) => x.endTs ?? x.ts)) + 60_000;
+  for (const t of side) {
+    const at = isActive(t) ? Infinity : t.endTs ?? t.ts;
+    const k = items.findIndex((x) => x.ts > at);
+    const end = k < 0 ? items.length : k;
+    // 一问一答是回答出来时一起存的（时间相同）：Router 交出去的那一轮结束得比它早，挂到那条回答里
+    if (t.byRouter && items[end]?.m?.role === "user" && items[end + 1]?.m?.role === "ai") (items[end + 1].kids ??= []).push(t);
+    // 汇报一次出一张卡片；同一批的（上一个还在干活或刚汇报完一分钟内又来一个）放进同一张
+    else if (items[end - 1]?.group && sameBatch(items[end - 1].group!, t)) items[end - 1].group!.push(t);
+    else if (items[end]?.group && at >= Math.min(...items[end].group!.map((x) => x.ts)) - 60_000) items[end].group!.push(t); // 后开工的先干完：和还在后面的那一批是同一批
+    else items.splice(end, 0, { ts: at, group: [t], i: -1 });
+  }
   const recent = useRecent(items, 30);
   const lastRun = past[past.length - 1];
+  const lastMsg = msgs.length - 1;
   const runCard = (t: Turn) => <RunCard key={t.key} t={t} active={isActive(t)} live={isActive(t) ? live[liveKey(t)] : undefined} brief={t !== lastRun && !isActive(t)} />;
+  const toWorker = (id: string) => {
+    pinned.current = false;
+    setTo("worker");
+    setThread(id);
+    onUi([{ type: "select_inst", inst_id: id }]);
+  };
+  const kidCard = (t: Turn) => (
+    <KidRow
+      key={t.key}
+      t={t}
+      active={isActive(t)}
+      onJump={t.agent === "worker" && t.inst ? () => toWorker(t.inst) : undefined}
+      card={<RunCard t={t} nested active={isActive(t)} live={isActive(t) ? live[liveKey(t)] : undefined} brief={false} onPick={(id) => onUi([{ type: "select_inst", inst_id: id }])} />}
+    />
+  );
+  const workerBox = (key: string, list: Turn[]) => <WorkerBox key={key} list={list} busy={list.filter(isActive).length} card={kidCard} />;
   const samples = [`${name} 现在能做多还是做空？给我一个方案`, `帮我做多 ${name}，投 200 U`, "看一下我的持仓，要不要动", "把止损移到保本"];
 
   return (
@@ -458,7 +626,7 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
         if (el.clientHeight > 0) followLatest.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       }}>
         <div className="chat-messages" ref={content}>
-        {items.length === 0 && running.length === 0 && !busy && (
+        {items.length === 0 && running.length === 0 && liveKids.length === 0 && !busy && (
           <div className="chat-empty">
             <div className="chips">
               {samples.map((s) => (
@@ -470,17 +638,12 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
           </div>
         )}
         <Earlier count={recent.earlier} onMore={recent.more} />
-        {recent.visible.map(({ m, i, t }) => t ? runCard(t) : m && (
-          <div key={i} className={`bubble ${m.role} ${m.proactive ? "proactive" : ""}`}>
-            {m.role === "ai" && (
-              <div className="bubble-from">
-                <i className={`ava sm ${m.from ? "" : "router"}`}>{m.from ? "W" : "R"}</i>
-                {m.from ? shortInst(m.from.replace(" Worker", "")) + " Worker" : "Router"}
-              </div>
-            )}
-            {m.role === "user" && m.to === "worker" && <div className="bubble-from">直接对 Worker 说</div>}
-            {m.steps && m.steps.length > 0 && <StepChips steps={m.steps} />}
-            {m.role === "ai" ? <Markdown text={m.text} /> : <div className="bubble-text">{m.text}</div>}
+        {recent.visible.map(({ m, i, t, group, kids }) => {
+          if (t) return runCard(t);
+          if (group) return workerBox(`g${group[0].key}`, group);
+          if (!m) return null;
+          const extras = (
+            <>
             {m.error && <ErrorDetails error={m.error} />}
             {!!m.images?.length && (
               <div className="msg-shots">
@@ -529,12 +692,37 @@ export function ChatPanel({ inst: chartInst, defaultEffort, shown, onShow, onAct
                 </div>
               ),
             )}
-          </div>
-        ))}
-        {running.map(runCard)}
-        {busy && !running.length && (
-          <div className="bubble ai thinking">
-            <span className="run-wait"><i /><i /><i /><span>{to === "worker" ? `${name} Worker` : "Router"} 思考中</span></span>
+            </>
+          );
+          if (m.role === "ai") return <AiCard key={i} m={m} brief={i !== lastMsg} kids={kids?.map(kidCard)}>{extras}</AiCard>;
+          return (
+            <div key={i} className="bubble user">
+              <div className="bubble-text">{m.text}</div>
+              {extras}
+            </div>
+          );
+        })}
+        {running.map((t, k) =>
+          to === "router" ? (
+            <RunCard key={t.key} t={t} active={isActive(t)} live={isActive(t) ? live[liveKey(t)] : undefined}>
+              {k === 0 && liveKids.map(kidCard)}
+            </RunCard>
+          ) : (
+            runCard(t)
+          ),
+        )}
+        {to === "router" && !running.length && liveKids.length > 0 && workerBox("live", liveKids)}
+        {busy && !running.length && !liveKids.length && (
+          <div className={`msg agent ag-${to} running`}>
+            <i className="ava">{to === "worker" ? "W" : "R"}</i>
+            <div className="col">
+              <div className="meta">
+                <b>{to === "worker" ? `${name} Worker` : "Router"}</b>
+              </div>
+              <div className="bub">
+                <span className="run-wait"><i /><i /><i /><span>思考中</span></span>
+              </div>
+            </div>
           </div>
         )}
         </div>

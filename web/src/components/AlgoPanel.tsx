@@ -2,6 +2,25 @@ import { Fragment, useEffect, useState } from "react";
 import { api, fmtPx, fmtTime, type AlgoReport, type BacktestGroup, type BacktestReport, type CacheStats, type InstStatus } from "../api";
 
 const VERDICT: Record<string, [string, string]> = { right: ["对", "ok"], wrong: ["错", "bad"], flat: ["没动", "flat"] };
+const SIDE: Record<string, string> = { long: "向上", short: "向下" };
+const STRUCT: Record<string, string> = { uptrend: "上涨", downtrend: "下跌", range: "横盘" };
+
+/** 事件里记下的依据，拼成一行：大方向按哪一段定的、比的是哪两个价位，结构和 ADX。 */
+function basis(d: Record<string, unknown> | undefined): string {
+  if (!d) return "";
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const out: string[] = [];
+  if (d.major_by) out.push(`大方向按 ${d.major_by} 定：${SIDE[String(d.major)] ?? "不明"}${d.window_trend ? `（${String(d.window_trend).split("（")[0]}）` : ""}`);
+  else if ("major" in d) out.push("各周期都没给出大方向");
+  if (num(d.prev_high) !== null && num(d.prev_low) !== null) out.push(`上一段高 ${fmtPx(num(d.prev_high)!)} / 低 ${fmtPx(num(d.prev_low)!)}`);
+  if (d.struct_bar && d.structure) out.push(`${d.struct_bar} 结构 ${STRUCT[String(d.structure)] ?? d.structure}`);
+  if (num(d.adx) !== null) out.push(`ADX ${num(d.adx)!.toFixed(0)}`);
+  if (num(d.level) !== null) out.push(`越过的摆动点 ${fmtPx(num(d.level)!)}`);
+  if (num(d.origin) !== null) out.push(`起点 ${fmtPx(num(d.origin)!)}`);
+  if (num(d.net_rr) !== null) out.push(`扣费盈亏比 ${num(d.net_rr)!.toFixed(2)}`);
+  if (d.evidence) out.push(`回测 ${d.evidence}`);
+  return out.join("，");
+}
 
 /** 算法页：每个算法在不在跑、刚算出了什么；下面是它们触发过的事件、触发了什么，以及之后价格有没有照它说的走。 */
 export function AlgoPanel({ coin, st, onShow }: { coin: string; st: InstStatus | undefined; onShow?: (ts: number, text: string) => void }) {
@@ -28,6 +47,8 @@ export function AlgoPanel({ coin, st, onShow }: { coin: string; st: InstStatus |
           {(st?.algos ?? []).map((a, i, all) => {
             const s = report?.stats[a.id];
             const judged = s ? s.right + s.wrong : 0;
+            const few = report?.few ?? 30;
+            const subs = Object.entries(report?.subs?.[a.id] ?? {});
             const head = a.layer && a.layer !== all[i - 1]?.layer ? report?.layers?.[a.layer] : "";
             return (
               <Fragment key={a.id}>
@@ -46,8 +67,15 @@ export function AlgoPanel({ coin, st, onShow }: { coin: string; st: InstStatus |
                   {a.reading}
                   <small>{a.does}</small>
                 </td>
-                <td className="algo-score" title="出信号 15 分钟后，价格朝它说的方向走了至少半个平均波幅算对">
-                  {judged ? `${s!.right} 对 ${s!.wrong} 错` : "—"}
+                <td className="algo-score" title="出信号 15 分钟后，价格朝它说的方向走了至少半个平均波幅算对，反着走这么多算错，其余算没动。「方向打架」和转折的「苗头」不是方向判断，不算在内">
+                  {judged || s?.flat ? `${s!.right} 对 ${s!.wrong} 错 ${s!.flat} 没动` : "—"}
+                  {!!s && s.right + s.wrong + s.flat < few && <small>样本太少，只当线索</small>}
+                  {subs.length > 1 &&
+                    subs.map(([name, t]) => (
+                      <small key={name}>
+                        {name}：{t.right} 对 {t.wrong} 错 {t.flat} 没动
+                      </small>
+                    ))}
                 </td>
               </tr>
               </Fragment>
@@ -76,7 +104,7 @@ export function AlgoPanel({ coin, st, onShow }: { coin: string; st: InstStatus |
         <div key={e.id} className="algo-ev">
           <div className="algo-ev-head">
             <time>{fmtTime(e.ts)}</time>
-            <b>{report?.labels[e.algo] ?? e.algo}</b>
+            <b>{report?.labels[e.algo] ?? e.algo}{e.sub ? ` · ${e.sub}` : ""}</b>
             {onShow && (
               <button className="btn xs" title="切到 K 线图，滚到这条记录触发的那根 K 线" onClick={() => onShow(e.ts, report?.labels[e.algo] ?? e.algo)}>
                 在图上看
@@ -87,6 +115,7 @@ export function AlgoPanel({ coin, st, onShow }: { coin: string; st: InstStatus |
             <span className="grow" />
             {(["15m", "1h"] as const).map((k) => {
               const c = e.checks[k];
+              if (e.scored === false) return k === "15m" && e.side ? <span key={k} className="algo-chk wait" title="这一类不是方向判断，只记录">不计对错</span> : null;
               if (!c) return e.side ? <span key={k} className="algo-chk wait">{k === "15m" ? "15 分钟" : "1 小时"}后核对</span> : null;
               return (
                 <span key={k} className={`algo-chk ${VERDICT[c.ok][1]}`} title={`当时 ${fmtPx(e.px)} → ${fmtPx(c.px)}`}>
@@ -96,6 +125,7 @@ export function AlgoPanel({ coin, st, onShow }: { coin: string; st: InstStatus |
             })}
           </div>
           <p>{e.text}</p>
+          {basis(e.data) && <p className="algo-effect">依据：{basis(e.data)}</p>}
           <p className="algo-effect">触发了：{e.effect || "只记录"}</p>
         </div>
       ))}

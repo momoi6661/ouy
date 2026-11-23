@@ -1,7 +1,7 @@
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ACTION_KINDS, EFFORTS, ENTRY_MODES, ENTRY_TYPE, FAST_MODES, KIND_LABEL, MODE_LABEL, noPlanText, STANCES, STYLES, api, shotUrl, fmtPx, fmtTime, fmtUsd, permissionFor, shortInst, STATUS_LABEL,
+  ACTION_KINDS, EFFORTS, ENTRY_MODES, LOOK_BARS, ENTRY_TYPE, FAST_MODES, KIND_LABEL, MODE_LABEL, noPlanText, STANCES, STYLES, api, shotUrl, fmtPx, fmtTime, fmtUsd, permissionFor, shortInst, STATUS_LABEL,
   type Account, type Activity, type AppState, type FastMode, type WorkerOverride, type Effort, type Mode, type PendingItem, type Permission, type Stance, type Rule, type Style, type UiCommand, type WorkItem,
 } from "../api";
 import { Chart, useLotEntries, type ChartLine } from "../components/Chart";
@@ -754,6 +754,20 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             <select value={own.effort ?? ""} onChange={(e) => saveWorker({ effort: (e.target.value || null) as Effort | null }, `${shortInst(coin)} Worker 的思考强度已修改`)}>
               <option value="">跟全局</option>
               {EFFORTS.map((x) => (
+                <option key={x.id} value={x.id}>
+                  {x.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="pref" title="这个 Worker 定时看盘按哪个周期的 K 线收盘（收盘后 10 秒叫醒）。不设跟全局；跟风格自动 = 空仓 超短线 15 分钟 / 日内 1 小时 / 波段 4 小时，有仓 5 / 15 / 60 分钟">
+            看盘
+            <select
+              value={own.look_minutes ?? ""}
+              onChange={(e) => saveWorker({ look_minutes: e.target.value === "" ? null : Number(e.target.value) }, `${shortInst(coin)} Worker 的定时看盘周期已修改`)}
+            >
+              <option value="">跟全局（{LOOK_BARS.find((x) => x.id === (cfg.look_minutes ?? 0))?.label}）</option>
+              {LOOK_BARS.map((x) => (
                 <option key={x.id} value={x.id}>
                   {x.label}
                 </option>

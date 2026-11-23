@@ -128,8 +128,8 @@ async def test_stop_can_reduce_risk_even_when_position_remains_above_budget(rt, 
     fake.cash = 1000
     too_loose = TradeAction(kind="set_stops", inst_id=BTC, stop_loss=59_350)
     improved = TradeAction(kind="set_stops", inst_id=BTC, stop_loss=59_650)
-    denied = await rt.trader.submit(too_loose, source="user")
-    assert denied.status == "rejected" and "当前风险" in denied.message
+    with pytest.raises(Rejected, match="当前风险"):  # Worker 放宽止损仍然过风控；用户自己改的不拦
+        await rt.trader._dry_run(too_loose, "demo")
     await rt.trader._dry_run(improved, "demo")
     accepted = await rt.trader.submit(improved, source="user")
     assert accepted.status == "executed", accepted.message

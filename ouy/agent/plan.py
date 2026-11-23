@@ -181,7 +181,13 @@ def _sig(v: float) -> float:
 REGIME_ADX = 20  # 结构周期 ADX 到这个数以上、高低点又和大方向一致，才算趋势
 
 
-def major_direction(snapshot: dict[str, Any], style: str) -> tuple[str, str]:
+TURN_FIRST = ("scalp",)  # 这些风格：5 分钟刚确认、还没被收回的结构转折先于前高前低定大方向（回测见 knowledge/evidence.md「行情判断：转折优先和 ADX 缓冲」）
+TURN_BY = "5m 转折"
+
+
+def major_direction(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | None = None) -> tuple[str, str]:
+    if style in TURN_FIRST and shift and shift.get("side") in ("long", "short"):
+        return shift["side"], TURN_BY
     windows = snapshot.get("windows") or {}
     for name in TREND_FRAMES[style]:
         word = str((windows.get(name) or {}).get("trend") or "")
@@ -210,7 +216,7 @@ def market_regime(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | 
     range 结构周期没有方向、ADX 低；mixed 其余（大方向和结构周期打架）。"""
     frames = snapshot.get("timeframes") or {}
     tf = frames.get(STYLES[style]["struct_bar"]) or {}
-    major, _ = major_direction(snapshot, style)
+    major, _ = major_direction(snapshot, style, shift)
     adx, structure = tf.get("adx14"), tf.get("structure")
     if (tf.get("insufficient") or structure not in ("uptrend", "downtrend", "range")
             or not isinstance(adx, (int, float)) or not math.isfinite(adx) or not 0 <= adx <= 100):
@@ -267,7 +273,7 @@ def build_candidates(
     limit_cost = maker_fee_pct + taker_fee_pct + max(spread, 0.0)
     windows = snapshot.get("windows") or {}
 
-    major, _ = major_direction(snapshot, style)
+    major, _ = major_direction(snapshot, style, shift)
 
     ups: list[float] = []
     downs: list[float] = []

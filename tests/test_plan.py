@@ -485,7 +485,7 @@ async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked
 
     # 行情判断和新出现的合格候选都记成算法事件（带中文名），页面和图上才看得到
     events = rt.store.algo_events("demo", BTC)
-    assert [e["algo"] for e in events].count("regime") == 1 and "启动后第一次判断" in events[-1]["text"]
+    assert [e["algo"] for e in events].count("regime") == 1 and "第一次判断" in events[-1]["text"]
     assert {"regime", "cand"} <= set(rt.watcher.ALGOS)
     st.reviewing = False
     frame = {"atr14": 300, "adx14": 30, "structure": "uptrend", "support": [{"price": 59_700}], "resistance": [{"price": 60_900}]}
@@ -498,6 +498,30 @@ async def test_algorithm_reads_the_market_on_its_own_clock_and_trades_are_booked
     assert all(e["side"] == "long" and "入场" in e["text"] for e in new if e["algo"] == "cand")
     rt.watcher._set_regime(cfg, BTC, st, snap, None, None)
     assert len(rt.store.algo_events("demo", BTC)) == len(events) + len(new)  # 没变化就不重复记
+
+    # 记录里带依据和子类；「方向打架」和转折的「苗头」不是方向判断，不核对对错
+    got = next(e for e in new if e["algo"] == "regime")
+    assert got["data"]["sub"] == "趋势" and got["data"]["major_by"] == "4H" and got["data"]["adx"] == 30 and got["data"]["structure"] == "uptrend" and not got["done"]
+    assert all(e["data"]["sub"] == "合格候选" and e["data"]["strategy"] for e in new if e["algo"] == "cand")
+    assert events[-1]["data"]["sub"] == "方向打架" and events[-1]["done"]  # 第一条是方向打架：记了但不等核对
+    rt.watcher._algo("demo", BTC, "turn", "苗头：还没收盘跌破", "只记录", "short", 60_000, 300, sub="苗头", score=False)
+    assert rt.store.algo_events("demo", BTC, 1)[0]["done"] == 1
+    # 重启后（内存里没有上一次的判断）：和库里最近一条一样就不再记；状态没变只是方向变了，写明方向怎么变
+    count = len(rt.store.algo_events("demo", BTC))
+    st.regime = {}
+    rt.watcher._set_regime(cfg, BTC, st, snap, None, None)
+    assert len([e for e in rt.store.algo_events("demo", BTC) if e["algo"] == "regime"]) == len([e for e in rt.store.algo_events("demo", BTC)[-count:] if e["algo"] == "regime"])
+    down = {**snap, "timeframes": {"15m": {**frame, "structure": "downtrend"}}, "windows": {"4H": {"trend": "下跌（高点低点都在降低）"}}}
+    rt.watcher._set_regime(cfg, BTC, st, down, None, None)
+    assert next(e for e in rt.store.algo_events("demo", BTC) if e["algo"] == "regime")["text"].startswith("趋势（方向由向上变向下）")
+    # 旧记录没有子类：从文字里认；准确率按子类分开，不计对错的两类不进统计
+    assert rt.watcher.algo_sub({"algo": "regime", "text": "启动后第一次判断：方向打架：大方向向下", "data": {}}) == "方向打架"
+    assert rt.watcher.algo_sub({"algo": "regime", "text": "震荡 → 趋势：大方向和5m结构同向", "data": {}}) == "趋势"
+    assert rt.watcher.algo_sub({"algo": "shift", "text": "苗头：扫了前低", "data": {}}) == "苗头"
+    rt.store._exec("UPDATE algo_events SET checks = ? WHERE algo IN ('regime', 'turn')", ('{"15m": {"ok": "right"}}',))
+    report = rt.watcher.algo_report("demo", BTC)
+    assert report["subs"]["regime"]["趋势"]["right"] == 2 and "方向打架" not in report["subs"]["regime"] and "turn" not in report["stats"]
+    assert report["stats"]["regime"]["right"] == 2 and report["few"] == 30
 
     cands = [{"side": "long", "entry": 100.0, "stop": 99.0}]
     plan = TradePlan(**{**PLAN, "entry_low": 100.1, "entry_high": 100.1, "stop_loss": 98.9, "take_profits": [103]})

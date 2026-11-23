@@ -37,7 +37,9 @@ interface Props {
 const rounder = (tickSz: string | undefined, ref: number) => {
   const tick = Number(tickSz) || 0;
   const digits = tick ? (String(tickSz).split(".")[1] ?? "").length : ref >= 100 ? 2 : 6;
-  return (raw: number) => Number((tick ? Math.round(raw / tick) * tick : raw).toFixed(digits));
+  // away = 往哪边取整（-1 向下、1 向上）：按百分比算出来的止损往远离入场价的一边取，取整后才不会比填的百分比更近
+  return (raw: number, away: -1 | 0 | 1 = 0) =>
+    Number((tick ? (away < 0 ? Math.floor(raw / tick + 1e-6) : away > 0 ? Math.ceil(raw / tick - 1e-6) : Math.round(raw / tick)) * tick : raw).toFixed(digits));
 };
 
 /** 止盈 / 止损的一块，和欧易一样：触发价和收益率两个框，下面是滑动条和快捷按钮。pct 是相对投入保证金的百分比，价格距离 = 百分比 ÷ 杠杆。 */
@@ -174,7 +176,7 @@ export function OrderTicket({ inst, last: pushed, account, risk, onDone, loggedI
     if (slPrice !== "") return slPrice;
     if (!entry || !levNow) return "";
     const d = slPct / 100 / levNow;
-    return round(s === "long" ? entry * (1 - d) : entry * (1 + d));
+    return s === "long" ? round(entry * (1 - d), -1) : round(entry * (1 + d), 1);
   };
   const tpFor = (s: "long" | "short"): number | "" => {
     if (tpPrice !== "") return tpPrice;
@@ -187,21 +189,22 @@ export function OrderTicket({ inst, last: pushed, account, risk, onDone, loggedI
     if (!entry) return "还没有拿到现价";
     if (slPrice !== "" && (s === "long" ? slPrice >= entry : slPrice <= entry)) return s === "long" ? "止损价要低于入场价才能开多" : "止损价要高于入场价才能开空";
     if (tpPrice !== "" && (s === "long" ? tpPrice <= entry : tpPrice >= entry)) return s === "long" ? "止盈价要高于入场价才能开多" : "止盈价要低于入场价才能开空";
-    const stop = slFor(s);
-    const gap = stop !== "" ? (Math.abs(entry - stop) / entry) * 100 : 0;
-    if (gap && gap < 0.1) return `止损离入场只有 ${gap.toFixed(3)}%，至少要 0.1%（${levNow}x 下亏损率至少 ${Math.ceil(0.1 * levNow)}%）`;
-    if (gap * levNow > 70) return `止损 ${gap.toFixed(2)}% 配 ${levNow}x，没到止损就先强平：杠杆降到 ${Math.max(Math.floor(70 / gap), 1)}x 以下`;
     return "";
+  };
+  // 手动下单不过风控：止损没到就先强平只提醒，不拦
+  const hint = (s: "long" | "short"): string => {
+    const stop = slFor(s);
+    const gap = stop !== "" && entry ? (Math.abs(entry - stop) / entry) * 100 : 0;
+    return gap * levNow > 70 ? `止损 ${gap.toFixed(2)}% 配 ${levNow}x，可能没到止损就先强平` : "";
   };
   const dist = slPrice !== "" && entry ? Math.abs(entry - slPrice) / entry : levNow ? slPct / 100 / levNow : 0;
   const pctShown = slPrice !== "" && entry ? Math.min(Math.round(dist * levNow * 1000) / 10, 100) : slPct;
   const tpShown: number | "" = tpPrice !== "" && entry ? Math.round((Math.abs(tpPrice - entry) / entry) * levNow * 1000) / 10 : tpPct;
-  const pct = riskPct === "" ? risk.risk_per_trade_pct : Math.min(riskPct, risk.risk_per_trade_pct);
+  const pct = riskPct === "" ? risk.risk_per_trade_pct : riskPct;
   const riskUsd = account ? (account.equity * pct) / 100 : 0;
   const byRisk = info && dist > 0 && entry ? riskUsd / (dist * entry * info.ct_val) : 0;
   const byAmount = info && amount !== "" && entry ? (amount * levNow) / (info.ct_val * entry) : 0;
-  const capped = riskPct !== "" && byAmount > 0 && byRisk > 0 && byAmount > byRisk;
-  const estContracts = byAmount > 0 ? (capped ? byRisk : byAmount) : byRisk;
+  const estContracts = byAmount > 0 ? byAmount : byRisk;
   const estNotional = info ? estContracts * info.ct_val * entry : 0;
   const estMargin = levNow ? estNotional / levNow : 0;
   const estLoss = info ? estContracts * dist * entry * info.ct_val : 0;
@@ -256,7 +259,7 @@ export function OrderTicket({ inst, last: pushed, account, risk, onDone, loggedI
     return (
       <button className={`btn ${s === "long" ? "buy" : "sell"}`} disabled={!!busy || !account || !!bad} title={bad || undefined} onClick={() => submit(s)}>
         <b>{busy === s ? "提交中…" : label}</b>
-        <small>{bad ? bad : sl !== "" ? `止损 ${fmtPx(sl)}${tp !== "" ? ` · 止盈 ${fmtPx(tp)}` : ""}` : ""}</small>
+        <small>{bad ? bad : hint(s) ? hint(s) : sl !== "" ? `止损 ${fmtPx(sl)}${tp !== "" ? ` · 止盈 ${fmtPx(tp)}` : ""}` : ""}</small>
       </button>
     );
   };
@@ -379,15 +382,9 @@ export function OrderTicket({ inst, last: pushed, account, risk, onDone, loggedI
               预计 {estContracts.toFixed(2)} 张 ≈ {estNotional.toFixed(0)} U 名义价值，占用保证金约 {estMargin.toFixed(2)} U
               <br />
               止损距离 {(dist * 100).toFixed(2)}% · 打到止损最多亏约 {estLoss.toFixed(2)} U
-              {capped && (
-                <>
-                  <br />
-                  <span className="warn">投入金额超过了单仓风险上限，数量会按上限缩小</span>
-                </>
-              )}
             </>
           ) : (
-            "填了投入就按「投入 × 杠杆」下单；不填则按风险额度自动算。两种都不会超过风控上限。"
+            "填了投入就按「投入 × 杠杆」下单；不填则按风险比例自动算。手动下单不过风控，照你填的来。"
           )}
         </div>
         <details className="tk-more">
@@ -405,7 +402,7 @@ export function OrderTicket({ inst, last: pushed, account, risk, onDone, loggedI
           </label>
           <label className="field">
             <span>风险额度（每笔最多亏权益的百分之多少）</span>
-            <Num value={riskPct} onChange={setRiskPct} min={0.1} max={risk.risk_per_trade_pct} step={0.1} placeholder={String(risk.risk_per_trade_pct)} suffix="%" />
+            <Num value={riskPct} onChange={setRiskPct} min={0.1} max={10} step={0.1} placeholder={String(risk.risk_per_trade_pct)} suffix="%" />
           </label>
         </details>
         {!loggedIn ? (

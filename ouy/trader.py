@@ -428,7 +428,9 @@ class Trader:
                     preflight()
                 if action.kind in ("open", "add"):
                     detail = await self._do_open(action, env, agent=source != "user", preflight=preflight, entry_only=entry_only)
-                elif preflight and action.kind in ("set_stops", "reduce", "close", "cancel_orders"):
+                elif action.kind == "set_stops":
+                    detail = await self._do_set_stops(action, env, preflight=preflight, manual=source == "user")
+                elif preflight and action.kind in ("reduce", "close", "cancel_orders"):
                     detail = await getattr(self, f"_do_{action.kind}")(action, env, preflight=preflight)
                 else:
                     detail = await getattr(self, f"_do_{action.kind}")(action, env)
@@ -636,7 +638,7 @@ class Trader:
                 if row["style"] == style and (action.stop_loss > stop if pos.side == "long" else action.stop_loss < stop):
                     stop = action.stop_loss
                 existing += row["contracts"] * inst.ct_val * ((row["entry_px"] - stop) if pos.side == "long" else (stop - row["entry_px"]))
-        sized = risk.size_entry(action, account=account, inst=inst, limits=cfg.risk, last_px=last, current_leverage=current, adds_done=adds_done, existing_risk=existing)
+        sized = risk.size_entry(action, account=account, inst=inst, limits=cfg.risk, last_px=last, current_leverage=current, adds_done=adds_done, existing_risk=existing, manual=not agent)
         assert action.side is not None
 
         if int(current) != sized.leverage:
@@ -649,7 +651,7 @@ class Trader:
             await self._set_leverage(action.inst_id, sized.leverage, mgn, account, action.side, env)
             if action.scalp_plan_id:
                 last = await self._scalp_quote(action, env, account)
-                sized = risk.size_entry(action, account=account, inst=inst, limits=self.get_config().risk, last_px=last, current_leverage=sized.leverage)
+                sized = risk.size_entry(action, account=account, inst=inst, limits=self.get_config().risk, last_px=last, current_leverage=sized.leverage, manual=not agent)
 
         sl = round_price(sized.stop_loss, inst.tick_sz)
         tp = round_price(sized.take_profit, inst.tick_sz) if sized.take_profit else None
@@ -827,7 +829,7 @@ class Trader:
                 self.bus.publish("journal", self.store.log(env, "alert", f"{pos.inst_id} 旧的止盈止损单没撤掉", {"message": str(exc)}, inst_id=pos.inst_id))
         return {"stop_loss": sl, "take_profit": tp}
 
-    async def _do_set_stops(self, action: TradeAction, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
+    async def _do_set_stops(self, action: TradeAction, env: Env, *, preflight: Callable[[], None] | None = None, manual: bool = False) -> dict[str, Any]:
         account, inst, last = await self._context(action, env)
         pos = account.position(action.inst_id)
         if not pos:
@@ -836,25 +838,25 @@ class Trader:
             raise Rejected("至少要给出止损或止盈其中一个价格。")
         lot = self._lot(action, env)
         if lot and len([l for l in self.store.lots(env, action.inst_id) if l["status"] == "open"]) > 1:
-            return await self._set_lot_stops(lot, pos, action, inst, last, env, preflight=preflight)
+            return await self._set_lot_stops(lot, pos, action, inst, last, env, preflight=preflight, manual=manual)
         sl = round_price(action.stop_loss, inst.tick_sz) if action.stop_loss else None
         tp = round_price(action.take_profit, inst.tick_sz) if action.take_profit else None
         old = await self._protections(pos, env)
         risk.check_stop_update(pos, float(sl) if sl is not None else None, float(tp) if tp is not None else None,
                                account=account, inst=inst, limits=self.get_config().risk, last_px=last,
-                               current_stop=self._covered_stop(pos, old, last))
+                               current_stop=self._covered_stop(pos, old, last), manual=manual)
         applied = await self._replace_stops(pos, old, sl, tp, env, preflight=preflight)
         for row in self.store.lots(env, action.inst_id):
             if row["status"] == "open":
                 self.store.update_lot(row["id"], stop_loss=_f(applied["stop_loss"]) or None, take_profit=_f(applied["take_profit"]) or None, algo_id="")
         return {"message": f"{action.inst_id} 整仓止损 {applied['stop_loss'] or '未设'}，止盈 {applied['take_profit'] or '未设'}", **applied}
 
-    async def _set_lot_stops(self, lot: dict[str, Any], pos: Position, action: TradeAction, inst: Any, last: float, env: Env, *, preflight: Callable[[], None] | None = None) -> dict[str, Any]:
-        """只改这个币的某一笔的止盈止损，别的几笔不动。"""
+    async def _set_lot_stops(self, lot: dict[str, Any], pos: Position, action: TradeAction, inst: Any, last: float, env: Env, *, preflight: Callable[[], None] | None = None, manual: bool = False) -> dict[str, Any]:
+        """只改这个币的某一笔的止盈止损，别的几笔不动。manual：用户自己改的，可以放宽止损。"""
         risk.check_stop_side(pos.side, last, action.stop_loss, action.take_profit, what="现价")
         if action.stop_loss is not None and lot["stop_loss"]:
             looser = action.stop_loss < lot["stop_loss"] if pos.side == "long" else action.stop_loss > lot["stop_loss"]
-            if looser:
+            if looser and not manual:
                 raise Rejected(f"这一笔的止损现在是 {lot['stop_loss']:g}，只能收紧不能放宽；想给更多空间请先减仓。")
         sl = round_price(action.stop_loss, inst.tick_sz) if action.stop_loss else (str(lot["stop_loss"]) if lot["stop_loss"] else None)
         tp = round_price(action.take_profit, inst.tick_sz) if action.take_profit else (str(lot["take_profit"]) if lot["take_profit"] else None)

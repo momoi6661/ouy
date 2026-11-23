@@ -30,6 +30,8 @@ export interface Turn {
   endTs?: number;
   /** 这一轮是你在对话里直接叫起来的：回答会出现在对话里 */
   byUser?: boolean;
+  /** 这一轮是 Router 交任务叫起来的：在 Router 的对话里它挂在 Router 那条回答下面 */
+  byRouter?: boolean;
   /** 被叫醒后程序判断没变化，没调用模型 */
   skipped?: boolean;
   /** 连着几轮都是「没变化、跳过」时并成一行，这里是并了几轮 */
@@ -112,7 +114,10 @@ export function toTurns(rows: Activity[]): Turn[] {
       if (a.data?.source === "user") {
         t.byUser = true;
         turns.splice(turns.length - 1, 0, { key: `u${a.id}`, id: a.id, ts: a.ts, agent: "user", inst: a.agent === "router" ? "" : a.inst_id, user: a.text.replace(/^用户：/, ""), images: a.data?.images, steps: [], asks: [], notes: [], done: true });
-      } else t.trigger = a.text;
+      } else {
+        t.trigger = a.text;
+        if (a.data?.source === "router" || a.data?.by === "Router") t.byRouter = true;
+      }
     } else if (a.kind === "tool" || a.kind === "handoff") {
       const step: Step = { id: a.id, label: a.text, why: a.data?.why, handoff: a.kind === "handoff", tool: a.data?.tool, args: a.data?.args };
       if (SPAWN_TOOLS.has(a.data?.tool)) (t.quiet ??= []).push(step);
@@ -224,10 +229,14 @@ interface RunProps {
   askWaiting?: (a: Activity) => boolean;
   renderAsk?: (a: Activity) => ReactNode;
   onPick?: (inst: string) => void;
+  /** 嵌在另一张卡片里（Router 卡片里的 Worker）：头像小一号 */
+  nested?: boolean;
+  /** 挂在这张卡片里面的内容：Router 交出去的 Worker 干活的卡片 */
+  children?: ReactNode;
 }
 
 /** 一轮运行的卡片：谁、为什么被叫醒、一步步调了什么工具（正在跑的转圈，跑完的打勾，点开看参数和返回）、正在想 / 正在写的内容、结论。 */
-export function RunCard({ t, live, active, brief, askWaiting, renderAsk, onPick }: RunProps) {
+export function RunCard({ t, live, active, brief, askWaiting, renderAsk, onPick, nested, children }: RunProps) {
   const [openStep, setOpenStep] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<boolean | null>(null);
   const [full, setFull] = useState(false);
@@ -257,7 +266,7 @@ export function RunCard({ t, live, active, brief, askWaiting, renderAsk, onPick 
   const names = [...new Set(t.steps.map((s) => s.label.replace(/（.*$/, "")))];
 
   return (
-    <div className={`msg agent ag-${t.agent} ${active ? "running" : ""} ${asking ? "has-ask" : ""}`}>
+    <div className={`msg agent ag-${t.agent} ${active ? "running" : ""} ${asking ? "has-ask" : ""} ${nested ? "nested" : ""}`}>
       <i className="ava">{AVATAR[t.agent] ?? "A"}</i>
       <div className="col">
         <div className="meta">
@@ -305,6 +314,7 @@ export function RunCard({ t, live, active, brief, askWaiting, renderAsk, onPick 
               )}
             </div>
           )}
+          {children}
           {t.notes.map((n) => (
             <div key={n.id} className={`note ${n.kind}`}>
               {n.text}

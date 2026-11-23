@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS equity_ts ON equity (env, ts);
 CREATE TABLE IF NOT EXISTS algo_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, env TEXT NOT NULL, inst TEXT NOT NULL, algo TEXT NOT NULL,
   side TEXT NOT NULL DEFAULT '', px REAL NOT NULL DEFAULT 0, atr REAL NOT NULL DEFAULT 0, text TEXT NOT NULL, effect TEXT NOT NULL DEFAULT '',
-  checks TEXT NOT NULL DEFAULT '{}', done INTEGER NOT NULL DEFAULT 0
+  checks TEXT NOT NULL DEFAULT '{}', done INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS algo_events_ts ON algo_events (env, inst, id DESC);
 CREATE TABLE IF NOT EXISTS opening_tape (
@@ -74,6 +74,8 @@ class Store:
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(pending)")}
             if "preview" not in columns:  # 旧版本建的库没有这一列
                 self._db.execute("ALTER TABLE pending ADD COLUMN preview TEXT NOT NULL DEFAULT '{}'")
+            if "data" not in {row["name"] for row in self._db.execute("PRAGMA table_info(algo_events)")}:  # 旧库：算法事件还没有「依据」这一列
+                self._db.execute("ALTER TABLE algo_events ADD COLUMN data TEXT NOT NULL DEFAULT '{}'")
             self._db.commit()
 
     def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
@@ -87,9 +89,12 @@ class Store:
             return self._db.execute(sql, params).fetchall()
 
     # ----- 算法事件：哪个算法在什么价位算出了什么、触发了什么，之后价格有没有照它说的走 -----
-    def add_algo_event(self, env: str, inst: str, algo: str, side: str, px: float, atr: float, text: str, effect: str) -> int:
-        cur = self._exec("INSERT INTO algo_events (ts, env, inst, algo, side, px, atr, text, effect, done) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                         (now_ms(), env, inst, algo, side, px, atr, text[:400], effect[:300], 0 if side and px else 1))
+    def add_algo_event(self, env: str, inst: str, algo: str, side: str, px: float, atr: float, text: str, effect: str,
+                       data: dict[str, Any] | None = None, score: bool = True) -> int:
+        """data = 算出这个结论用到的数（事后能查）；score=False = 这条不是方向判断，之后不核对对错。"""
+        cur = self._exec("INSERT INTO algo_events (ts, env, inst, algo, side, px, atr, text, effect, done, data) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                         (now_ms(), env, inst, algo, side, px, atr, text[:400], effect[:300], 0 if side and px and score else 1,
+                          json.dumps(data or {}, ensure_ascii=False, default=str)))
         return int(cur.lastrowid)
 
     def algo_events(self, env: str, inst: str | None = None, limit: int = 80, pending: bool = False) -> list[dict[str, Any]]:
@@ -99,7 +104,8 @@ class Store:
             params.append(inst)
         if pending:
             sql += " AND done=0"
-        return [{**dict(r), "checks": json.loads(r["checks"] or "{}")} for r in self._rows(sql + " ORDER BY id DESC LIMIT ?", (*params, limit))]
+        return [{**dict(r), "checks": json.loads(r["checks"] or "{}"), "data": json.loads(r["data"] or "{}")}
+                for r in self._rows(sql + " ORDER BY id DESC LIMIT ?", (*params, limit))]
 
     def check_algo_event(self, event_id: int, checks: dict[str, Any], done: bool) -> None:
         self._exec("UPDATE algo_events SET checks=?, done=? WHERE id=?", (json.dumps(checks, ensure_ascii=False), 1 if done else 0, event_id))
