@@ -3,7 +3,7 @@ import { api } from "../api";
 import { RECORD_DATA } from "./Recorders";
 
 type When = "price_touch" | "close_above" | "close_below" | "data_above" | "data_below";
-type Do = "wake" | "cancel_orders" | "close" | "open";
+type Do = "wake" | "cancel_orders" | "close" | "open" | "reverse";
 
 const num = (v: string) => (v.trim() === "" || Number.isNaN(Number(v)) ? undefined : Number(v));
 
@@ -18,8 +18,8 @@ export function LineForm({ coin, last, lines = [], busy, run }: { coin: string; 
   const [stop, setStop] = useState("");
   const [target, setTarget] = useState("");
   const price = num(level);
-  const reading = when.startsWith("data"); // 条件是一项算法读数：数值可以是 0 或负数，反复生效，不能直接开仓
-  const opening = todo === "open" && !reading;
+  const reading = when.startsWith("data"); // 条件是一项算法读数：数值可以是 0 或负数，反复生效，不能直接开仓或反手
+  const opening = (todo === "open" || todo === "reverse") && !reading;
   const sl = num(stop);
   // 止损放错边的话后端也会拒绝，这里先提示，免得白点一次
   const wrongSide = opening && price !== undefined && sl !== undefined && (side === "long") !== sl < price;
@@ -53,11 +53,12 @@ export function LineForm({ coin, last, lines = [], busy, run }: { coin: string; 
         </select>
       )}
       <span className="muted small">就</span>
-      <select aria-label="到了做什么" value={reading && todo === "open" ? "wake" : todo} onChange={(e) => setTodo(e.target.value as Do)}>
+      <select aria-label="到了做什么" value={reading && (todo === "open" || todo === "reverse") ? "wake" : todo} onChange={(e) => setTodo(e.target.value as Do)}>
         <option value="wake">叫 Worker 来看</option>
         <option value="cancel_orders">撤掉这个币的挂单</option>
         <option value="close">平掉这个币的仓位</option>
         {!reading && <option value="open">市价开仓</option>}
+        {!reading && <option value="reverse">平仓并市价反手</option>}
       </select>
       {opening && (
         <>
@@ -76,7 +77,7 @@ export function LineForm({ coin, last, lines = [], busy, run }: { coin: string; 
         onClick={() =>
           run(async () => {
             await api.addLine({
-              inst_id: coin, when, level: price!, bar: reading || when === "price_touch" ? undefined : bar, do: reading && todo === "open" ? "wake" : todo,
+              inst_id: coin, when, level: price!, bar: reading || when === "price_touch" ? undefined : bar, do: reading && (todo === "open" || todo === "reverse") ? "wake" : todo,
               ...(reading ? { data } : {}),
               ...(opening ? { side, stop_loss: sl, take_profit: num(target) } : {}),
             });

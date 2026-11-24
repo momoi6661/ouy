@@ -127,6 +127,11 @@ def check_plan(
     out.net_rr = (out.tp_pct - cost_pct) / (out.stop_pct + cost_pct)
     if out.stop_pct < MIN_STOP_DISTANCE_PCT:
         out.issues.append(f"止损离入场只有 {out.stop_pct:.3f}%（至少 {MIN_STOP_DISTANCE_PCT}%），正常波动就会扫掉：把止损放到 5m / 15m 的结构位之外")
+    elif cost_pct > 0 and out.tp_pct < cost_pct * 3.0:
+        out.issues.append(
+            f"到第一目标只有 {out.tp_pct:.2f}%，不到往返成本（手续费+点差 {cost_pct:.2f}%）的 3 倍，赚的还不够交手续费："
+            f"把第一目标放到至少 {cost_pct * 3.0:.2f}% 外的真实高/低点，或者放弃这笔微利单（no_plan_reason 选 cost）"
+        )
     elif out.net_rr < min_rr:
         need = min_rr * (out.stop_pct + cost_pct) + cost_pct
         out.issues.append(
@@ -241,12 +246,9 @@ WAVE_BY = "实时拐点走向"
 
 
 def major_direction(snapshot: dict[str, Any], style: str, shift: dict[str, Any] | None = None) -> tuple[str, str]:
-    live_wave = str(((snapshot.get("live_wave") or {}).get("trend")) or "")
-    frames = snapshot.get("timeframes") or {}
-    local = {"uptrend": "long", "downtrend": "short"}.get((frames.get(STYLES[style]["struct_bar"]) or {}).get("structure"), "")
+    # 盘中实时走向（live_wave）不参与定大方向：1m 回放里它切换后 15 分钟继续同向的只有约 45%（见 knowledge/evidence.md）
     if style in TURN_FIRST and shift and shift.get("side") in ("long", "short"):
-        if not (live_wave in ("long", "short") and live_wave != shift["side"] and local == live_wave):
-            return shift["side"], TURN_BY
+        return shift["side"], TURN_BY
     win_major, win_name = "", ""
     windows = snapshot.get("windows") or {}
     for name in TREND_FRAMES[style]:
@@ -254,9 +256,6 @@ def major_direction(snapshot: dict[str, Any], style: str, shift: dict[str, Any] 
         if word.startswith(("上涨", "下跌")):
             win_major, win_name = ("long" if word.startswith("上涨") else "short"), name
             break
-    # 打破整点切块滞后：若上一整小时无方向，或整点旧方向已被「小周期收盘结构 + 盘中实时波峰波谷走向」双重反向推翻，按实时走向定方向
-    if live_wave in ("long", "short") and (not win_major or (win_major != live_wave and local == live_wave)):
-        return live_wave, WAVE_BY
     return win_major, win_name
 
 
@@ -479,14 +478,14 @@ def build_candidates(
     adx_val = float(tf.get("adx14") or 0)
     last_close = float(tf.get("last_closed_price") or px)
     vol_ratio = float(tf.get("volume_ratio") or 0)
-    if regime["kind"] == "trend" and e20 > 0 and adx_val >= 25 and vol_ratio >= 1.15 and regime["side"] in ("long", "short") and entry_mode != "limit":
+    if regime["kind"] == "trend" and e20 > 0 and adx_val >= 20 and regime["side"] in ("long", "short") and entry_mode != "limit":
         t_long = regime["side"] == "long"
         t_sign = 1 if t_long else -1
-        if abs(px - e20) <= 0.45 * atr and (px - e20) * t_sign >= -0.15 * atr and (last_close - e20) * t_sign >= 0:
-            stop = _sig(e20 - t_sign * max(1.4 * wide_atr, stop_floor))
+        if -0.2 * atr <= (px - e20) * t_sign <= 1.15 * wide_atr and (last_close - e20) * t_sign >= 0:
+            stop = _sig(e20 - t_sign * max(1.15 * wide_atr, stop_floor))
             if (px - stop) * t_sign > 0:
                 risk_m = abs(px - stop)
-                raw.append(("动量延续", f"顺势回踩 {spec['struct_bar']} EMA20（{e20:g}）企稳直接跟进", TradePlan(
+                raw.append(("动量延续", f"顺 1H/结构周期趋势在 {spec['struct_bar']} EMA20（{e20:g}）同侧推进，现价直接跟进", TradePlan(
                     direction=regime["side"], strategy="动量延续", entry_low=_sig(px), entry_high=_sig(px), stop_loss=stop,
                     take_profits=[_sig(px + t_sign * 2.0 * risk_m), _sig(px + t_sign * 4.0 * risk_m)],
                     leverage=20, entry_type="now", invalidation=f"{spec['struct_bar']} 收盘跌破 {stop:g}" if t_long else f"{spec['struct_bar']} 收盘站上 {stop:g}",

@@ -43,8 +43,8 @@ async def test_breakout_fires_the_moment_price_crosses_and_then_manages_the_trad
     lot = rt.trader.lots("demo", BTC)[0]
     assert lot["source"] == "agent" and lot["stop_loss"] == 60_200
 
-    await tick(rt, fake, 60_850)  # 入场 60520，R = 320：到 1R 移保本
-    assert rt.trader.lots("demo", BTC)[0]["stop_loss"] == pytest.approx(60_520)
+    await tick(rt, fake, 60_850)  # 入场 60520，R = 320：到 1R 移到含双边手续费+滑点的真保本位（> 60520，不再设裸入场价亏手续费）
+    assert rt.trader.lots("demo", BTC)[0]["stop_loss"] == pytest.approx(60_520 * 1.0013, rel=1e-4)
     await tick(rt, fake, 61_200)  # 到 2R 平一半
     assert fake.positions[BTC]["pos"] == pytest.approx(size / 2, rel=0.02)
     await tick(rt, fake, 61_250)  # 同一条规则不会做第二次

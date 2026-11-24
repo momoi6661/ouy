@@ -26,6 +26,7 @@ from .market import Market, _f
 from .models import AgentConfig, Effort, TradeAction
 from .profit_guard import ExitRules
 from .okx.auth import OkxAuth, OkxAuthError
+from .okx.feed import PriceFeed
 from .okx.gateway import Gateway, OkxError, OkxGateway, Patient, Shared
 from .okx.runtime import OkxRuntimeMissing
 from .risk import Rejected
@@ -63,6 +64,8 @@ class Runtime:
         self.watcher.skills = self.skills
         self.watcher.proxy_url = lambda: self.settings.proxy_url or None
         self.watcher.uploads = self.settings.data_dir / "uploads"  # 对话里附的图片存在这里
+        if gateway is None:  # 真实运行环境挂上欧易公共行情 WebSocket，毫秒级推送价格并事件驱动触发器；单测不连外网
+            self.watcher.feed = PriceFeed(proxy_url=self.watcher.proxy_url, on_tick=self.watcher.on_live_price)
         self.store.fail_running_work("程序重启，上次没跑完")
         self._env_llm = {"base_url": settings.ai_base_url, "api_key": settings.ai_api_key, "model": settings.ai_model}
         self._env_proxy = settings.proxy_url
@@ -70,6 +73,8 @@ class Runtime:
         self.apply_proxy()
         self._config: AgentConfig | None = None
         self._auth_status = ""
+        self._silent_refresh_at = 0.0
+        self._logged_out = False
         self._swap_meta: tuple[float, dict[str, Any]] = (0.0, {})
 
     # ----- 模型接口：界面上填的 Base URL / API Key / 默认模型，存在本机数据库里，优先于 .env -----
@@ -149,6 +154,8 @@ class Runtime:
                 # 看盘周期或风格改了：已排好的下一次定时看盘按新周期重排，不用等旧的那一次到点
                 if st.next_due_ts and (new.look_for(inst), new.style_for(inst)) != (old.look_for(inst), old.style_for(inst)):
                     st.next_due_ts = max(self.watcher._next_look(new, inst, st, time.time()), st.retry_after_ts)
+        if self.watcher.running and self.watcher.feed is not None:
+            self.watcher.feed.start(new.env, list(dict.fromkeys([*new.instruments, "BTC-USDT-SWAP"])))
         self.bus.publish("agent", self.watcher.status())
 
     async def set_watching(self, on: bool) -> None:
@@ -158,6 +165,37 @@ class Runtime:
             await self.watcher.stop()
         self.store.set("agent_running", on)
 
+    async def try_silent_refresh(self, *, force: bool = False) -> dict[str, Any] | None:
+        """停机超过 1 小时后 1 小时短期 access_token 会过期，okx-auth status 只查短期令牌会误报 not_logged_in，
+        但长期 refresh_token 仍保存在本机。通过受信 @okx_ai 网关发起一次只读余额查询即可自动静默换新令牌，无需重新扫码登录。"""
+        if self._logged_out:
+            return None
+        now = time.monotonic()
+        if not force and self._silent_refresh_at and now - self._silent_refresh_at < 300:
+            return None
+        self._silent_refresh_at = now
+        try:
+            inner = getattr(self.gateway, "inner", None)
+            if hasattr(inner, "_cache"):
+                inner._cache.clear()
+            await self.gateway.call("account_get_balance", {}, env=self.config().env)
+        except Exception as exc:  # noqa: BLE001 - 本机未登录或长期刷新令牌也已失效
+            log.debug("静默刷新欧易令牌未成功：%s", exc)
+            return None
+        check = getattr(self.auth, "invalidate_cache", None) or getattr(self.auth, "status", None)
+        st: dict[str, Any] = {}
+        if callable(check):
+            try:
+                st = await check()
+            except Exception:  # noqa: BLE001
+                st = {}
+        if st.get("status") != "logged_in":
+            # 私有余额接口已真实成功，说明本机凭证可用（例如 API Key 或旧 pending 残留）
+            st = {**st, "status": "logged_in", "site": st.get("site") or self.settings.okx_site, "error": None}
+        self._auth_cache = (time.time(), st)
+        self._auth_status = "logged_in"
+        return st
+
     async def auth_status(self, fresh: bool = True) -> dict[str, Any]:
         """欧易登录状态。查一次要起官方命令行（一两秒）：页面每次刷新都会问，所以 fresh=False 时 15 秒内直接用上次的结果。"""
         cached = getattr(self, "_auth_cache", None)
@@ -165,6 +203,10 @@ class Runtime:
         if cached and time.time() - cached[0] < (60 if cached[1].get("status") == "logged_in" else (0 if fresh else 15)):
             return cached[1]
         status = await self.auth.status()
+        if status.get("status") == "not_logged_in" and not self._logged_out:
+            refreshed = await self.try_silent_refresh()
+            if refreshed is not None:
+                return refreshed
         self._auth_cache = (time.time(), status)
         previous, self._auth_status = self._auth_status, status["status"]
         if previous and previous != "logged_in" and self._auth_status == "logged_in":
@@ -256,12 +298,27 @@ class LineIn(BaseModel):
     level: float
     data: str | None = Field(None, max_length=60, description="条件是算法读数时：看哪一项（turn_stage、vol_ratio、dist:线名 ……）")
     bar: Literal["5m", "15m", "1H"] = "15m"
-    do: Literal["wake", "cancel_orders", "close", "open"] = "wake"
+    do: Literal["wake", "cancel_orders", "close", "open", "reverse"] = "wake"
     side: Literal["long", "short"] | None = None
     stop_loss: float | None = Field(None, gt=0)
     take_profit: float | None = Field(None, gt=0)
+    leverage: int | None = Field(None, ge=1, le=125)
+    margin_usdt: float | None = Field(None, gt=0)
     note: str = Field("", max_length=200)
     valid_minutes: int = Field(720, ge=5, le=10080)
+
+
+class ReverseRuleIn(BaseModel):
+    """止损后自动反手触发器：原仓被止损且价格到触发价时自动开反方向新仓；原仓止盈则自动作废。"""
+    inst_id: str = Field(..., max_length=40)
+    side: Literal["long", "short"]
+    trigger: float = Field(..., gt=0)
+    stop_loss: float = Field(..., gt=0)
+    take_profit: float | None = Field(None, gt=0)
+    leverage: int | None = Field(None, ge=1, le=125)
+    margin_usdt: float | None = Field(None, gt=0)
+    window_minutes: int = Field(60, ge=5, le=1440)
+    note: str = Field("", max_length=200)
 
 
 class RecorderEdit(BaseModel):
@@ -405,6 +462,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         app.state.rt = rt
         warm = asyncio.create_task(rt.kb.warmup())
         keep_auth = asyncio.create_task(rt.auth_keepalive_loop(), name="ouy-auth-keepalive")
+        try:
+            if (await rt.auth.status()).get("status") == "not_logged_in":
+                await rt.try_silent_refresh(force=True)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("启动静默恢复欧易授权跳过：%s", exc)
         if rt.store.get("agent_running"):
             try:
                 await rt.watcher.start(recover_auth=True)
@@ -517,6 +579,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.post("/api/auth/login")
     async def login(request: Request):
         rt = rt_of(request)
+        rt._logged_out = False
         result = await rt.auth.login()
         rt._auth_cache = None
         rt._auth_status = result.get("status", "pending")
@@ -529,6 +592,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.post("/api/auth/logout")
     async def logout(request: Request):
         rt = rt_of(request)
+        rt._logged_out = True
         await rt.watcher.stop("已退出欧易授权")
         rt.store.set("agent_running", False)
         await rt.auth.logout()
@@ -573,7 +637,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.get("/api/market/levels")
     async def levels(request: Request, inst_id: str, bar: str = "15m"):
         """图上要画的关键位：和 Worker 复盘时看到的是同一套算法——这个周期的区间上下沿、支撑阻力，以及上一小时 / 上 4 小时的高低点。"""
-        from .agent.signals import structure_shift
+        from .agent.signals import chart_trend_marks, structure_shift
         from .indicators import day_profile, read_chart, value_area, window_levels
         from .market import session_anchor
 
@@ -590,6 +654,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             "range": chart.get("range"), "support": chart.get("support", []), "resistance": chart.get("resistance", []),
             "patterns": chart.get("patterns", []), "windows": window_levels({"15m": m15, "1H": h1}),
             "shift": structure_shift(frame[-120:]),
+            "trend_marks": chart_trend_marks(frame[-140:]),
         }
 
     @app.get("/api/market/candles")
@@ -1033,22 +1098,25 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     @app.post("/api/lines")
     async def line_add(request: Request, body: LineIn):
         """用户划一条触发线：价格到了、K 线收盘越过这个价位、或者某项算法读数到了某个值时，叫醒 Worker、撤掉这个币的挂单、平掉这个币的仓位，
-        或者按写好的止损止盈市价进场。按价位的只执行一次；按算法读数的反复生效（两次之间至少隔 15 分钟）、不能用来开仓。照样过权限和硬性风控。"""
+        或者按写好的止损止盈市价进场 / 平仓并市价反手。按价位的只执行一次；按算法读数的反复生效（两次之间至少隔 15 分钟）、不能用来开仓或反手。"""
         from .strategy import recorder_params
 
         rt = rt_of(request)
-        opening = body.do == "open"
+        opening = body.do in ("open", "reverse")
         reading = body.when.startswith("data")
         if reading and (not body.data or opening):
-            raise HTTPException(400, "按算法读数的触发线要选一项读数，而且只能叫醒 Worker、撤挂单或平仓；要开仓请用价位条件。")
+            raise HTTPException(400, "按算法读数的触发线要选一项读数，而且只能叫醒 Worker、撤挂单或平仓；要开仓或反手请用价位条件。")
         if not reading and not body.level > 0:
             raise HTTPException(400, "价位要大于 0。")
         if not opening and (body.side or body.stop_loss or body.take_profit):
-            raise HTTPException(400, "方向、止损、止盈只在「到了就开仓」时填。")
+            raise HTTPException(400, "方向、止损、止盈只在「到了就开仓 / 反手」时填。")
         params = {
             "when": body.when, "level": body.level, "bar": body.bar if body.when != "price_touch" else None,
-            "do": "open_market" if opening else body.do, "expires_minutes": body.valid_minutes,
+            "do": "reverse" if body.do == "reverse" else ("open_market" if body.do == "open" else body.do),
+            "expires_minutes": body.valid_minutes,
             "stop_loss": body.stop_loss, "take_profit": body.take_profit,
+            **({"leverage": body.leverage} if body.leverage else {}),
+            **({"margin_usdt": body.margin_usdt} if body.margin_usdt else {}),
             "wake_note": (body.note or "你划的线到了，按现在的行情判断要不要做") if body.do == "wake" else None,
         }
         if reading:
@@ -1057,6 +1125,23 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             if reading:
                 params.update(recorder_params([{"data": body.data, "op": body.when[5:], "level": body.level}]))
             row = rt.watcher.strategies.deploy(rt.config(), body.inst_id.upper(), "trigger", (body.side or "") if opening else "", params, source="user", note=body.note)
+        except Rejected as exc:
+            raise HTTPException(400, str(exc)) from exc
+        rt.bus.publish("agent", rt.watcher.status())
+        return row
+
+    @app.post("/api/strategies/reverse")
+    async def strategy_reverse_add(request: Request, body: ReverseRuleIn):
+        """部署「止损后自动反手」触发器：原仓被止损且价格到触发价时自动开反方向新仓；原仓止盈或超时则自动作废。"""
+        rt = rt_of(request)
+        params = {
+            "trigger": body.trigger, "stop_loss": body.stop_loss, "take_profit": body.take_profit,
+            "window_minutes": body.window_minutes,
+            **({"leverage": body.leverage} if body.leverage else {}),
+            **({"margin_usdt": body.margin_usdt} if body.margin_usdt else {}),
+        }
+        try:
+            row = rt.watcher.strategies.deploy(rt.config(), body.inst_id.upper(), "reverse", body.side, params, source="user", note=body.note or "止损后自动反手")
         except Rejected as exc:
             raise HTTPException(400, str(exc)) from exc
         rt.bus.publish("agent", rt.watcher.status())

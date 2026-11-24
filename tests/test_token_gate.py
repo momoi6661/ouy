@@ -146,6 +146,31 @@ async def test_shared_gateway_does_not_repeat_the_same_account_query():
     assert inner.calls.count("market_get_ticker") == 2  # 行情不缓存
 
 
+async def test_silent_refresh_recovers_expired_access_token_after_restart(settings, fake):
+    """停机超 1 小时短期 access_token 过期时，okx-auth status 报 not_logged_in，但受信网关调用会自动用本地长期 refresh_token 换新令牌，无需重新登录。"""
+    from ouy.app import Runtime
+    from ouy.store import Store
+
+    class ExpiredStatusAuth:
+        def __init__(self) -> None:
+            self.refreshed = False
+
+        async def status(self) -> dict:
+            return {"status": "logged_in" if self.refreshed else "not_logged_in", "site": "global"}
+
+        async def invalidate_cache(self) -> dict:
+            self.refreshed = True
+            return await self.status()
+
+    rt = Runtime(settings, gateway=fake, auth=ExpiredStatusAuth(), store=Store(":memory:"), model_factory=lambda: "test")
+    st = await rt.auth_status()
+    assert st["status"] == "logged_in"
+    rt._logged_out = True
+    rt._auth_cache = None
+    rt.auth.refreshed = False
+    assert (await rt.auth_status())["status"] == "not_logged_in"
+
+
 def test_mcp_oauth_patch_adds_singleflight_and_clears_401_cache():
     from ouy.okx.runtime import _patch_oauth_singleflight
 

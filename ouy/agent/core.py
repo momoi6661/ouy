@@ -448,8 +448,31 @@ async def reduce_position(ctx: RunContext[Deps], inst_id: str, fraction: float, 
 
 @toolset.tool
 async def close_position(ctx: RunContext[Deps], inst_id: str, reason: str, lot_id: int | None = None) -> str:
-    """市价平仓并撤掉对应的止盈止损单。判断被证伪时用它立刻离场。
+    """市价平仓并撤掉对应的止盈止损单。判断被已收盘结构证伪时用它离场。
     给了 lot_id 就只平那一笔，别的几笔不动；不给是把这个币的持仓全部平掉。"""
+    target = _inst(inst_id)
+    if ctx.deps.plan_check is not None and not ctx.deps.propose_only and not ctx.tool_call_approved:
+        cfg = ctx.deps.config
+        lots = ctx.deps.trader.lots(cfg.env, target)
+        picked = [l for l in lots if lot_id is None or l["id"] == lot_id]
+        if len(picked) == 1:
+            lot = picked[0]
+            opened_ts = int(lot.get("ts") or lot.get("created_ts") or 0)
+            age_min = (time.time() * 1000 - opened_ts) / 60_000 if opened_ts > 0 else 999.0
+            if 0 <= age_min < 10:
+                account = await ctx.deps.trader.account(cfg.env)
+                pos = account.position(target)
+                entry, sl = float(lot.get("entry_px") or 0), float(lot.get("stop_loss") or 0)
+                r0 = abs(entry - sl) if entry and sl else 0.0
+                px = float(pos.mark_px or 0) if pos else 0.0
+                sign = 1 if lot.get("side") == "long" else -1
+                gain_r = ((px - entry) * sign / r0) if r0 > 0 and px > 0 else 0.0
+                has_struct_break = bool(re.search(r"收盘.*(跌破|站上|破坏|反转|失效)|用户|强平|目标已结束", reason or ""))
+                if -0.65 < gain_r < 0.8 and not has_struct_break:
+                    return (
+                        f"[拦截：禁止刚开仓就恐慌平仓] 第 #{lot['id']} 笔仅持仓 {age_min:.1f} 分钟（当前 {gain_r:+.2f}R），"
+                        "远未触及原结构硬止损且缺少已收盘结构破坏依据。短线正常波动交给硬止损与跟踪止损规则管理，禁止几分钟内频繁平仓白交手续费！"
+                    )
     return await _act(ctx, TradeAction(kind="close", inst_id=inst_id, lot_id=lot_id, reason=reason))
 
 
@@ -457,6 +480,42 @@ async def close_position(ctx: RunContext[Deps], inst_id: str, reason: str, lot_i
 async def move_stops(ctx: RunContext[Deps], inst_id: str, reason: str, stop_loss: float | None = None, take_profit: float | None = None, lot_id: int | None = None) -> str:
     """修改止损/止盈价（只改给出的那个，另一个保持不变）。止损只能收紧，不能放宽。
     这个币上有几笔不同风格的仓位时，给 lot_id 只改那一笔；不给是把整个持仓的止损止盈统一成这个价位。"""
+    target = _inst(inst_id)
+    if stop_loss is not None and ctx.deps.plan_check is not None and not ctx.deps.propose_only and not ctx.tool_call_approved:
+        cfg = ctx.deps.config
+        lots = ctx.deps.trader.lots(cfg.env, target)
+        picked = [l for l in lots if lot_id is None or l["id"] == lot_id]
+        if len(picked) == 1:
+            lot = picked[0]
+            entry, cur_sl = float(lot.get("entry_px") or 0), float(lot.get("stop_loss") or 0)
+            if entry > 0 and cur_sl > 0:
+                sign = 1 if lot.get("side") == "long" else -1
+                r0 = abs(entry - cur_sl)
+                account = await ctx.deps.trader.account(cfg.env)
+                pos = account.position(target)
+                px = float(pos.mark_px or 0) if pos else 0.0
+                gain_r = ((px - entry) * sign / r0) if r0 > 0 and px > 0 else 0.0
+                near_entry = (stop_loss - entry) * sign >= -0.25 * r0
+                if lot.get("source") in ("user", "external") and gain_r < 1.8:
+                    return (
+                        f"[拦截：禁止擅改手动仓止损] 第 #{lot['id']} 笔是用户手动开的仓且已有止损 {cur_sl:g}，当前浮盈 {gain_r:+.2f}R 未到 1.8R，"
+                        "请保留用户原止损，不要提前拉回入场价。"
+                    )
+                if near_entry and gain_r < 1.2:
+                    return (
+                        f"[拦截：禁止过早提保本] 第 #{lot['id']} 笔当前浮盈仅 {gain_r:+.2f}R（未达 1.2R 锁盈门槛），"
+                        f"禁止把止损收紧到入场价 {entry:g} 附近（{stop_loss:g}）被正常回撤提前洗出！请保留原结构硬止损 {cur_sl:g}，等冲出 1.5R 高点后由保盈线自动移到含手续费真保本位。"
+                    )
+                fee_buf = entry * (cfg.taker_fee_pct * 2 + 0.03) / 100
+                if 0 <= (stop_loss - entry) * sign < fee_buf:
+                    be_px = float(f"{entry + sign * fee_buf:.8g}")
+                    if px > 0 and (px - be_px) * sign > 0:
+                        stop_loss = be_px  # 自动补足双边手续费+滑点缓冲，绝不设在裸入场价倒亏手续费
+                    else:
+                        return (
+                            f"[拦截：保本止损未覆盖手续费] 止损 {stop_loss:g} 紧贴入场价 {entry:g}，打掉会倒亏双边手续费（需至少到 {be_px:g} 才真保本）；"
+                            "当前现价还不够放到含费保本位外，请先保留原止损。"
+                        )
     return await _act(ctx, TradeAction(kind="set_stops", inst_id=inst_id, stop_loss=stop_loss, take_profit=take_profit, lot_id=lot_id, reason=reason))
 
 
@@ -497,7 +556,7 @@ async def add_trigger(
     ctx: RunContext[Deps],
     inst_id: str,
     when: TriggerWhen,
-    do: Literal["open_limit", "open_market", "cancel_orders", "close", "reduce", "set_stops", "wake"],
+    do: Literal["open_limit", "open_market", "reverse", "cancel_orders", "close", "reduce", "set_stops", "wake"],
     reason: str,
     level: float | None = None,
     bar: Literal["1m", "5m", "15m", "1H"] | None = None,
@@ -531,6 +590,8 @@ async def add_trigger(
       turn_stage 转折走到第几步（看涨为正、看跌为负：1 扫流动性 / 2 加动能背离 / 3 收盘确认）、shift_failure 转折位盘中状态（1 向上突破后失守、-1 向下突破后收回、0 没有）、
       score_long / score_short 做多 / 做空凑了几分（0~4：顺 1 小时方向、碰到关键线、收盘确认、放量）、sig_long / sig_short 快判分数、
       vol_ratio 5 分钟量比、chg_pct 最近一根 5 分钟涨跌幅 %（跌是负数）、vol_1m / move_1m 1 分钟的量比和涨跌幅、trend 1 小时方向（上涨 1、震荡 0、下跌 -1）、
+      wave_dir 实时拐点方向（2秒抗插针：1 向上 / -1 向下）、wave_move_pct 自拐点幅度 %、wave_cont 是否延续走势（1 延续 / 0 新拐点）、
+      chg_10s / chg_30s / chg_60s WebSocket 实时近 10/30/60 秒涨跌幅 %、
       range_pos 现价在区间里的位置 %（0 下沿、100 上沿）、spread_pct 点差 %、book_bias 盘口买卖偏向（-100 ~ 100）、
       dist:线名 现价高出这条线百分之几（在线下方是负数，例如 dist:区间下沿 ≤ 0.1 就是贴近或跌破区间下沿）。level 可以是 0 或负数。读数缺失或过期时不触发。
       线名：区间上沿、区间下沿、支撑 1、支撑 2、阻力 1、阻力 2、上一个 30m / 1H / 4H 高点 / 低点。
@@ -1352,9 +1413,11 @@ _ROLE = """你是一名加密货币永续合约交易员，是这个币种的专
    - **计划线近端感应**：你画的 `lines` 若价格逼近到 0.22% 以内提前拐头弹开，也会自动触发提醒或核对进场；
    - **持仓拐点推止损**：已有仓位或刚成交的新仓浮盈 ≥1.2R 后，每走出一个新的顺向波谷（多单）/ 波峰（空单），监控器自动把止损上移到新拐点外侧锁住波段利润。
 3. **触发器与执行器（`add_trigger` / `deploy_strategy`）**：条件可直接用实时拐点读数（如 `wave_dir`、`wave_move_pct`、`retrace_pct`）或价位/收盘条件，满足即秒级执行。
-4. **你的职责（贴近现价抓拐点、大小走势通吃）**：
-   - **严禁挂天外远单**：超短线挂单离现价绝对不能超过 0.45%（日内不超过 1.2%）。看好要涨、或者价格已经踩住前低/支撑下影收回（假跌破反转），**就在现价（`entry_type=now`）或离现价 0.1%~0.3% 的贴身位置买**，绝不准挂到 1% 外的老高点/老低点装样子！
-   - **跳过贴身微噪音定止盈**：如果眼前 0.15% 有个刚踩过的小低点/小高点，不要拿它锁死第一目标导致算不出盈亏比，第一目标直接看下一级结构位（1.3R~2.5R 处）。
+4. **你的核心打法（转折 + 低买高卖 + 盈利加仓，算清手续费）**：
+   - **只做两类清晰机会**：① **转折反包**（前低扫流动性收回、结构 `上·转折` 做多；前高受阻或 `下·转折` 做空）；② **低买高卖波段**（顺 1H/30m 主波段，依托前低/支撑买多、目标拿到前高/阻力卖，绝不逆着眼前 2 小时涨势听旧 4H 唱空）。
+   - **绝不做赚不够手续费的微利单**：第一目标空间必须至少是往返手续费的 3 倍以上（约 ≥0.40%）；挂单紧贴现价（超短线 ≤0.45%、日内 ≤1.2%），禁止挂天外远单。
+   - **真·含费保本与持仓纪律**：任何保本止损必须放在「入场价 ± 双边手续费与滑点（约 0.13%）」之外，绝不把止损放裸入场价倒贴手续费；浮盈未达 1.2R 前不提保本，开仓 10 分钟内无结构收盘破坏不恐慌平仓。
+   - **浮盈顺势加仓（金字塔滚仓）**：当原仓浮盈 ≥1.0R 且止损已移至含费净保本位（底仓零风险），如果行情顺势继续走出延续或回踩支撑再企稳，果断用 `add_position` 顺势加仓 50%～80%，并同步收紧合并止损到新均价含费保本或最近波谷/波峰外侧，靠对的单子把利润滚大！
    - **不要乱派 risk 子代理否决交易**：仓位张数、杠杆强平缓冲和最小下单量已由程序 `risk.py` 100% 精确计算和自动缩量，`margin_usdt` 可留空交由系统按风险比例算，日常下单不要调 `ask_subagent(role="risk")` 自己吓停自己。
 
 # 每一轮按这个顺序做决定

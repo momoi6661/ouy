@@ -627,6 +627,9 @@ class Watcher:
         self._beat = 0.0
         self._watchdog_task: asyncio.Task[None] | None = None
         self._patrol_task: asyncio.Task[None] | None = None
+        self.feed: Any = None  # 实时报价 WebSocket（PriceFeed，Runtime 在真实环境下挂上）
+        self._wake_tick = asyncio.Event()
+        self._instant_at = 0.0
         self._maintenance_task: asyncio.Task[None] | None = None
         self.watchdog: dict[str, Any] = {"restarts": 0, "last": ""}
         self._chat_histories: dict[str, list[ModelMessage]] = {}
@@ -1503,12 +1506,17 @@ class Watcher:
         self._beat = time.time()
         self._task = asyncio.create_task(self._loop(), name="ouy-watcher")
         self._watchdog_task = asyncio.create_task(self._watch_loop(), name="ouy-watchdog")
+        if self.feed is not None:
+            cfg0 = self.get_config()
+            self.feed.start(cfg0.env, list(dict.fromkeys([*cfg0.instruments, BTC])))
         self._note("system", "Agent 已开始盯盘", {"instruments": self.get_config().instruments, "mode": self.get_config().mode})
         self.bus.publish("agent", self.status())
 
     async def stop(self, reason: str = "已手动停止") -> None:
         was_running = self.running
         self.running = False
+        if self.feed is not None:
+            await self.feed.stop()
         tasks = [self._task, self._watchdog_task, self._patrol_task, self._maintenance_task]
         for st in self.states.values():
             tasks.append(st.task)
@@ -1544,6 +1552,8 @@ class Watcher:
                 for name in ("workers", "subagents")
                 for lim in [self._limiter(cfg, name)]
             },
+            "feed": ({"connected": bool(self.feed.connected), "age": {k[1]: round(time.monotonic() - v[2], 1) for k, v in self.feed.prices.items() if k[0] == cfg.env}}
+                     if self.feed is not None else None),
             "router_adhoc": self.router_adhoc[-6:],
             "general": dict(self.general),
             "watchdog": {**self.watchdog, "beat_age": int(now - self._beat) if self.running and self._beat else None},
@@ -1657,8 +1667,80 @@ class Watcher:
                 failures += 1
                 self.last_error = str(exc)
                 log.exception("盯盘循环异常")
-            # 币多了每一拍的请求也多：拉长间隔，免得被欧易限流（每个币至少留 0.75 秒）
-            await asyncio.sleep(max(cfg.tick_seconds, len(cfg.instruments) * 0.75))
+            # 有实时 WebSocket 报价且触及任何触发线/反手/突破/撤单线时，_wake_tick 会立刻打断休眠毫秒级响应；平时按 tick_seconds 兜底同步账户和 K 线
+            wait = max(cfg.tick_seconds, len(cfg.instruments) * 0.75)
+            if self.feed is None:
+                await asyncio.sleep(wait)
+            else:
+                sleep_task = asyncio.create_task(asyncio.sleep(wait))
+                wake_task = asyncio.create_task(self._wake_tick.wait())
+                _, pending = await asyncio.wait({sleep_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                self._wake_tick.clear()
+
+    def _should_wake_now(self, cfg: AgentConfig, inst_id: str, prev_px: float, px: float) -> bool:
+        """纯内存判断（微秒级）：这笔最新实时报价是否刚触及任意触发线、反手单、突破/回踩位、挂单撤单线或保盈线。"""
+        lo, hi = (min(prev_px, px), max(prev_px, px)) if prev_px > 0 else (px, px)
+        for row in self.store.strategies(cfg.env, inst_id):
+            if row["status"] not in ("armed", "active"):
+                continue
+            kind, p = row["kind"], row["params"]
+            if kind == "trigger":
+                w, lv = p.get("when"), float(p.get("level") or 0)
+                if lv > 0:
+                    if w == "price_touch" and ((lo <= lv <= hi) or abs(px - lv) / lv <= 0.0005):
+                        return True
+                    if w == "price_above" and px >= lv:
+                        return True
+                    if w == "price_below" and px <= lv:
+                        return True
+            elif kind in ("breakout", "pullback", "reverse"):
+                for key in ("trigger", "stop_loss", "miss_px"):
+                    lv = float(p.get(key) or 0)
+                    if lv > 0 and lo <= lv <= hi:
+                        return True
+        for g in self.trader.order_guards(cfg.env, inst_id):
+            cpx = float(g.get("cancel_px") or 0)
+            if cpx > 0 and lo <= cpx <= hi:
+                return True
+        for m in self.lot_track(cfg.env).values():
+            if m.get("inst") == inst_id and m.get("open") and m.get("r0", 0) > 0:
+                entry = float(m["entry"])
+                gain = ((px - entry) if m["side"] == "long" else (entry - px)) / float(m["r0"])
+                if not m.get("locked") and gain >= LOCK_R.get(cfg.style_for(inst_id), 1.5):
+                    return True
+        return False
+
+    def on_live_price(self, env: str, inst_id: str, px: float, ts_ms: int) -> None:
+        """WebSocket 每推来一笔最新成交价：立刻刷图价、更新实时拐点，如果触及触发线/反手/撤单线立刻打断 3 秒休眠执行。"""
+        if not self.running or px <= 0:
+            return
+        cfg = self.get_config()
+        if env != cfg.env or inst_id not in cfg.instruments:
+            return
+        st = self._state(inst_id)
+        prev = st.last_px or px
+        st.prev_px, st.last_px = prev, px
+        self.bus.publish("tick", {"inst_id": inst_id, "last": px, "ts": ts_ms})
+        m_live = self.strategies.metrics.get(inst_id)
+        atr5 = float((m_live or {}).get("values", {}).get("atr") or 0.0)
+        turned = st.wave.update(ts_ms, px, atr5)
+        if m_live and m_live.get("values") is not None:
+            m_live["values"].update(st.wave.readings(px))
+        # 每笔实时 tick 直接算盘中走向（翻向 / 100%反包 / 30s 急拉急砸），命中立刻打断休眠秒级记标并叫醒 Agent
+        atr_pct = (atr5 / px * 100) if atr5 and px > 0 else 0.30
+        live_trend_now = st.wave.live_trend(px, atr5)
+        trend_changed = bool(live_trend_now and live_trend_now != st.wave.reported_trend)
+        c30 = st.wave.velocity(30, px)
+        # 急冲只在这个方向的 90 秒冷却过了才提前叫醒一次；暂停的 Worker 不会消费走向切换，不为它反复打断休眠
+        surge_now = abs(c30) >= max(0.35, atr_pct * 0.90) and ts_ms - st.wave._surge_at.get("long" if c30 > 0 else "short", 0) >= 90_000
+        if cfg.worker(inst_id).paused:
+            trend_changed = surge_now = False
+        if (turned or trend_changed or surge_now or self._should_wake_now(cfg, inst_id, prev, px)) and time.monotonic() - self._instant_at >= 0.25:
+            self._instant_at = time.monotonic()
+            self._wake_tick.set()
 
     async def _market_only(self, cfg: AgentConfig) -> None:
         tickers = await asyncio.gather(*(self.market.ticker(inst, cfg.env) for inst in cfg.instruments), return_exceptions=True)
@@ -1685,10 +1767,25 @@ class Watcher:
                     await self._check_goal(cfg, inst_id, account, time.time())
                 except Exception as exc:  # noqa: BLE001
                     log.warning("核对目标失败 %s: %s", inst_id, exc)
-        tickers = await asyncio.gather(*(self.market.ticker(i, cfg.env) for i in cfg.instruments), return_exceptions=True)
         now = time.time()
-        prices = {i: _f(t.get("last")) for i, t in zip(cfg.instruments, tickers) if not isinstance(t, BaseException)}
-        wave_flips: dict[str, str] = {}
+        prices: dict[str, float] = {}
+        ticker_map: dict[str, Any] = {}
+        need_http: list[str] = []
+        for i in cfg.instruments:
+            fresh = self.feed.fresh_price(cfg.env, i) if self.feed is not None else None
+            if fresh is not None:
+                prices[i] = fresh[0]
+                ticker_map[i] = {"last": fresh[0], "ts": fresh[1]}
+            else:
+                need_http.append(i)
+        if need_http:
+            fetched = await asyncio.gather(*(self.market.ticker(i, cfg.env) for i in need_http), return_exceptions=True)
+            for i, t in zip(need_http, fetched):
+                ticker_map[i] = t
+                if not isinstance(t, BaseException) and (p := _f(t.get("last"))):
+                    prices[i] = p
+        tickers = [ticker_map[i] for i in cfg.instruments]
+        wave_flips: dict[str, tuple[str, str]] = {}
         for inst_w, px_w in prices.items():
             if px_w > 0 and not cfg.worker(inst_w).paused:
                 st_w = self._state(inst_w)
@@ -1699,11 +1796,19 @@ class Watcher:
                     m_w["values"].update(st_w.wave.readings(px_w))
                 if flip := st_w.wave.trend_flip(px_w, atr_w):
                     side_f, text_f = flip
-                    wave_flips[inst_w] = text_f
-                    self._algo(cfg.env, inst_w, "wave", text_f, "盘中走向切换：立即重算行情判断与候选并通知 Worker", side_f, px_w, atr_w, sub="走向切换")
+                    is_cont = st_w.wave.is_continuation(px_w)
+                    sub_f = ("上涨延续" if side_f == "long" else "下跌延续") if is_cont else ("转向做多" if side_f == "long" else "转向做空")
+                    wave_flips[inst_w] = (side_f, text_f)
+                    self._algo(cfg.env, inst_w, "wave", text_f, "盘中走向切换：立即重算行情判断与候选并通知 Worker", side_f, px_w, atr_w, sub=sub_f, data={"continuation": is_cont})
                     if now_ms() - st_w.regime.get("ts", 0) >= 30_000:
                         st_w.algo_clock = None
                         st_w.algo_poll_after = 0
+                elif surge := st_w.wave.surge_event(now_ms(), px_w, atr_w):
+                    side_s, text_s = surge
+                    is_cont = st_w.wave.is_continuation(px_w)
+                    sub_s = ("急涨延续" if side_s == "long" else "急跌延续") if is_cont else ("急涨反包" if side_s == "long" else "急跌反包")
+                    wave_flips[inst_w] = (side_s, text_s)
+                    self._algo(cfg.env, inst_w, "wave", text_s, "盘中急拉/反包异动：立即通知 Worker 评估顺势或护仓", side_s, px_w, atr_w, sub=sub_s, data={"continuation": is_cont, "surge": True})
         try:  # 挂单的撤单线、有效期及近区提前拐头追进：满足即执行，不等模型
             await self._guard_orders(cfg, account, prices)
         except Exception as exc:  # noqa: BLE001 - 撤单/追单出错不能拖垮盯盘循环
@@ -1823,15 +1928,23 @@ class Watcher:
                         self.interject(inst_id, retest, "走势记录器")
                     else:
                         reason = f"{retest} 同时：{reason}" if reason else retest
-            if w_flip := wave_flips.get(inst_id):
-                note_w = f"{w_flip}。核对已有计划与挂单方向，顺最新走向给 plan 或调整。"
-                if not standby:
+            if wf := wave_flips.get(inst_id):
+                side_w, text_w = wf
+                adverse_pos = pos is not None and pos.side != side_w
+                # 回放：这类盘中切换 15 分钟后继续同向的只有约 45%，不是方向信号。只在它逆着持仓时马上叫醒 Worker 管仓，其余只留言
+                note_w = (
+                    f"{text_w}。【持仓逆向急变】这类盘中切换回放里 15 分钟后继续同向的只有约 45%，它不是平仓或反手指令："
+                    "对照本笔的结构周期收盘判断入场理由还在不在——结构周期已收盘破坏就按规矩减仓或离场，没破坏就守原止损，不追着它反手。"
+                    if adverse_pos else
+                    f"{text_w}。只是盘面记录（回放里 15 分钟后继续同向约 45%），不是入场或换方向的依据；方向仍按大周期和已收盘结构定。"
+                )
+                if adverse_pos:
                     if st.reviewing or st.lock.locked() or st.run is not None:
-                        self.interject(inst_id, note_w, "实时走向", market_key="wave")
-                    elif now - st.last_review_ts >= cfg.min_review_seconds:
-                        reason = f"{note_w} 同时：{reason}" if reason else note_w
+                        self.interject(inst_id, note_w, "实时走向")
                     else:
-                        self.interject(inst_id, note_w, "实时走向", market_key="wave")
+                        reason, hard = (f"{note_w} 同时：{reason}" if reason else note_w), True
+                elif not standby:
+                    self.interject(inst_id, note_w, "实时走向", market_key="wave")
             # 软事件（价格波动、定时）先过 Router 的第二级过滤；硬事件（首次、持仓变化、触及价位、进入入场区间、BTC 异动）直接唤醒
             if (not reason and btc_alert and inst_id != BTC and self._asset.get(inst_id, "crypto") == "crypto"
                     and account.position(inst_id) and now - st.last_review_ts >= cfg.min_review_seconds):
@@ -2037,7 +2150,7 @@ class Watcher:
         """浮盈冲出高点后，把止损移到「入场价 + 往返成本」（扣费后真实不亏）；现价空间还不够时等下一拍，绝不退而求其次移到不含手续费的裸买入价。"""
         long, entry, stop = lot["side"] == "long", lot["entry_px"], lot["stop_loss"]
         sign = 1 if long else -1
-        buffer = max(entry * (cfg.taker_fee_pct * 2 + 0.02) / 100, 0.1 * mark["r0"])
+        buffer = max(entry * (cfg.taker_fee_pct * 2 + 0.03) / 100, 0.1 * mark["r0"])
         lock_px = entry + sign * buffer
         if stop and (stop - lock_px) * sign >= 0:
             mark["locked"] = stop
@@ -3981,8 +4094,8 @@ class Watcher:
             lines.append(f"【算法读数（程序持续采样）】{rec_snap}")
         wave_text = self._state(inst_id).wave.summary(self._state(inst_id).last_px)
         if wave_text:
-            lines.append(f"【盘中实时拐点与波幅（WaveTracker 秒级记录）】{wave_text}。"
-                         "注：若你挂的回踩限价单稍偏低，价格回踩进入近区未触单便提前拐头，程序会自动撤旧改现价追进；持仓浮盈 ≥1.2R 后走出新波谷/波峰，程序也会自动把止损推到新拐点外侧。")
+            lines.append(f"【盘中实时拐点与涨速（WebSocket 毫秒流 · 2秒抗插针确认）】{wave_text}。"
+                         "说明：【走势延续】表示已越过前波峰/波谷顺势推进，【新拐点】表示刚出现反向拐头；你可用 add_trigger 直接按 wave_dir / wave_cont / chg_10s / chg_30s / chg_60s 设触发线。")
         turn = metrics.get("shift")
         state = turn_state(turn, metrics.get("turn"), self._state(inst_id).last_retest)
         if state and state["stage"] == "early":
@@ -4059,7 +4172,8 @@ class Watcher:
                 "【这个币的各笔仓位】" + "；".join(rows) + "。\n每一笔按它自己的风格管理（周期、止损宽度、持仓时间都按那一笔的风格），操作时带上 lot_id；"
                 "在 lot_verdicts 里对每一笔各给一个结论：继续拿 / 收紧止损 / 调整止盈 / 减仓 / 加仓 / 平仓，并写明理由。"
                 "轨迹里的浮盈最高点按初始止损距离（R）算：浮盈到过一段又回吐，说明原目标可能太远或行情在走弱，要正面回答还拿不拿、目标要不要收近。"
-                "保盈线由程序执行（默认浮盈冲出 1.5R~1.8R 高点后把止损移到入场价 + 往返成本，用户手动单不自动抢改止损），你不用重复做；想给这笔更多回撤空间，就用 deploy_strategy 的 manage 写 lot_id 和 lock_r=0，并说明理由。"
+                "保盈线由程序执行（默认浮盈冲出 1.5R~1.8R 高点后把止损移到「入场价 + 双边手续费与滑点」真保本位，绝不移到裸入场价亏手续费；用户手动单不自动抢改止损），你不用重复做。"
+                "【浮盈顺势加仓（金字塔滚仓）】原仓浮盈 ≥1.0R 且止损已移至含费净保本位以上（底仓零风险）时，若走势继续顺向延续或回踩支撑/EMA20 再次企稳，可调用 add_position 顺势加仓 50%~80%，并把合并止损同步上移到新均价含费保本或最近波谷/波峰外侧；浮亏时严禁胡乱补仓。"
                 "已成交仓位每次复核原止盈是否仍符合本笔结构周期：顺势延续且收盘突破中间阻力/支撑、有新的真实目标，才考虑延伸；"
                 "遇到反向收回、原目标难以到达时，可收近到仍在现价盈利方向的结构位。单根未收影线不是理由。"
                 "有实质变化时用 move_stops(lot_id, take_profit) 只改止盈，保留止损；原目标仍合理就不改单。"

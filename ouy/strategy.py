@@ -50,6 +50,7 @@ DATA = {
     "turn_stage": "转折苗头",
     "sig_long": "快判做多分数", "sig_short": "快判做空分数", "move_1m": "最近一根 1 分钟涨跌幅%", "vol_1m": "1 分钟量比",
     "wave_dir": "实时拐点走向", "wave_move_pct": "实时拐点幅度%", "retrace_pct": "占前段回撤比%",
+    "wave_cont": "是否延续走势", "chg_10s": "近10秒涨跌%", "chg_30s": "近30秒涨跌%", "chg_60s": "近60秒涨跌%",
 }
 DATA_HELP = {
     "shift_failure": "1=向上突破后失守，-1=向下突破后收回，0=尚未失守或已恢复；无近期结构或无有效报价时未知",
@@ -60,9 +61,11 @@ DATA_HELP = {
     "turn_stage": "看涨转折走到第几关为正、看跌为负：1 扫流动性，2 加动能背离，3 结构反转确认；0 = 没有",
     "sig_long": "快判现在给做多几分（0 = 没有信号；1 只有形态，带量 +1，顺大方向 +1）", "sig_short": "快判现在给做空几分",
     "move_1m": "最近一根收盘的 1 分钟 K 线从开盘到收盘的涨跌幅（%，每几秒更新）", "vol_1m": "最近一根收盘的 1 分钟 K 线的量 ÷ 前 20 根平均",
-    "wave_dir": "盘中实时拐点方向：1=从最近波谷向上拐头推进，-1=从最近波峰向下拐头回落，0=未分向",
+    "wave_dir": "盘中实时拐点方向（经2秒抗插针确认）：1=向上推进，-1=向下回落，0=未分向",
     "wave_move_pct": "当前这波从最近确认拐点走出的实时幅度（%，涨正跌负）",
     "retrace_pct": "当前这波幅度占上一段完整波幅的百分比（用于识别回调到位拐头）",
+    "wave_cont": "1=当前实时波段已越过前波峰/波谷属于延续走势，0=新拐点或震荡未延续",
+    "chg_10s": "WebSocket 实时报价近 10 秒涨跌幅（%）", "chg_30s": "WebSocket 实时报价近 30 秒涨跌幅（%）", "chg_60s": "WebSocket 实时报价近 60 秒涨跌幅（%）",
 }
 RECORDER_MAX_CONDS = 4
 
@@ -92,7 +95,7 @@ def _ref(p: dict[str, Any], key: str, line: str, off: str) -> str:
     if p.get(line):
         return f"「{p[line]}」" + (f"{p[off]:+g}%" if p.get(off) else "")
     return f"{p[key]:g}" if p.get(key) else ""
-TRIGGER_DO = {"open_limit": "open", "open_market": "open", "cancel_orders": "cancel_orders", "close": "close", "reduce": "reduce", "set_stops": "set_stops",
+TRIGGER_DO = {"open_limit": "open", "open_market": "open", "reverse": "open", "cancel_orders": "cancel_orders", "close": "close", "reduce": "reduce", "set_stops": "set_stops",
               "wake": "", "task": "", "router_task": ""}
 TRIGGER_TALK = ("wake", "task", "router_task")  # 不碰交易的动作：叫醒、Worker 自己做一项任务、交给 Router 派任务
 TRIGGER_BARS = {"1m": 1, "5m": 5, "15m": 15, "1H": 60}
@@ -101,6 +104,9 @@ ENTRY_TRIGGER_ACTIONS = ("open_limit", "open_market")
 
 def describe_action(side: str, p: dict[str, Any]) -> str:
     do, verb = p["do"], "买" if side == "long" else "卖"
+    if do == "reverse":
+        tp = _ref(p, "take_profit", "tp_line", "tp_offset_pct")
+        return f"平掉原仓并市价反手{'做多' if side == 'long' else '做空'}，止损 {_ref(p, 'stop_loss', 'stop_line', 'stop_offset_pct')}" + (f"，止盈 {tp}" if tp else "")
     if do in ("open_limit", "open_market"):
         head = f"挂限价{verb}单 @ {_ref(p, 'price', 'price_line', 'price_offset_pct')}" if do == "open_limit" else f"市价{'做多' if side == 'long' else '做空'}"
         tp = _ref(p, "take_profit", "tp_line", "tp_offset_pct")
@@ -149,6 +155,8 @@ def rule_parts(row: dict[str, Any]) -> tuple[str, str]:
     if kind == "profit_guard":
         when, _, do = text.partition("时")
         return when, do.split("，")[0]
+    if kind == "reverse":
+        return f"原仓止损且价格{'涨到' if row['side'] == 'long' else '跌到'} {p['trigger']:g}", f"自动反手{'做多' if row['side'] == 'long' else '做空'}，止损 {p['stop_loss']:g}" + (f"，止盈 {p['take_profit']:g}" if p.get("take_profit") else "")
     return {"range": "价格到区间两头", "martingale": "价格每逆向走一档", "grid": "价格每走一格"}.get(kind, "这笔仓位浮盈到设定的位置"), text
 LIVE = ("armed", "active")
 MAX_ERRORS = 3  # 连续出错这么多次就停掉这条策略
@@ -411,13 +419,15 @@ class StrategyEngine:
                     raise Rejected(f"条件「{when}」要给一个大于 0 的数值 level。")
                 if when.startswith("close") and bar not in TRIGGER_BARS:
                     raise Rejected(f"按 K 线收盘判断要指定周期 bar：{' / '.join(TRIGGER_BARS)}。")
-            if p["do"].startswith("open"):
+            if p["do"].startswith("open") or p["do"] == "reverse":
                 need(*(() if p.get("stop_line") else ("stop_loss",)), *(("price",) if p["do"] == "open_limit" and not p.get("price_line") else ()))
                 if side not in ("long", "short"):
-                    raise Rejected("开仓的触发线要指定方向 long 或 short。")
+                    raise Rejected("开仓或反手的触发线要指定方向 long 或 short。")
                 ref = p.get("price") if p["do"] == "open_limit" else p.get("level") if p["when"].startswith(("price", "close")) else None
                 if ref and p.get("stop_loss") and not p.get("stop_line") and not p.get("price_line") and (side == "long") != (p["stop_loss"] < ref):
                     raise Rejected("止损放错边了：做多的止损要低于入场价，做空的要高于入场价。")
+                if ref and p.get("take_profit") and not p.get("tp_line") and not p.get("price_line") and (side == "long") != (p["take_profit"] > ref):
+                    raise Rejected("止盈放错边了：做多的止盈要高于入场价，做空的要低于入场价。")
             elif p["do"] == "reduce":
                 need("fraction")
             elif p["do"] in ("task", "router_task"):
@@ -661,6 +671,7 @@ class StrategyEngine:
         hit = px >= p["trigger"] if triggers_above else px <= p["trigger"]
         if not hit:
             state.pop("confirm_ticks", None)
+            state.pop("crossed_ms", None)
             return "armed", ""
         if breakout and abs(px / p["trigger"] - 1) * 100 > p.get("max_chase_pct", 0.4):
             return "armed", f"价格已经冲过触发价 {abs(px / p['trigger'] - 1) * 100:.2f}%，不追，等回到触发价附近"
@@ -669,12 +680,29 @@ class StrategyEngine:
             if m and 0 <= now_ms() - m.get("fast_ts", 0) <= FAST_DATA_MS:
                 vol_1m = float(m["values"].get("vol_1m") or 0.0)
                 move_1m = float(m["values"].get("move_1m") or 0.0) * (1 if long else -1)
+                chg_30s = float(m["values"].get("chg_30s") or 0.0) * (1 if long else -1)
                 beyond_pct = (px / p["trigger"] - 1) * 100 * (1 if long else -1)
                 ticks = state["confirm_ticks"] = int(state.get("confirm_ticks") or 0) + 1
-                surging = vol_1m >= float(p["confirm_vol"]) and (move_1m > 0 or beyond_pct >= 0.08)
-                sustained = ticks >= 2 and beyond_pct >= 0.03
+                crossed = state.setdefault("crossed_ms", now_ms())
+                held_ok = now_ms() - crossed >= 1800 and beyond_pct >= 0.03
+                surging = (vol_1m >= float(p["confirm_vol"]) and (move_1m > 0 or beyond_pct >= 0.08)) or chg_30s >= 0.35
+                sustained = (ticks >= 2 and beyond_pct >= 0.03) or held_ok
                 if not (surging or sustained):
-                    return "armed", f"报价刚触及突破位 {p['trigger']:g}（1m 量比 {vol_1m:.2f}），再确认一拍防无量假针"
+                    return "armed", f"报价刚触及突破位 {p['trigger']:g}（1m 量比 {vol_1m:.2f}，30s {chg_30s:+.2f}%），站稳 1.8 秒防假针"
+        if not breakout:
+            # 回踩单防飞刀：价格进入回踩区但近 30 秒正逆向急砸且尚未拐头时，先追踪实时极值，等反向回弹 ≥0.12% 止跌/受阻确认再进
+            m_pb = self.fresh_metrics(cfg.env, row["inst_id"])
+            vals_pb = (m_pb.get("values") or {}) if m_pb else {}
+            sign_pb = 1 if long else -1
+            c30_pb = float(vals_pb.get("chg_30s") or 0.0) * sign_pb
+            wdir_pb = int(vals_pb.get("wave_dir") or 0)
+            if c30_pb <= -0.28 and wdir_pb == -sign_pb:
+                ext = state.get("trail_ext")
+                ext = min(ext, px) if (long and ext) else max(ext, px) if (not long and ext) else px
+                state["trail_ext"] = ext
+                rebound = ((px - ext) / ext * 100) if long else ((ext - px) / ext * 100)
+                if rebound < 0.12:
+                    return "armed", f"已进回踩区但 30s 仍在急{'跌' if long else '拉'}（{c30_pb:+.2f}%），追踪极值 {ext:g} 等拐头确认再进防接飞刀"
         if account.position(row["inst_id"]):
             return "cancelled", "已有持仓或入场委托，原入场规则不再执行"
         open_entries = [o for o in account.orders if o.inst_id == row["inst_id"] and not o.reduce_only]
@@ -843,6 +871,28 @@ class StrategyEngine:
             self.emit(cfg.env, inst, "strategy", "action", f"{cond} 已满足，但没执行成：{exc}", None, {"strategy_id": row["id"], "notify_worker": True})
             return "armed", f"这次没执行成：{exc}"
         reason = f"触发线 #{row['id']}：{cond}（现价 {px:g}）"
+        if p["do"] == "reverse":
+            if cfg.permission_for("close", inst) == "off" or cfg.permission_for("open", inst) == "off":
+                return "cancelled", f"{cond} 已满足，但平仓或开仓权限已关闭，没有执行反手"
+            pos = account.position(inst)
+            if pos and pos.side == row["side"]:
+                return "cancelled", f"{cond} 已满足，当前持仓已经是{'多' if row['side'] == 'long' else '空'}单，不用再反手"
+            try:
+                if pos:
+                    await self._order(cfg, row, TradeAction(kind="close", inst_id=inst, reason=f"{reason} · 自动反手先平仓"), "触发线反手平仓")
+                    account = await self.trader.account(cfg.env)
+                    if account.position(inst) is not None:
+                        return "failed", f"{cond} 已满足，但原仓位尚未确认平空，已停止反向开仓"
+                open_act = TradeAction(
+                    kind="open", inst_id=inst, side=row["side"], order_type="market",
+                    stop_loss=p["stop_loss"], take_profit=p.get("take_profit"), leverage=p.get("leverage"),
+                    risk_pct=p.get("risk_pct"), margin_usdt=p.get("margin_usdt"), style=p.get("style"), reason=f"{reason} · 自动反手开仓",
+                )
+                result = await self._order(cfg, row, open_act, "触发线反手开仓")
+                state["last_result"] = result.model_dump(mode="json")
+                return "done", f"{cond} 已满足，已完成平仓并反手：{result.message}"
+            except (Rejected, OkxError) as exc:
+                return "failed", f"{cond} 已满足，反手没执行成（不重试）：{str(exc)[:220]}"
         if p["do"].startswith("open"):
             action = TradeAction(
                 kind="open", inst_id=inst, side=row["side"], order_type="limit" if p["do"] == "open_limit" else "market",
@@ -943,7 +993,7 @@ class StrategyEngine:
             return "cancelled", f"价格已经冲过反手触发价 {abs(px / p['trigger'] - 1) * 100:.2f}%，追进去位置太差，作废"
         if (px - p["stop_loss"]) * sign <= 0:
             return "cancelled", "价格已经越过反手单的止损，作废"
-        result = await self._order(cfg, row, self._entry(account, row, row["side"], p["stop_loss"], p.get("take_profit"), px), "止损后自动反手")
+        result = await self._order(cfg, row, self._entry(account, row, row["side"], p["stop_loss"], p.get("take_profit"), px, margin=p.get("margin_usdt")), "止损后自动反手")
         return "done", f"已在 {px:g} 反手{'做多' if long else '做空'}，止损 {p['stop_loss']:g}：{result.message[:120]}"
 
     # ----- 持仓管理：移保本、分批止盈、跟踪止损、时间止损 -----
@@ -976,11 +1026,15 @@ class StrategyEngine:
             await self._order(cfg, row, TradeAction(kind="set_stops", inst_id=row["inst_id"], lot_id=lot["id"], stop_loss=stop, reason=what), what)
             state["stop"] = stop
 
+        sign = 1 if long else -1
+        fee_buf = entry * (cfg.taker_fee_pct * 2 + 0.03) / 100
+        be_px = float(f"{entry + sign * fee_buf:.8g}")
         if rules.get("breakeven_r") and not state.get("be") and gain >= rules["breakeven_r"]:
-            if not stop_now or (stop_now - entry) * (1 if long else -1) < 0:
-                await move(entry, f"浮盈到 {rules['breakeven_r']:g}R，止损移到保本 {entry:g}")
-                stop_now = entry
-            state["be"] = True
+            if (px - be_px) * sign > 0:
+                if not stop_now or (stop_now - be_px) * sign < 0:
+                    await move(be_px, f"浮盈到 {rules['breakeven_r']:g}R，止损移到含费净保本 {be_px:g}（覆盖双边手续费）")
+                    stop_now = be_px
+                state["be"] = True
         done = state.setdefault("partials", [])
         for i, part in enumerate(rules.get("partials") or []):
             if i not in done and gain >= part["r"]:

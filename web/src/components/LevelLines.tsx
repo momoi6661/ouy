@@ -7,6 +7,7 @@ const WINDOW_LINES: [string, string][] = [["30m", "#d8c06a"], ["1H", "#e0a458"],
 const WINDOW_NAME: Record<string, string> = { "30m": "30 分钟", "1H": "1 小时", "4H": "4 小时", "1D": "1 天" };
 /** 参考线和当前挂单按类控制显示。 */
 const GROUPS: [string, string, string, string][] = [
+  ["trend", "走势标记", "#22c55e", "在 K 线上用上下箭头清晰标出算法判断出走势的位置：上·延续 / 下·延续（同向结构推进）或 上·转折 / 下·转折（方向切换），方便入场与划线"],
   ["shift", "变盘点", "#38bdf8", "算法识别出的最近一次结构转折（BOS/CHoCH）：标出转折那根 K 线和顺势回踩参考线"],
   ["value", "价值区间", "#e879f9", "上一个 UTC 日成交最密集的价格带：POC 是成交最多的价格，VAH / VAL 是包住七成成交量的上沿和下沿。里面做两头，站稳在外面顺着做，冲出去又收回反着做"],
   ["open", "开盘价", "#facc15", "今天的开盘价（加密货币按 UTC 0 点，股票永续按美股开盘）和开盘后第一个小时的高低点；开盘价是当天的多空分界"],
@@ -24,16 +25,18 @@ const GROUPS: [string, string, string, string][] = [
 /** 加新的一类线之前存下来的开关：沿用，不让用户重新选一遍。 */
 function previousShow(): string[] {
   try {
+    const v6 = localStorage.getItem("ouy.chart.show.v6");
+    if (v6) return [...(JSON.parse(v6) as string[]), "trend"];
     const raw = localStorage.getItem("ouy.chart.show.v5");
-    if (raw) return JSON.parse(raw) as string[];
+    if (raw) return [...(JSON.parse(raw) as string[]), "orders", "trend"];
     const v4 = localStorage.getItem("ouy.chart.show.v4");
-    if (v4) return [...(JSON.parse(v4) as string[]), "events"];
+    if (v4) return [...(JSON.parse(v4) as string[]), "events", "orders", "trend"];
     const older = localStorage.getItem("ouy.chart.show.v3");
-    if (older) return [...(JSON.parse(older) as string[]), "algo"];
+    if (older) return [...(JSON.parse(older) as string[]), "algo", "events", "orders", "trend"];
   } catch {
     /* 读不到就用默认值 */
   }
-  return ["shift", "plan", "trigger", "algo", "events"];
+  return ["trend", "shift", "plan", "trigger", "algo", "events", "orders"];
 }
 
 /** 一条线到了之后程序做什么，画在图上的名字。action 是规则的动作（open_market / cancel_orders / close / wake），
@@ -55,6 +58,8 @@ export function lineKind(action: unknown): string | null {
     case "open_market":
     case "enter":
       return "进场线";
+    case "reverse":
+      return "反手线";
     case "cancel_orders":
     case "cancel":
       return "撤单线";
@@ -73,25 +78,58 @@ export function lineKind(action: unknown): string | null {
 export function useLevelLines(inst: string, bar: string, candidates?: Candidate[]) {
   const [levels, setLevels] = useState<ChartLevels | null>(null);
   const [showWin, setShowWin] = useStored<string[]>("ouy.chart.windows", ["1H"]);
-  const [show, setShow] = useStored<string[]>("ouy.chart.show.v6", [...previousShow(), "orders"]);
+  const [show, setShow] = useStored<string[]>("ouy.chart.show.v7", previousShow());
   const [algo, setAlgo] = useState<AlgoReport | null>(null);
-  const showEvents = show.includes("events");
+  const showEvents = show.includes("events") || show.includes("trend");
   useEffect(() => {
     if (!showEvents) return setAlgo(null);
     let alive = true;
     const load = () => api.algo(inst).then((r) => alive && setAlgo(r), () => {});
     setAlgo(null);
     load();
-    const timer = window.setInterval(load, 20_000);
+    const timer = window.setInterval(load, 6_000);
     return () => {
       alive = false;
       window.clearInterval(timer);
     };
   }, [inst, showEvents]);
-  const algoMarks = useMemo(
-    () => (algo?.events ?? []).map((e) => ({ ts: e.ts, side: e.side, label: algo?.labels[e.algo] ?? e.algo, ok: e.checks["15m"]?.ok })),
-    [algo],
-  );
+  const showTrend = show.includes("trend");
+  const showDots = show.includes("events");
+  const algoMarks = useMemo(() => {
+    const out: { ts: number; side: string; label: string; ok?: string; shape?: "arrowUp" | "arrowDown" | "circle"; color?: string }[] = [];
+    if (showTrend && levels?.trend_marks?.length) {
+      for (const m of levels.trend_marks) {
+        out.push({
+          ts: m.ts,
+          side: m.side,
+          label: m.label,
+          shape: m.side === "long" ? "arrowUp" : "arrowDown",
+          color: m.continuation ? (m.side === "long" ? "#0ecb81" : "#f6465d") : "#38bdf8",
+        });
+      }
+    }
+    if (algo?.events?.length) {
+      for (const e of algo.events) {
+        const isDir = e.side === "long" || e.side === "short";
+        if (showTrend && isDir && (e.algo === "regime" || e.algo === "run")) {
+          const cont = Boolean(e.data?.continuation) || e.algo === "run" || e.text.includes("延续");
+          const dirTxt = e.side === "long" ? "上" : "下";
+          out.push({
+            ts: e.ts,
+            side: e.side,
+            label: `${dirTxt}·${cont ? "延续" : "转折"}`,
+            shape: e.side === "long" ? "arrowUp" : "arrowDown",
+            color: cont ? (e.side === "long" ? "#0ecb81" : "#f6465d") : "#38bdf8",
+          });
+          continue;
+        }
+        if (showDots && e.algo !== "wave") {
+          out.push({ ts: e.ts, side: e.side, label: algo.labels[e.algo] ?? e.algo, ok: e.checks["15m"]?.ok });
+        }
+      }
+    }
+    return out;
+  }, [algo, levels?.trend_marks, showTrend, showDots]);
   const on = (group: string) => show.includes(group);
   useEffect(() => {
     let alive = true;

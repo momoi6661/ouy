@@ -209,6 +209,53 @@ SHIFT_BREAK_ATR = 0.3  # 收盘要越过摆动点至少多少个 ATR 才算破
 SHIFT_MOVE_ATR = 2.5  # 这一段要走出多少个 ATR 才算有力度（不是磨过去的）
 
 
+def chart_trend_marks(bars: Sequence[Candle], wing: int = 2, max_marks: int = 12) -> list[dict[str, Any]]:
+    """扫描当前图表的已收盘 K 线，标出算法判断出走势的关键位置：方向（上/下）以及是否是延续走势（BOS 延续 vs CHoCH 转折）。"""
+    from ..indicators import swings
+
+    closed = [c for c in bars if c.confirmed]
+    if len(closed) < 35:
+        return []
+    series = atr_series(closed)
+    marks: list[dict[str, Any]] = []
+    trend = ""  # 当前已确立的结构方向："long" / "short" / ""
+    last_pivot_ts: dict[str, int] = {}
+    start = max(25, len(closed) - 110)
+    for i in range(start, len(closed)):
+        bar, a = closed[i], series[i - 1]
+        if not a:
+            continue
+        highs, lows = swings(closed[:i], wing)
+        if len(highs) < 2 or len(lows) < 2:
+            continue
+        for long in (True, False):
+            side = "long" if long else "short"
+            piv_idx, pivot = highs[-1] if long else lows[-1]
+            sign = 1 if long else -1
+            if (bar.close - pivot) * sign < SHIFT_BREAK_ATR * a or (closed[i - 1].close - pivot) * sign >= SHIFT_BREAK_ATR * a:
+                continue
+            piv_ts = closed[piv_idx].ts
+            if last_pivot_ts.get(side) == piv_ts:
+                continue  # 同一个摆动点只标一次
+            last_pivot_ts[side] = piv_ts
+            # 判断之前结构是否已在同方向（延续）还是从反方向反转过来（转折）
+            if trend:
+                cont = trend == side
+            else:
+                cont = (highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]) if long else (highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1])
+            trend = side
+            dir_txt = "上" if long else "下"
+            kind_txt = "延续" if cont else "转折"
+            marks.append({
+                "ts": bar.ts,
+                "side": side,
+                "continuation": cont,
+                "level": round(pivot, 8),
+                "label": f"{dir_txt}·{kind_txt}",
+            })
+    return marks[-max_marks:]
+
+
 def structure_shift(bars: Sequence[Candle], wing: int = 2) -> dict[str, Any] | None:
     """最近走势有没有变：K 线收盘有力地越过了最近一个摆动高点（转向上）或摆动低点（转向下），而且到现在还没被收回去。
     之前是反着的结构（越过高点之前高低点都在降低）叫「反转」，本来就同向的叫「延续」。只认已收盘的 K 线。

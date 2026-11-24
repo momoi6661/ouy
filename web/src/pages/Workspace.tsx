@@ -138,6 +138,44 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
     return !!sid && (agent.instruments[a.inst_id]?.strategies ?? []).some((x) => x.id === sid && x.status === "proposed");
   };
 
+  const [openTaskId, setOpenTaskId] = useState<number | null>(null);
+  const [taskDetail, setTaskDetail] = useState<(WorkItem & { activity: Activity[] }) | null>(null);
+  const [taskLoading, setTaskLoading] = useState(false);
+  const toggleTask = async (id: number) => {
+    if (openTaskId === id) {
+      setOpenTaskId(null);
+      setTaskDetail(null);
+      return;
+    }
+    setOpenTaskId(id);
+    setTaskDetail(null);
+    setTaskLoading(true);
+    try {
+      setTaskDetail(await api.workDetail(id));
+    } catch (e: any) {
+      toast(e.message, "error");
+    } finally {
+      setTaskLoading(false);
+    }
+  };
+
+  const decidePending = (id: number, ok: boolean) =>
+    act(`p${id}`, async () => {
+      if (ok) {
+        const r = await api.approve(id);
+        if (r.status !== "executed") toast(`${STATUS_LABEL[r.status] ?? r.status}：${r.message}`, "error");
+      } else {
+        await api.reject(id);
+      }
+      window.dispatchEvent(new Event("ouy:work"));
+    }, ok ? "已同意并提交" : "已拒绝该操作");
+
+  const decideStrat = (id: number, ok: boolean) =>
+    act(`s${id}`, async () => {
+      await api.strategyAct(id, ok ? "approve" : "cancel");
+      window.dispatchEvent(new Event("ouy:work"));
+    }, ok ? "策略已启用" : "策略已拒绝");
+
   /** 活动记录保留这一步的状态。 */
   const askCard = (a: Activity) => {
     const pid = a.data?.pending_id as number | undefined;
@@ -168,6 +206,18 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
         )}
         {s && <div className="ask-text">{s.text}</div>}
         {(p?.action.reason || s?.note) && <div className="muted small">{p?.action.reason || s?.note}</div>}
+        {waiting && p && (
+          <div className="row" style={{ marginTop: 6, gap: 6 }}>
+            <button className="btn xs primary" disabled={!!acting} onClick={() => decidePending(p.id, true)}>同意执行</button>
+            <button className="btn xs" disabled={!!acting} onClick={() => decidePending(p.id, false)}>不执行</button>
+          </div>
+        )}
+        {waiting && !p && s && (
+          <div className="row" style={{ marginTop: 6, gap: 6 }}>
+            <button className="btn xs primary" disabled={!!acting} onClick={() => decideStrat(s.id, true)}>同意启用</button>
+            <button className="btn xs" disabled={!!acting} onClick={() => decideStrat(s.id, false)}>不启用</button>
+          </div>
+        )}
       </div>
     );
   };
@@ -546,6 +596,40 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
             {feed === "all" ? "返回对话" : "查看团队动态"}
           </button>
         </div>
+        {(pending.length > 0 || Object.values(agent.instruments).some((x) => (x.strategies ?? []).some((s) => s.status === "proposed"))) && (
+          <div className="pend-bar">
+            {pending.map((p) => (
+              <div key={`pb-${p.id}`} className="pend-item">
+                <div className="pend-info">
+                  <span className="tag warn">等你同意</span>
+                  <b>{p.title}</b>
+                  {p.action.reason && <span className="muted small">{p.action.reason}</span>}
+                </div>
+                <div className="row" style={{ gap: 6 }}>
+                  <button className="btn xs primary" disabled={!!acting} onClick={() => decidePending(p.id, true)}>同意执行</button>
+                  <button className="btn xs" disabled={!!acting} onClick={() => decidePending(p.id, false)}>不执行</button>
+                </div>
+              </div>
+            ))}
+            {Object.entries(agent.instruments).flatMap(([id, info]) =>
+              (info.strategies ?? [])
+                .filter((s) => s.status === "proposed")
+                .map((s) => (
+                  <div key={`sb-${s.id}`} className="pend-item">
+                    <div className="pend-info">
+                      <span className="tag warn">等你同意</span>
+                      <b>{shortInst(id)} · 策略「{s.label}」</b>
+                      <span className="muted small">{s.text}</span>
+                    </div>
+                    <div className="row" style={{ gap: 6 }}>
+                      <button className="btn xs primary" disabled={!!acting} onClick={() => decideStrat(s.id, true)}>同意启用</button>
+                      <button className="btn xs" disabled={!!acting} onClick={() => decideStrat(s.id, false)}>不启用</button>
+                    </div>
+                  </div>
+                )),
+            )}
+          </div>
+        )}
           <ChatPanel inst={coin} config={cfg} agent={agent} activity={activity} defaultEffort={cfg.reasoning_effort} shown={shownPlan} hidden={feed === "all"}
             onShow={(plan) => {
               setShownPlan(plan);
@@ -980,18 +1064,82 @@ export function Workspace({ state, account, ticks, pending, activity, inst, redU
               清除已完成
             </button>
           </h5>
-          {openWork.length === 0 && <p className="muted">现在没有在做的任务{st?.next_review_in != null ? `，${st.next_review_in} 秒后下一次复盘` : ""}。</p>}
-          {[...openWork, ...pastWork].map((w) => (
-            <div key={w.id} className="task-row" title={w.result || w.goal}>
-              <em className={`st-${w.status}`}>{WORK_STATE[w.status]}</em>
-              <div>
-                <b>{WORK_FROM[w.source] ?? w.source}：{w.goal}</b>
-                {w.result && <span>{w.result.replace(/[*#`]/g, "")}</span>}
-                {w.status === "failed" && <ErrorDetails workId={w.id} message={w.result} />}
+          {pending.filter((p) => p.action.inst_id === coin).map((p) => (
+            <div key={`tp-${p.id}`} className="ask-card waiting" style={{ marginBottom: 8 }}>
+              <div className="ask-head">
+                <b>{p.title}</b>
+                <span>等你同意</span>
               </div>
-              <time>{fmtTime(w.ts)}</time>
+              {p.preview?.contracts && (
+                <div className="ask-grid">
+                  <span>投入 / 名义</span>
+                  <b>{fmtUsd(p.preview.margin_usd, 0)} U / {fmtUsd(p.preview.notional_usd, 0)} U</b>
+                  <span>止损 / 最多亏</span>
+                  <b className="down-fixed">{fmtPx(p.preview.stop_loss)}（-{fmtUsd(p.preview.risk_usd)} U）</b>
+                </div>
+              )}
+              {p.action.reason && <div className="muted small" style={{ marginTop: 4 }}>{p.action.reason}</div>}
+              <div className="row" style={{ marginTop: 8, gap: 6 }}>
+                <button className="btn xs primary" disabled={!!acting} onClick={() => decidePending(p.id, true)}>同意执行</button>
+                <button className="btn xs" disabled={!!acting} onClick={() => decidePending(p.id, false)}>不执行</button>
+              </div>
             </div>
           ))}
+          {(st?.strategies ?? []).filter((s) => s.status === "proposed").map((s) => (
+            <div key={`ts-${s.id}`} className="ask-card waiting" style={{ marginBottom: 8 }}>
+              <div className="ask-head">
+                <b>布置策略「{s.label}」</b>
+                <span>等你同意</span>
+              </div>
+              <div className="ask-text">{s.text}</div>
+              {s.note && <div className="muted small">{s.note}</div>}
+              <div className="row" style={{ marginTop: 8, gap: 6 }}>
+                <button className="btn xs primary" disabled={!!acting} onClick={() => decideStrat(s.id, true)}>同意启用</button>
+                <button className="btn xs" disabled={!!acting} onClick={() => decideStrat(s.id, false)}>不启用</button>
+              </div>
+            </div>
+          ))}
+          {openWork.length === 0 && <p className="muted">现在没有在做的任务{st?.next_review_in != null ? `，${st.next_review_in} 秒后下一次复盘` : ""}。</p>}
+          {[...openWork, ...pastWork].map((w) => {
+            const expanded = openTaskId === w.id;
+            return (
+              <div key={w.id} className={`task-wrap ${expanded ? "open" : ""}`}>
+                <div className="task-row clickable" onClick={() => toggleTask(w.id)} title="点击展开查看完整过程与工具调用明细">
+                  <em className={`st-${w.status}`}>{WORK_STATE[w.status]}</em>
+                  <div>
+                    <b>{WORK_FROM[w.source] ?? w.source}：{w.goal}</b>
+                    {w.result && <span>{w.result.replace(/[*#`]/g, "")}</span>}
+                    {w.status === "failed" && <ErrorDetails workId={w.id} message={w.result} />}
+                  </div>
+                  <div className="task-right">
+                    <time>{fmtTime(w.ts)}</time>
+                    <span className="link small">{expanded ? "收起 ▴" : "查看 ▾"}</span>
+                  </div>
+                </div>
+                {expanded && (
+                  <div className="task-detail">
+                    {taskLoading ? (
+                      <div className="muted small">加载明细中…</div>
+                    ) : taskDetail && taskDetail.id === w.id ? (
+                      <>
+                        {taskDetail.activity.length === 0 ? (
+                          <div className="muted small">暂无更详细的步骤记录。</div>
+                        ) : (
+                          taskDetail.activity.map((ev) => (
+                            <div key={ev.id} className="task-step small">
+                              <span className="muted">{fmtTime(ev.ts)}</span>
+                              <span className="tag">{ev.kind}</span>
+                              <span style={{ flex: 1, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{ev.text}</span>
+                            </div>
+                          ))
+                        )}
+                      </>
+                    ) : null}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
         <div className="ws-card wide trg" hidden={sideTab !== "triggers"}>
           <div className="trg-head">

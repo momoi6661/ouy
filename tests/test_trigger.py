@@ -611,3 +611,69 @@ def test_a_wake_line_always_fires_on_touch_even_if_the_worker_asked_for_a_close(
     assert (cancel.when, cancel.bar) == ("close_below", "5m")
     enter = PlanLine(price=71.54, when="close_above", bar="5m", do="enter", side="long", stop_loss=71.2, take_profit=72.2, note="站上前高跟多")
     assert enter.when == "close_above"
+
+
+async def test_reverse_trigger_line_and_after_stop_rule(rt, fake):
+    """用户可提前设置两类自动反手触发器：① 到点位自动先平仓核实归零再开反向单（/api/lines do=reverse）；② 止损后自动反手（/api/strategies/reverse）。"""
+    import httpx
+    from ouy.app import create_app
+    from ouy.models import TradeAction
+    from ouy.strategy import rule_parts
+
+    app = create_app(rt)
+    async with app.router.lifespan_context(app), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8899") as client:
+        await rt.trader.execute(TradeAction(kind="open", inst_id=BTC, side="long", leverage=5, stop_loss=59_400, reason="测试"), "demo", source="user")
+        assert fake.positions[BTC]["pos"] > 0
+
+        r_after = await client.post("/api/strategies/reverse", json={"inst_id": BTC, "side": "short", "trigger": 59_380, "stop_loss": 59_800, "take_profit": 58_500, "leverage": 20, "margin_usdt": 15.0, "window_minutes": 60})
+        assert r_after.status_code == 200
+        row_after = r_after.json()
+        when_s, do_s = rule_parts(row_after)
+        assert row_after["kind"] == "reverse" and row_after["params"]["margin_usdt"] == 15.0 and row_after["params"]["leverage"] == 20 and "原仓止损" in when_s and "自动反手做空" in do_s
+        await client.post(f"/api/strategies/{row_after['id']}/cancel")
+
+        r_line = await client.post("/api/lines", json={"inst_id": BTC, "when": "price_touch", "level": 59_500, "do": "reverse", "side": "short", "stop_loss": 59_900, "take_profit": 58_600, "leverage": 5, "margin_usdt": 50.0})
+        assert r_line.status_code == 200
+        row_line = r_line.json()
+        assert row_line["params"]["do"] == "reverse" and row_line["params"]["margin_usdt"] == 50.0 and "平掉原仓并市价反手做空" in rt.watcher.strategies.describe(row_line)
+
+        await tick(rt, fake, 59_800)
+        assert fake.positions[BTC]["pos"] > 0 and rt.store.get_strategy(row_line["id"])["status"] == "armed"
+
+        await tick(rt, fake, 59_500)
+        assert rt.store.get_strategy(row_line["id"])["status"] == "done"
+        assert fake.positions[BTC]["pos"] < 0
+        assert fake.algos[0]["slTriggerPx"] == "59900" and fake.algos[0]["tpTriggerPx"] == "58600"
+
+
+async def test_live_price_feed_wakes_immediately_on_trigger_and_skips_redundant_http_poll(rt, fake):
+    """实时 WebSocket 报价：平时不打断 3 秒周期，一旦触及触发线立刻置位 _wake_tick 毫秒级执行；且 _tick 直接复用新鲜 WS 报价不发多余 HTTP ticker。"""
+    import time
+    from ouy.okx.feed import PriceFeed
+    from ouy.store import now_ms
+
+    rt.save_config(rt.config().model_copy(update={"instruments": [BTC]}))
+    w = rt.watcher
+    w.running = True
+    w.feed = PriceFeed(on_tick=w.on_live_price)
+    add(rt, when="price_touch", level=59_500, do="wake", wake_note="触及反手线")
+
+    st = w._state(BTC)
+    st.last_px, st.last_review_ts, st.next_due_ts = 60_000.0, time.time(), time.time() + 3600
+    w._wake_tick.clear()
+    # 普通波动未碰线：更新最新价但不提前打断休眠
+    w.on_live_price("demo", BTC, 59_900.0, now_ms())
+    assert st.last_px == 59_900.0 and not w._wake_tick.is_set()
+
+    # 价格瞬间触及 59500 触发线：毫秒级置位 _wake_tick 立刻唤醒执行！
+    w.on_live_price("demo", BTC, 59_500.0, now_ms())
+    assert w._wake_tick.is_set()
+
+    # 首次 _tick 后算法时钟就绪，之后 _tick 直接复用新鲜 WS 报价，不再发 HTTP market_get_ticker
+    w.feed.prices[("demo", BTC)] = (59_500.0, now_ms(), time.monotonic())
+    await w._tick(rt.config())
+    before = len(fake.called("market_get_ticker"))
+    w.feed.prices[("demo", BTC)] = (59_510.0, now_ms(), time.monotonic())
+    await w._tick(rt.config())
+    assert len(fake.called("market_get_ticker")) == before
+    w.running = False

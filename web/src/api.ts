@@ -312,6 +312,8 @@ export interface ChartLevels {
   patterns: string[];
   windows: Record<string, { prev_high: number; prev_low: number; trend: string; now: string; plan?: string }>;
   shift?: StructureShift | null;
+  /** 算法在当前图表识别出的走势标记：方向（上/下）及是否是延续走势（上·延续 / 下·延续 / 上·转折 / 下·转折） */
+  trend_marks?: { ts: number; side: "long" | "short"; continuation: boolean; level: number; label: string }[];
   /** 上一个 UTC 日的价值区间：成交最密集的价格 poc，包住七成成交量的上沿 vah / 下沿 val */
   value_area?: { poc: number; vah: number; val: number; open?: string; now?: string; read?: string } | null;
   /** 开盘以来怎么走的：开盘价、相对开盘的涨跌、哪种走法，以及开盘后第一个小时的高低点 */
@@ -946,8 +948,10 @@ export const api = {
     post<{ id: number }>(`/api/lots/${id}/profit-guard`, rules),
   strategyAct: (id: number, verb: "approve" | "cancel") => post<Strategy>(`/api/strategies/${id}/${verb}`),
   editStrategy: (id: number, patch: { conds?: RecorderCond[]; level?: number; cooldown_minutes?: number; off?: boolean }) => post<Strategy>(`/api/strategies/${id}/edit`, patch),
-  addLine: (body: { inst_id: string; when: "price_touch" | "close_above" | "close_below" | "data_above" | "data_below"; level: number; data?: string; bar?: string; do: "wake" | "cancel_orders" | "close" | "open"; side?: "long" | "short"; stop_loss?: number; take_profit?: number; note?: string }) =>
+  addLine: (body: { inst_id: string; when: "price_touch" | "close_above" | "close_below" | "data_above" | "data_below"; level: number; data?: string; bar?: string; do: "wake" | "cancel_orders" | "close" | "open" | "reverse"; side?: "long" | "short"; stop_loss?: number; take_profit?: number; leverage?: number; margin_usdt?: number; note?: string }) =>
     post<Strategy>("/api/lines", body),
+  addReverseRule: (body: { inst_id: string; side: "long" | "short"; trigger: number; stop_loss: number; take_profit?: number; leverage?: number; margin_usdt?: number; window_minutes?: number; note?: string }) =>
+    post<Strategy>("/api/strategies/reverse", body),
   interject: (inst: string, message: string) => post<{ delivered: boolean; message: string }>("/api/agent/interject", { inst_id: inst, message }),
   standby: (inst: string, on: boolean) => post<AgentStatus>("/api/agent/standby", { inst_id: inst, on }),
   setGoal: (inst: string, goal: string, max_loss_usdt?: number, hours?: number, target_usdt?: number, stop_when?: string) =>

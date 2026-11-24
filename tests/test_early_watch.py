@@ -176,7 +176,7 @@ async def test_a_run_wakes_the_worker_once_per_step_and_is_recorded(rt, fake, mo
 def test_wave_tracker_records_pivots_direction_and_amplitude():
     from ouy.agent.early_watch import WaveTracker
 
-    wt = WaveTracker()
+    wt = WaveTracker(hold_ms=0)
     assert not wt.update(1000, 100.0, atr5=0.5)
     assert not wt.update(2000, 100.1, atr5=0.5)
     assert wt.update(3000, 100.5, atr5=0.5)  # 向上拐头推进
@@ -195,14 +195,14 @@ def test_wave_tracker_records_pivots_direction_and_amplitude():
     assert flip and flip[0] == "long" and "盘中实时走向转多" in flip[1]
     assert wt.trend_flip(102.5, atr5=0.5) is None  # 同方向不重复触发
 
-    # 验证打破整点死锁：上一小时虽标为上涨，但小周期已转 downtrend 且实时拐点走向转 short 时，大方向立即切换为 short
+    # 盘中实时走向不改大方向（回放里它切换后继续同向不到一半）：上一小时是上涨，就仍按上涨
     from ouy.agent.plan import major_direction
     snap = {
         "last": 76.0, "live_wave": {"trend": "short"},
         "timeframes": {"5m": {"structure": "downtrend", "adx14": 35, "atr14": 0.4}},
         "windows": {"1H": {"trend": "上涨（高点低点都在抬高）"}},
     }
-    assert major_direction(snap, "scalp") == ("short", "实时拐点走向")
+    assert major_direction(snap, "scalp")[0] == "long"
 
 
 async def test_pullback_limit_catches_up_on_early_turn_and_position_trails_new_pivot(settings, fake):
@@ -223,7 +223,7 @@ async def test_pullback_limit_catches_up_on_early_turn_and_position_trails_new_p
     assert len(fake.orders) == 1 and float(fake.orders[0]["px"]) == 59_700 and BTC not in fake.positions
 
     t0 = int(time.time() * 1000) + 1000
-    for dt, px in ((0, 60_000), (1000, 59_800), (2000, 59_950)):
+    for dt, px in ((0, 60_000), (3000, 59_800), (6000, 59_950)):
         st.wave.update(t0 + dt, px, atr5=80.0)
         fake.set_price(BTC, px)
         st.last_px = px
@@ -235,11 +235,51 @@ async def test_pullback_limit_catches_up_on_early_turn_and_position_trails_new_p
     # 3. 持仓浮盈 ≥1.2R 后走出新的更高波谷 60400 并向上推进到 60800 → 自动把止损推到新波谷 60400 外侧
     rt.trader._lot_touch.clear()
     await rt.trader.account("demo")
-    t1 = int(time.time() * 1000) + 5000
-    for dt, px in ((0, 60_650), (1000, 60_400), (2000, 60_800)):
+    t1 = int(time.time() * 1000) + 12000
+    for dt, px in ((0, 60_650), (3000, 60_400), (6000, 60_800)):
         st.wave.update(t1 + dt, px, atr5=80.0)
         fake.set_price(BTC, px)
         st.last_px = px
         await rt.watcher._watch_lots(rt.config(), BTC, st, time.time())
     new_sl = rt.trader.lots("demo", BTC)[0]["stop_loss"]
     assert 60_200 < new_sl < 60_400
+
+
+def test_wave_tracker_rejects_short_wick_computes_velocity_and_chart_trend_marks():
+    """高频实时报价：0.5 秒毛刺假针不确认拐点，站稳 2 秒后确认；同时算出 10s/30s/60s 涨速与图表「上·延续 / 下·转折」标记。"""
+    from ouy.agent.early_watch import WaveTracker
+    from ouy.agent.signals import chart_trend_marks
+
+    w = WaveTracker(hold_ms=2000)
+    t = 1_700_000_000_000
+    w.update(t, 100.0, 0.2)
+    # 0.5 秒瞬间插一根 +0.4% 的毛刺针又缩回：不确认拐点
+    assert w.update(t + 500, 100.4, 0.2) is False and w.dir == 0
+    assert w.update(t + 900, 100.05, 0.2) is False and w.dir == 0
+    # 真正站稳 2 秒以上：确认向上拐点
+    assert w.update(t + 1500, 100.35, 0.2) is False
+    assert w.update(t + 3600, 100.40, 0.2) is True and w.dir == 1
+
+    # 连续推高 35 秒形成 +0.8% 急涨，验证 chg_10s / chg_30s 与 surge_event
+    for sec in range(5, 36, 5):
+        px = 100.4 + sec * 0.025
+        w.update(t + 3600 + sec * 1000, px, 0.2)
+    r = w.readings(100.4 + 35 * 0.025)
+    assert r["chg_10s"] > 0 and r["chg_30s"] >= 0.5
+    surge = w.surge_event(t + 39_600, 100.4 + 35 * 0.025, 0.2)
+    assert surge is not None and surge[0] == "long"
+
+    # 验证盘中 100%+ 反包大涨（如实盘 ETH 下跌后瞬间反包 +0.35% / 116%）：立即触发 live_trend("long") 与 surge_event("long")
+    w2 = WaveTracker(hold_ms=0)
+    w2.update(t, 1702.0, 5.2)
+    w2.update(t + 3000, 1696.8, 5.2)  # 下跌 -0.305%
+    w2.update(t + 6000, 1702.99, 5.2)  # 瞬间拉起 +0.365%（反包 119%）
+    assert w2.live_trend(1702.99, 5.2) == "long"
+    assert w2.surge_event(t + 6000, 1702.99, 5.2)[0] == "long"
+
+    # 图表走势标记：连续上升台阶再下破反转，能清晰分出「上·延续」与「下·转折」
+    seq = [100, 101, 100, 102, 101, 103, 102, 104, 103, 105, 104, 106, 105, 107, 106, 108]
+    bars_px = [*([100, 101] * 14), *seq, 111, 112, 110, 109, 111, 114, 115, 112, 107, 104]
+    marks = chart_trend_marks(_closes(bars_px))
+    assert any(m["side"] == "long" and "上·" in m["label"] for m in marks)
+    assert any(m["side"] == "short" and m["label"] == "下·转折" for m in marks)

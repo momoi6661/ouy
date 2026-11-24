@@ -1774,6 +1774,37 @@ async def test_context_center_inspects_prompt_and_archives_without_wiping_memory
         assert (await client.delete(f"/api/agent/memory/{BTC}/{mid}")).json()["items"] == []
 
 
+async def test_anti_paper_hands_guard_blocks_early_breakeven_and_panic_close(settings, fake):
+    """方案 A 持仓硬护栏：浮盈未达 1.2R 拦截 Worker 把止损贴回入场价；开仓 10 分钟内无结构收盘破坏拦截恐慌平仓。"""
+    from pydantic_ai import RunContext
+    from pydantic_ai.usage import RunUsage
+    from ouy.agent.core import Deps, close_position, move_stops
+
+    rt = make_rt(settings, fake, "test")
+    await _open(rt)  # 多单 60000，止损 59400 → 1R = 600
+    lot = rt.trader.lots("demo", BTC)[0]
+    fake.set_price(BTC, 60_360)  # +0.6R，未达 1.2R 门槛
+    deps = Deps(trader=rt.trader, market=rt.market, gateway=rt.gateway, config=rt.config(), kb=rt.kb, plan_check=lambda _p: None)
+    rctx = RunContext(deps=deps, model=rt.watcher._model(""), usage=RunUsage())
+
+    # 1. +0.6R 想提保本到 60000：拦截，原止损 59400 不变
+    res_sl = await move_stops(rctx, BTC, "先锁一下保本", stop_loss=60_000, lot_id=lot["id"])
+    assert "禁止过早提保本" in res_sl and fake.algos[0]["slTriggerPx"] == "59400"
+
+    # 2. 刚开仓不到 10 分钟，无已收盘结构破坏想直接平仓：拦截，仓位保留
+    res_cl = await close_position(rctx, BTC, "短线有点回撤先出来", lot_id=lot["id"])
+    assert "禁止刚开仓就恐慌平仓" in res_cl and BTC in fake.positions
+
+    # 3. 浮盈冲到 +1.3R（60780）后再提保本：放行！
+    fake.set_price(BTC, 60_780)
+    res_ok = await move_stops(rctx, BTC, "浮盈超 1.2R 移到成本线上", stop_loss=60_080, lot_id=lot["id"])
+    assert "拦截" not in res_ok and fake.algos[0]["slTriggerPx"] == "60080"
+
+    # 4. 明确写明已收盘跌破结构失效时平仓：放行！
+    res_break = await close_position(rctx, BTC, "15m 收盘跌破支撑结构失效", lot_id=lot["id"])
+    assert "拦截" not in res_break and BTC not in fake.positions
+
+
 async def test_router_replaces_outdated_preferences_and_keeps_them_short(settings, fake):
     """用户改口时，Router 把过时的偏好换掉，不让新旧两种说法同时留着；太长的偏好不收（界面上显示不全）。"""
     replies: list[str] = []

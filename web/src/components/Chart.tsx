@@ -76,7 +76,7 @@ interface Props {
   position?: ChartPosition | null;
 }
 
-export interface AlgoMark { ts: number; side: string; label: string; ok?: string }
+export interface AlgoMark { ts: number; side: string; label: string; ok?: string; shape?: "arrowUp" | "arrowDown" | "circle"; color?: string }
 const BAR_SECONDS: Record<string, number> = { "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1H": 3600, "2H": 7200, "4H": 14400, "6H": 21600, "12H": 43200, "1D": 86400, "1W": 604800 };
 
 const TZ_SHIFT = -new Date().getTimezoneOffset() * 60;
@@ -237,21 +237,37 @@ export function Chart({ instId, bar, lines, tick, redUp, onLast, onDragLine, mar
     const series = candles.current;
     if (!series || loading) return;
     const step = BAR_SECONDS[bar] ?? 60;
-    const out: { time: UTCTimestamp; position: "aboveBar" | "belowBar"; color: string; shape: "arrowUp" | "arrowDown" | "circle"; text: string }[] = [];
+    const out: { time: UTCTimestamp; position: "aboveBar" | "belowBar"; color: string; shape: "arrowUp" | "arrowDown" | "circle"; text: string; size?: number }[] = [];
     if (last.current) {
       for (const e of entries ?? []) {
         const t = Math.floor(e.ts / 1000 / step) * step;
         const early = t < firstTime.current; // 入场比图上最早的一根还早：标在最左边
         const time = ((early ? firstTime.current : Math.min(t, last.current.time)) + TZ_SHIFT) as UTCTimestamp;
         const long = e.side === "long";
-        out.push({ time, position: long ? "belowBar" : "aboveBar", color: long ? GREEN : RED, shape: long ? "arrowUp" : "arrowDown", text: early ? `更早${e.label}` : e.label });
+        out.push({ time, position: long ? "belowBar" : "aboveBar", color: long ? GREEN : RED, shape: long ? "arrowUp" : "arrowDown", size: 0.5, text: early ? `更早${e.label}` : e.label });
       }
-      // 算法触发记录：同一根 K 线、同一个方向的并成一个圆点；15 分钟后核对过的按对错上色
+      // 走势箭头标记（上·延续 / 下·延续 / 上·转折 / 下·转折）按同根 K 线去重，控制紧凑尺寸不遮挡 K 线
       const groups = new Map<string, { time: number; side: string; labels: string[]; ok: string }>();
+      const arrowSeen = new Set<string>();
       for (const a of algoMarks ?? []) {
         const t = Math.floor(a.ts / 1000 / step) * step;
         if (t < firstTime.current) continue;
         const time = Math.min(t, last.current.time);
+        if (a.shape === "arrowUp" || a.shape === "arrowDown") {
+          const key = `${time}:${a.side}`;
+          if (arrowSeen.has(key)) continue;
+          arrowSeen.add(key);
+          const isLong = a.side === "long";
+          out.push({
+            time: (time + TZ_SHIFT) as UTCTimestamp,
+            position: isLong ? "belowBar" : "aboveBar",
+            color: a.color ?? (isLong ? (redUp ? RED : GREEN) : (redUp ? GREEN : RED)),
+            shape: a.shape,
+            size: 0.45,
+            text: a.label,
+          });
+          continue;
+        }
         const g = groups.get(`${time}:${a.side}`) ?? { time, side: a.side, labels: [], ok: "" };
         if (!g.labels.includes(a.label)) g.labels.push(a.label);
         g.ok = g.ok || a.ok || "";
@@ -263,6 +279,7 @@ export function Chart({ instId, bar, lines, tick, redUp, onLast, onDragLine, mar
           position: g.side === "long" ? "belowBar" : "aboveBar",
           color: ALGO_COLOR[g.ok] ?? "#a78bfa",
           shape: "circle",
+          size: 0.35,
           text: (g.labels.length > 2 ? `${g.labels.slice(0, 2).join("·")} +${g.labels.length - 2}` : g.labels.join("·")) + (g.side === "long" ? "↑" : g.side === "short" ? "↓" : ""),
         });
       }
@@ -274,6 +291,7 @@ export function Chart({ instId, bar, lines, tick, redUp, onLast, onDragLine, mar
             position: shiftMark.side === "long" ? "belowBar" : "aboveBar",
             color: "#38bdf8",
             shape: "circle",
+            size: 0.35,
             text: shiftMark.text,
           });
         }
@@ -282,7 +300,7 @@ export function Chart({ instId, bar, lines, tick, redUp, onLast, onDragLine, mar
     const t = mark ? Math.floor(mark.ts / 1000 / step) * step : 0;
     const showMark = !!mark && !!last.current && t >= firstTime.current;
     const markTime = showMark ? ((Math.min(t, last.current!.time) + TZ_SHIFT) as UTCTimestamp) : (0 as UTCTimestamp);
-    if (showMark) out.push({ time: markTime, position: "aboveBar", color: "#ff9f43", shape: "arrowDown", text: mark!.text });
+    if (showMark) out.push({ time: markTime, position: "aboveBar", color: "#ff9f43", shape: "arrowDown", size: 0.5, text: mark!.text });
     series.setMarkers(out.sort((x, y) => (x.time as number) - (y.time as number)));
     if (!showMark) return;
     const ts = chart.current?.timeScale();

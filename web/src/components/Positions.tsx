@@ -1,6 +1,6 @@
 import { Fragment, useState, useEffect } from "react";
 import { api, fmtPx, fmtUsd, shortInst, STATUS_LABEL, type Account, type Position, type TradeAction, needLogin, fmtTime, type ClosedTrade, type Lot, STYLES } from "../api";
-import { Empty, Modal, Pnl, toast, LeverPicker } from "./ui";
+import { Empty, Modal, Num, Pnl, toast, LeverPicker } from "./ui";
 import { StopsEditor } from "./OrderTicket";
 
 interface Props {
@@ -341,9 +341,52 @@ export function Positions({ account, maxLeverage, onSelect, onDone, loggedIn }: 
       {edit?.mode === "reverse" && (
         <ReverseModal
           pos={edit.pos}
+          maxLeverage={maxLeverage}
+          currentStop={stopOf(edit.pos.inst_id).sl ?? undefined}
           busy={!!busy}
           onClose={() => setEdit(null)}
-          onSubmit={async (sl, tp) => {
+          onSchedule={async (cfg) => {
+            const pos = edit.pos;
+            const nextSide: "long" | "short" = pos.side === "long" ? "short" : "long";
+            setBusy("reverse");
+            try {
+              if (cfg.kind === "after_stop") {
+                await api.addReverseRule({
+                  inst_id: pos.inst_id,
+                  side: nextSide,
+                  trigger: cfg.trigger,
+                  stop_loss: cfg.sl,
+                  take_profit: cfg.tp,
+                  leverage: cfg.leverage,
+                  margin_usdt: cfg.marginUsdt,
+                  window_minutes: cfg.windowMinutes,
+                });
+                toast(`已设「止损后自动反手」触发器：原仓止损且价格到 ${fmtPx(cfg.trigger)} 自动 ${cfg.leverage}x 开${nextSide === "long" ? "多" : "空"}`, "ok");
+              } else {
+                await api.addLine({
+                  inst_id: pos.inst_id,
+                  when: cfg.when,
+                  bar: cfg.when === "price_touch" ? undefined : cfg.bar,
+                  level: cfg.trigger,
+                  do: "reverse",
+                  side: nextSide,
+                  stop_loss: cfg.sl,
+                  take_profit: cfg.tp,
+                  leverage: cfg.leverage,
+                  margin_usdt: cfg.marginUsdt,
+                  note: "到点自动平仓并反手",
+                });
+                toast(`已设「到点自动反手」触发器：到达 ${fmtPx(cfg.trigger)} 自动平仓并 ${cfg.leverage}x 开${nextSide === "long" ? "多" : "空"}`, "ok");
+              }
+            } catch (e: any) {
+              toast(e.message, "error");
+            } finally {
+              setBusy("");
+              setEdit(null);
+              onDone();
+            }
+          }}
+          onSubmit={async (sl, tp, leverage, marginUsdt) => {
             const pos = edit.pos;
             setBusy("reverse");
             try {
@@ -356,7 +399,8 @@ export function Positions({ account, maxLeverage, onSelect, onDone, loggedIn }: 
                 kind: "open",
                 inst_id: pos.inst_id,
                 side: pos.side === "long" ? "short" : "long",
-                leverage: pos.leverage,
+                leverage,
+                margin_usdt: marginUsdt,
                 stop_loss: sl,
                 take_profit: tp,
                 reason: "一键反手：反向开仓",
@@ -528,24 +572,244 @@ function CloseModal({ pos, busy, onClose, onSubmit }: { pos: Position; busy: boo
   );
 }
 
-function ReverseModal({ pos, busy, onClose, onSubmit }: { pos: Position; busy: boolean; onClose: () => void; onSubmit: (sl: number, tp?: number) => void }) {
+function ReverseModal({
+  pos,
+  maxLeverage,
+  currentStop,
+  busy,
+  onClose,
+  onSubmit,
+  onSchedule,
+}: {
+  pos: Position;
+  maxLeverage: number;
+  currentStop?: number;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (sl: number, tp: number | undefined, leverage: number, marginUsdt?: number) => void;
+  onSchedule: (cfg: {
+    kind: "after_stop" | "at_level";
+    when: "price_touch" | "close_above" | "close_below";
+    bar: "5m" | "15m" | "1H";
+    trigger: number;
+    sl: number;
+    tp?: number;
+    leverage: number;
+    marginUsdt?: number;
+    windowMinutes: number;
+  }) => void;
+}) {
+  const [mode, setMode] = useState<"after_stop" | "at_level" | "now">("after_stop");
+  const [when, setWhen] = useState<"price_touch" | "close_above" | "close_below">("price_touch");
+  const [bar, setBar] = useState<"5m" | "15m" | "1H">("15m");
+  const [trigger, setTrigger] = useState<number | "">(currentStop ?? pos.mark_px);
+  const [windowMinutes, setWindowMinutes] = useState<number | "">(60);
+  const [lever, setLever] = useState<number>(Math.max(1, Math.min(Math.round(pos.leverage || 20), maxLeverage || 100)));
+  const [margin, setMargin] = useState<number | "">(pos.margin > 0 ? Number(pos.margin.toFixed(2)) : "");
   const [sl, setSl] = useState<number | "">("");
   const [tp, setTp] = useState<number | "">("");
-  const next = pos.side === "long" ? "空" : "多";
+  const nextSide: "long" | "short" = pos.side === "long" ? "short" : "long";
+  const next = nextSide === "long" ? "多" : "空";
+  const refPx = mode === "now" ? pos.mark_px : typeof trigger === "number" && trigger > 0 ? trigger : pos.mark_px;
+  const badSl = typeof sl === "number" && (nextSide === "long") !== sl < refPx;
+  const badTp = typeof tp === "number" && (nextSide === "long") !== tp > refPx;
+  const marginVal = typeof margin === "number" && margin > 0 ? margin : undefined;
+  const notional = marginVal ? marginVal * lever : 0;
+  const slDistPct = typeof sl === "number" && refPx > 0 ? Math.abs(sl - refPx) / refPx * 100 : 0;
+  const tpDistPct = typeof tp === "number" && refPx > 0 ? Math.abs(tp - refPx) / refPx * 100 : 0;
+  const estLoss = notional > 0 && slDistPct > 0 ? notional * (slDistPct / 100) : 0;
+  const estGain = notional > 0 && tpDistPct > 0 ? notional * (tpDistPct / 100) : 0;
+  const canSubmit = !busy && typeof sl === "number" && sl > 0 && !badSl && !badTp && (mode === "now" || (typeof trigger === "number" && trigger > 0));
   return (
-    <Modal title={`${shortInst(pos.inst_id)} 一键反手`} onClose={onClose}>
-      <p className="muted small">
-        先市价平掉现在的{pos.side === "long" ? "多" : "空"}单（投入 {fmtUsd(pos.margin)} U），再市价开{next}单，杠杆沿用 {pos.leverage}x。新仓的张数由风控按止损距离重新计算，不一定和原来相同。
-      </p>
-      <p className="muted small">新{next}单的止盈止损（按现价 {fmtPx(pos.mark_px)} 算）：</p>
-      <StopsEditor inst={pos.inst_id} side={pos.side === "long" ? "short" : "long"} entry={pos.mark_px} leverage={pos.leverage} sl={sl} tp={tp} setSl={setSl} setTp={setTp} stack />
-      <div className="modal-foot">
-        <button className="btn" onClick={onClose}>
-          取消
-        </button>
-        <button className="btn danger" disabled={busy || sl === ""} onClick={() => onSubmit(sl as number, tp === "" ? undefined : tp)}>
-          {busy ? "执行中…" : `平仓并开${next}`}
-        </button>
+    <Modal title={`${shortInst(pos.inst_id)} 反手下单 / 自动触发`} onClose={onClose} wide>
+      <div className="rev-shell">
+        <div className="rev-banner">
+          <div className="rev-side">
+            <span className={`rev-badge ${pos.side === "long" ? "long" : "short"}`}>
+              原仓 {pos.side === "long" ? "多" : "空"} · {pos.leverage}x
+            </span>
+            <span className="rev-meta">
+              投入 <b>{fmtUsd(pos.margin)} U</b>
+              <i>·</i>现价 <b>{fmtPx(pos.mark_px)}</b>
+              {currentStop ? <><i>·</i>止损 <b>{fmtPx(currentStop)}</b></> : null}
+            </span>
+          </div>
+          <span className="rev-arrow">⟶</span>
+          <span className={`rev-badge ${nextSide === "long" ? "long" : "short"}`}>
+            反手做{next} · {lever}x
+          </span>
+        </div>
+
+        <div className="rev-tabs" role="tablist">
+          {(
+            [
+              ["after_stop", "止损后自动反手", "原仓止损且到触发价自动开反手"],
+              ["at_level", "到点自动反手", "到价或收盘自动先平仓再开反手"],
+              ["now", "立即市价反手", "当场市价平仓并立刻开反手"],
+            ] as const
+          ).map(([id, title, sub]) => (
+            <button key={id} type="button" className={`rev-tab ${mode === id ? "on" : ""}`} onClick={() => setMode(id)}>
+              <b>{title}</b>
+              <span>{sub}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="rev-cols">
+          <div className="rev-col">
+            {mode !== "now" && (
+              <div className="rev-sec">
+                <div className="rev-sec-h">触发条件</div>
+                {mode === "after_stop" ? (
+                  <div className="rev-row2">
+                    <label className="field">
+                      <span>反手触发价（默认原止损）</span>
+                      <Num value={trigger} onChange={setTrigger} placeholder="触发价" />
+                    </label>
+                    <label className="field">
+                      <span>有效窗口（分钟）</span>
+                      <Num value={windowMinutes} onChange={setWindowMinutes} min={5} max={1440} step={5} />
+                    </label>
+                  </div>
+                ) : (
+                  <div className="rev-row2">
+                    <label className="field">
+                      <span>条件</span>
+                      <select className="input" value={when} onChange={(e) => setWhen(e.target.value as any)}>
+                        <option value="price_touch">实时价格触及</option>
+                        <option value="close_below">K 线收盘跌破</option>
+                        <option value="close_above">K 线收盘站上</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>触发价位</span>
+                      <Num value={trigger} onChange={setTrigger} placeholder="价位" />
+                    </label>
+                    {when !== "price_touch" && (
+                      <label className="field" style={{ gridColumn: "1 / -1" }}>
+                        <span>确认 K 线周期</span>
+                        <select className="input" value={bar} onChange={(e) => setBar(e.target.value as any)}>
+                          <option value="5m">5 分钟收盘</option>
+                          <option value="15m">15 分钟收盘</option>
+                          <option value="1H">1 小时收盘</option>
+                        </select>
+                      </label>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="rev-sec">
+              <div className="rev-sec-h">
+                <span>投入保证金（USDT）</span>
+                <span className="muted small">{notional > 0 ? `名义 ≈ ${fmtUsd(notional)} U` : "留空按风控自动算"}</span>
+              </div>
+              <Num value={margin} onChange={setMargin} min={0.01} step={0.1} placeholder="输入投入 U，留空按风控自动算" />
+              <div className="rev-pills">
+                {pos.margin > 0 && (
+                  <>
+                    <button type="button" className={marginVal === Number(pos.margin.toFixed(2)) ? "on" : ""} onClick={() => setMargin(Number(pos.margin.toFixed(2)))}>
+                      同原仓 ({pos.margin.toFixed(2)}U)
+                    </button>
+                    <button type="button" className={marginVal === Number((pos.margin * 0.5).toFixed(2)) ? "on" : ""} onClick={() => setMargin(Number((pos.margin * 0.5).toFixed(2)))}>
+                      50%
+                    </button>
+                    <button type="button" className={marginVal === Number((pos.margin * 2).toFixed(2)) ? "on" : ""} onClick={() => setMargin(Number((pos.margin * 2).toFixed(2)))}>
+                      2×
+                    </button>
+                  </>
+                )}
+                <button type="button" className={margin === "" ? "on" : ""} onClick={() => setMargin("")}>
+                  风控自动
+                </button>
+              </div>
+            </div>
+
+            <div className="rev-sec">
+              <div className="rev-sec-h">
+                <span>杠杆倍数</span>
+                <span className="muted small">最高 {maxLeverage || 100}x</span>
+              </div>
+              <LeverPicker value={lever} instMax={maxLeverage || 100} riskMax={maxLeverage || 100} onChange={setLever} />
+            </div>
+          </div>
+
+          <div className="rev-col">
+            <div className="rev-sec">
+              <div className="rev-sec-h">
+                <span>新{next}单止盈止损</span>
+                <span className="muted small">基准 {fmtPx(refPx)}</span>
+              </div>
+              <StopsEditor inst={pos.inst_id} side={nextSide} entry={refPx} leverage={lever} sl={sl} tp={tp} setSl={setSl} setTp={setTp} />
+              {(badSl || badTp) && (
+                <div className="rev-err">
+                  {badSl
+                    ? `止损放错边：反手做${next}止损必须${nextSide === "long" ? "低于" : "高于"} ${fmtPx(refPx)}`
+                    : `止盈放错边：反手做${next}止盈必须${nextSide === "long" ? "高于" : "低于"} ${fmtPx(refPx)}`}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="rev-summary">
+          <div>
+            <span>反手方向</span>
+            <b className={nextSide === "long" ? "up-fixed" : "down-fixed"}>做{next} · {lever}x</b>
+          </div>
+          <div>
+            <span>投入 / 名义</span>
+            <b>{marginVal ? `${marginVal} U / ${fmtUsd(notional)} U` : "按风控自动"}</b>
+          </div>
+          <div>
+            <span>止损距离 / 预计亏</span>
+            <b className="down-fixed">
+              {slDistPct > 0 ? `${slDistPct.toFixed(2)}%${estLoss > 0 ? ` (-${estLoss.toFixed(2)} U)` : ""}` : "待填写止损"}
+            </b>
+          </div>
+          <div>
+            <span>止盈距离 / 预计赚</span>
+            <b className="up-fixed">
+              {tpDistPct > 0 ? `${tpDistPct.toFixed(2)}%${estGain > 0 ? ` (+${estGain.toFixed(2)} U)` : ""}` : "未设止盈"}
+            </b>
+          </div>
+        </div>
+
+        <div className="modal-foot rev-foot">
+          <button className="btn" onClick={onClose}>
+            取消
+          </button>
+          {mode === "now" ? (
+            <button
+              className={`btn ${nextSide === "long" ? "buy" : "sell"}`}
+              disabled={!canSubmit}
+              onClick={() => onSubmit(sl as number, tp === "" ? undefined : tp, lever, marginVal)}
+            >
+              {busy ? "执行中…" : `立即平仓并 ${lever}x 开${next}`}
+            </button>
+          ) : (
+            <button
+              className={`btn ${nextSide === "long" ? "buy" : "sell"}`}
+              disabled={!canSubmit}
+              onClick={() =>
+                onSchedule({
+                  kind: mode,
+                  when,
+                  bar,
+                  trigger: trigger as number,
+                  sl: sl as number,
+                  tp: tp === "" ? undefined : tp,
+                  leverage: lever,
+                  marginUsdt: marginVal,
+                  windowMinutes: typeof windowMinutes === "number" && windowMinutes >= 5 ? windowMinutes : 60,
+                })
+              }
+            >
+              {busy ? "部署中…" : mode === "after_stop" ? `启用止损后自动反手（${lever}x 开${next}）` : `启用到点自动反手（${lever}x 开${next}）`}
+            </button>
+          )}
+        </div>
       </div>
     </Modal>
   );
